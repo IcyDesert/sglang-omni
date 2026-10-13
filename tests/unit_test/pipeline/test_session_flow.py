@@ -10,6 +10,7 @@ import pytest
 from sglang_omni.pipeline.sessions import Session
 from sglang_omni.proto import OmniRequest
 from sglang_omni.proto.session import TimedChunk, find_session_operation
+from tests.unit_test.fixtures.session_outputs import control_chunk
 from tests.unit_test.fixtures.session_pipeline import chunk, event_log, pipeline
 
 IN_FLIGHT_ACCEPT_TIMEOUT_S = 1
@@ -267,3 +268,39 @@ async def test_later_operations_do_not_carry_the_opening_inputs(
         request_inputs is None and raw_inputs is None
         for _, request_inputs, raw_inputs in submitted
     )
+
+
+def control_owners(events: Queue) -> list[tuple[str, str]]:
+    return [
+        (event[1], event[3]) for event in event_log(events) if event[0] == "control"
+    ]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_control_reaches_every_stage_of_the_route_or_the_named_stages(
+    linear_pair,
+) -> None:
+    coordinator, events, _ = linear_pair
+    session_identity = await coordinator.open_session(
+        OmniRequest(None), stages=["source", "sink"]
+    )
+    outputs = coordinator.session_outputs(session_identity)
+    interrupt = control_chunk("interrupt")
+    try:
+        await coordinator.control_session(session_identity, interrupt)
+        await coordinator.control_session(
+            session_identity, control_chunk("truncate"), stages=["sink"]
+        )
+        with pytest.raises(ValueError, match="not all on the session route"):
+            await coordinator.control_session(
+                session_identity, interrupt, stages=["middle"]
+            )
+        await coordinator.append_session(session_identity, chunk(0, eos=True))
+        await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
+    finally:
+        await outputs.aclose()
+    assert control_owners(events) == [
+        ("source", "interrupt"),
+        ("sink", "interrupt"),
+        ("sink", "truncate"),
+    ]

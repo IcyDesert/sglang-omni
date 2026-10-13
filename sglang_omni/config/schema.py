@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.main import IncEx
 from typing_extensions import Unpack
 
+from sglang_omni.proto.session import ControlEdge, DataEdge, SessionGraph, SessionNode
+
 if TYPE_CHECKING:
     from sglang_omni.serve.realtime.transcription_session import StreamingASRStrategy
 else:
@@ -653,6 +655,54 @@ class ModelDumpOptions(TypedDict, total=False):
     polymorphic_serialization: bool | None
 
 
+class SessionControlEdgeConfig(BaseModel):
+    """An input of a node written `{"kind": "control", "source", "event"}`: the control event of `source` reaches the node as a control operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["control"]
+    source: str
+    event: str
+    target_stages: list[str] | None = None
+    preempt: bool = False
+
+    def edge(self) -> ControlEdge:
+        """The runtime edge; the declaration's `preempt` is the edge's `should_preempt`."""
+        return ControlEdge(
+            source=self.source,
+            event=self.event,
+            target_stages=(
+                None if self.target_stages is None else tuple(self.target_stages)
+            ),
+            should_preempt=self.preempt,
+        )
+
+
+class SessionDataEdgeConfig(BaseModel):
+    """An input of a stage node written `{"source", "capacity", "overflow", "feedback"}`: the `source` of a plain input with the bound of its edge (see `DataEdge`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    capacity: int | None = Field(default=None, gt=0)
+    overflow: Literal["block", "drop_oldest"] = "block"
+    feedback: bool = False
+
+    def edge(self) -> DataEdge:
+        return DataEdge(self.source, self.capacity, self.overflow, self.feedback)
+
+
+class SessionNodeConfig(BaseModel):
+    """One stage route of the Session graph and the sources it reads."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stages: list[str] = Field(min_length=1)
+    inputs: list[str | SessionDataEdgeConfig | SessionControlEdgeConfig] = Field(
+        min_length=1
+    )
+
+
 class PipelineConfig(BaseModel):
     """Top-level pipeline configuration.
 
@@ -705,6 +755,10 @@ class PipelineConfig(BaseModel):
     endpoints: EndpointsConfig = Field(default_factory=EndpointsConfig)
     terminal_stages_fn: str | None = None
     config_cls: str | None = None
+    session_nodes: dict[str, SessionNodeConfig] = Field(default_factory=dict)
+    "The Session as a graph of stage routes; empty when the Session is the one route from the entry stage."
+    session_publish: dict[str, list[str]] = Field(default_factory=dict)
+    "Per node of the graph, the chunk formats that reach the client."
 
     def model_dump(self, **kwargs: Unpack[ModelDumpOptions]) -> dict[str, object]:
         """Dump with each stage serialized by its runtime class.
@@ -830,6 +884,52 @@ class PipelineConfig(BaseModel):
     @property
     def terminal_stages(self) -> list[str]:
         return [s.name for s in self.stages if s.terminal]
+
+    def session_route(self) -> list[str]:
+        """The stage chain a Session of this pipeline follows: `next` from the entry stage to a terminal stage."""
+        route = [self.resolved_entry_stage]
+        while True:
+            following = self.stage_named(route[-1]).next
+            if following is None:
+                return route
+            elif isinstance(following, list) and len(following) == 1:
+                route.append(following[0])
+            elif isinstance(following, str):
+                route.append(following)
+            else:
+                raise ValueError(
+                    f"the stage chain forks at {route[-1]!r} into {following}; "
+                    "a Session of this pipeline needs session_nodes"
+                )
+
+    def session_graph(self) -> SessionGraph | None:
+        """The node graph a Session of this pipeline is, when it is more than one route."""
+        if not self.session_nodes:
+            return None
+        else:
+            pass
+        nodes = {
+            name: SessionNode(
+                stages=tuple(node.stages),
+                inputs=tuple(
+                    entry if isinstance(entry, str) else entry.edge()
+                    for entry in node.inputs
+                    if not isinstance(entry, SessionControlEdgeConfig)
+                ),
+                controls=tuple(
+                    entry.edge()
+                    for entry in node.inputs
+                    if isinstance(entry, SessionControlEdgeConfig)
+                ),
+            )
+            for name, node in self.session_nodes.items()
+        }
+        return SessionGraph(
+            nodes=nodes,
+            publish={
+                name: tuple(formats) for name, formats in self.session_publish.items()
+            },
+        )
 
     @classmethod
     def process_local_edges(cls) -> frozenset[tuple[str, str]]:

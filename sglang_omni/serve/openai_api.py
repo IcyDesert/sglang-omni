@@ -120,6 +120,7 @@ from sglang_omni.serve.protocol import (
 )
 from sglang_omni.serve.realtime.manager import RealtimeDeployment
 from sglang_omni.serve.realtime.schema import CapabilityResponse
+from sglang_omni.serve.session_wire import register_session_wire
 from sglang_omni.serve.speech_errors import (
     SpeechAPIError,
     bad_request,
@@ -271,7 +272,8 @@ def create_app(
             other and unknown fields are refused before parsing. None accepts
             every protocol field and ignores unknown ones.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
-            endpoint (OpenAI Realtime API).
+            endpoint (OpenAI Realtime API) and the Session protocol on
+            ``/v1/session``.
         supports_realtime_audio_output: Whether the mounted realtime endpoint
             can request streamed audio from the configured pipeline.
         realtime_transcription: Pipeline-owned live-ASR strategy declaration.
@@ -368,6 +370,7 @@ def create_app(
     register_translations(app)
     if enable_realtime or realtime_deployment is not None:
         register_realtime(app)
+        register_session_wire(app)
     else:
         pass
 
