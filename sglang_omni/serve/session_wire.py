@@ -32,11 +32,14 @@ def unpack(frame: bytes) -> dict[str, object]:
 
 
 class SessionWire:
-    """One WebSocket serving one Session through the Client session API."""
+    """One WebSocket serving one Session through the Client session API, with the deployment's `limits`."""
 
-    def __init__(self, client: Client, websocket: WebSocket) -> None:
+    def __init__(
+        self, client: Client, websocket: WebSocket, limits: SessionLimits
+    ) -> None:
         self.client = client
         self.websocket = websocket
+        self.limits = limits
         self.session_identity: SessionIdentity | None = None
         self.send_lock = asyncio.Lock()
 
@@ -64,9 +67,15 @@ class SessionWire:
             raise ValueError("the first session frame must be open")
         else:
             pass
-        limits = msgspec.convert(message.get("limits", {}), type=SessionLimits)
+        if "limits" in message:
+            raise ValueError(
+                "the open frame takes params only; session limits are the deployment's"
+            )
+        else:
+            pass
         self.session_identity = await self.client.open_session(
-            OmniRequest(None, params=dict(message.get("params", {}))), limits=limits
+            OmniRequest(None, params=dict(message.get("params", {}))),
+            limits=self.limits,
         )
         await self.send({"op": "opened", "session": self.session_identity.to_dict()})
 
@@ -153,10 +162,12 @@ class SessionWire:
             pass
 
 
-def register_session_wire(app: FastAPI) -> None:
-    """Mount the Session protocol WebSocket on /v1/session."""
+def register_session_wire(
+    app: FastAPI, limits: SessionLimits = SessionLimits()
+) -> None:
+    """Mount the Session protocol WebSocket on /v1/session; every Session opens with the deployment's `limits`."""
 
     @app.websocket(SESSION_WIRE_PATH)
     async def session(websocket: WebSocket) -> None:
         await websocket.accept()
-        await SessionWire(app.state.client, websocket).run()
+        await SessionWire(app.state.client, websocket, limits).run()

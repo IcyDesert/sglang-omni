@@ -85,6 +85,7 @@ from sglang_omni.http.admin_auth import (
 )
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.proto.admin import AdminResponse
+from sglang_omni.proto.session import SessionLimits
 from sglang_omni.serve.diarizations import register_diarizations
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (
@@ -370,7 +371,14 @@ def create_app(
     register_translations(app)
     if enable_realtime or realtime_deployment is not None:
         register_realtime(app)
-        register_session_wire(app)
+        register_session_wire(
+            app,
+            limits=(
+                realtime_deployment.limits
+                if realtime_deployment is not None
+                else SessionLimits()
+            ),
+        )
     else:
         pass
 

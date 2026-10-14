@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from sglang_omni.admission import QueueFullError
-from sglang_omni.proto.session import TimedChunk
+from sglang_omni.proto.session import SessionLimits, TimedChunk
 from sglang_omni.serve.session_wire import register_session_wire
 from tests.unit_test.fixtures.session_client import FakeSessionClient
 
@@ -38,10 +38,10 @@ class FakeClient(FakeSessionClient):
         )
 
 
-def connect(client):
+def connect(client, limits=SessionLimits()):
     app = FastAPI()
     app.state.client = client
-    register_session_wire(app)
+    register_session_wire(app, limits=limits)
     return TestClient(app).websocket_connect("/v1/session")
 
 
@@ -67,7 +67,7 @@ def open_session(websocket, **fields):
 def test_open_append_outputs_close_round_trip():
     client = FakeClient()
     with connect(client) as websocket:
-        opened = open_session(websocket, limits={"max_pending_chunks": 4})
+        opened = open_session(websocket)
         assert opened == {
             "op": "opened",
             "session": {"id": "session", "open_index": 3},
@@ -84,7 +84,7 @@ def test_open_append_outputs_close_round_trip():
         assert receive(websocket) == {"op": "closed"}
     request, limits, _ = client.opened[0]
     assert request.params == {"a": 1}
-    assert limits.max_pending_chunks == 4
+    assert limits == SessionLimits()
     assert client.appended[0].payload == bytes([0]) * 4
     assert client.appended[0].turn == 4
     assert client.closed.is_set()
@@ -167,3 +167,19 @@ def test_control_reaches_the_session_and_is_answered():
         send(websocket, {"op": "close"})
         assert receive(websocket) == {"op": "closed"}
     assert client.controlled == [(event, ["sink"], True), (event, None, False)]
+
+
+def test_a_client_may_not_request_session_limits():
+    client = FakeClient()
+    with connect(client) as websocket:
+        frame = open_session(websocket, limits={"idle_timeout_s": 5.0})
+        assert frame["op"] == "error" and "params only" in frame["message"]
+    assert client.opened == []
+
+
+def test_sessions_open_with_the_deployment_limits():
+    client = FakeClient()
+    with connect(client, SessionLimits(idle_timeout_s=5.0)) as websocket:
+        open_session(websocket)
+    _, limits, _ = client.opened[0]
+    assert limits == SessionLimits(idle_timeout_s=5.0)
