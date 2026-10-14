@@ -160,16 +160,17 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
     )
     entered, release = asyncio.Event(), asyncio.Event()
     append_seqs: list[int] = []
-    original = coordinator.session_operation
+    original = coordinator.submit_session_operation
 
     async def hold_first_append(
         session: Session,
-        operation: Literal["open", "append", "close"],
+        operation: Literal["open", "read", "append", "control", "close"],
         *,
         owner: str | None = None,
         chunk: TimedChunk | None = None,
         request_id: str | None = None,
-    ) -> None:
+        should_preempt: bool = False,
+    ) -> str:
         if operation == "append" and chunk is not None:
             append_seqs.append(chunk.seq)
             if chunk.seq == 0:
@@ -181,9 +182,10 @@ async def test_next_input_is_accepted_while_one_unit_is_in_flight(
             owner=owner,
             chunk=chunk,
             request_id=request_id,
+            should_preempt=should_preempt,
         )
 
-    monkeypatch.setattr(coordinator, "session_operation", hold_first_append)
+    monkeypatch.setattr(coordinator, "submit_session_operation", hold_first_append)
     outputs = coordinator.session_outputs(session_identity)
     try:
         assert await coordinator.append_session(session_identity, chunk(0)) == 0
@@ -321,3 +323,40 @@ async def test_an_open_session_read_holds_no_generation_slot(tmp_path):
             assert [item.kind for item in received] == ["data", "input_done"]
         finally:
             await outputs.aclose()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_a_control_follows_the_appends_accepted_before_it(linear_pair) -> None:
+    coordinator, events, _ = linear_pair
+    session_identity = await coordinator.open_session(
+        OmniRequest(None, {"delay": 0.05}), stages=["source", "sink"]
+    )
+    outputs = coordinator.session_outputs(session_identity)
+    try:
+        await coordinator.append_session(session_identity, chunk(0))
+        await coordinator.append_session(session_identity, chunk(1))
+        await coordinator.control_session(session_identity, control_chunk("configure"))
+        await coordinator.append_session(session_identity, chunk(2))
+        received = [
+            await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
+            for _ in range(6)
+        ]
+        assert [item.input_seq for item in received if item.kind == "input_done"] == [
+            0,
+            1,
+            2,
+        ]
+    finally:
+        await outputs.aclose()
+    order = [
+        (event[1], event[3])
+        for event in event_log(events)
+        if event[0] in ("append", "control")
+    ]
+    for stage in ("source", "sink"):
+        assert [item for owner, item in order if owner == stage] == [
+            0,
+            1,
+            "configure",
+            2,
+        ]

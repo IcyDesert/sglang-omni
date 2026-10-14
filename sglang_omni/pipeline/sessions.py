@@ -91,8 +91,9 @@ class Session:
     pending: deque[PendingSessionChunk] = field(default_factory=deque)
     pending_bytes: int = 0
     pending_count: int = 0
-    # Controls being delivered; the pump starts no append while one is.
-    controls_in_flight: int = 0
+    # Note (Junnan Li): Waiting controls in arrival order, each with the input seq it arrived at; the pump stops before the first.
+    control_barriers: deque[tuple[int, object]] = field(default_factory=deque)
+    in_flight_append: Literal["accepted", "submitted"] | None = None
     outputs: deque[tuple[OutputChunk, int]] = field(default_factory=deque)
     output_bytes: int = 0
     next_input: int = 0
@@ -509,7 +510,10 @@ class CoordinatorSessions:
     async def pump_session(self, session: Session) -> None:
         try:
             while not session.is_closing:
-                if not session.pending or session.controls_in_flight:
+                if not session.pending or (
+                    session.control_barriers
+                    and session.pending[0].chunk.seq >= session.control_barriers[0][0]
+                ):
                     session.wake.clear()
                     await asyncio.wait_for(
                         session.wake.wait(), session.limits.idle_timeout_s
@@ -519,13 +523,17 @@ class CoordinatorSessions:
                     pass
                 pending_chunk = session.pending.popleft()
                 chunk = pending_chunk.chunk
+                session.in_flight_append = "accepted"
                 try:
-                    await self.session_operation(
+                    request_id = await self.submit_session_operation(
                         session,
                         "append",
                         chunk=chunk,
                         request_id=pending_chunk.request_id,
                     )
+                    session.in_flight_append = "submitted"
+                    session.wake.set()
+                    await self.finish_session_operation(session, "append", request_id)
                     self.emit_session_output(
                         session,
                         pending_chunk.request_id,
@@ -534,8 +542,10 @@ class CoordinatorSessions:
                         kind="input_done",
                     )
                 finally:
+                    session.in_flight_append = None
                     session.pending_count -= 1
                     session.pending_bytes -= pending_chunk.encoded_bytes
+                    session.wake.set()
         except Exception as exc:
             session.error = exc
             self.owned_session_task(self.close_session_state(session))
@@ -569,8 +579,9 @@ class CoordinatorSessions:
     ) -> None:
         """Deliver a control event to the named logical stages, or to every stage of the route.
 
-        A control shares the session's arrival order with its appends on
-        each stage; should_preempt cancels the in-flight appends first.
+        A control keeps its arrival order among the appends and controls of
+        the session; with should_preempt it goes out once the earlier appends
+        have reached their owners, which cancel the ones still in flight.
         A graph delivers the event along its control edges from `input`.
         """
         graph = self.graphs.get(session_identity.id)
@@ -595,9 +606,24 @@ class CoordinatorSessions:
             )
         else:
             pass
-        # Note (Junnan Li): Hold the pump so input arriving during a control stays behind it.
-        session.controls_in_flight += 1
+        barrier = (session.next_input, object())
+        session.control_barriers.append(barrier)
         try:
+            while True:
+                if session.is_closing:
+                    raise RuntimeError("session is closing")
+                elif (
+                    session.control_barriers[0] is barrier
+                    and (not session.pending or session.pending[0].chunk.seq >= barrier[0])
+                    and (
+                        session.in_flight_append is None
+                        or (should_preempt and session.in_flight_append == "submitted")
+                    )
+                ):
+                    break
+                else:
+                    session.wake.clear()
+                    await session.wake.wait()
             for owner in owners:
                 await self.session_operation(
                     session,
@@ -607,7 +633,7 @@ class CoordinatorSessions:
                     should_preempt=should_preempt,
                 )
         finally:
-            session.controls_in_flight -= 1
+            session.control_barriers.remove(barrier)
             session.wake.set()
 
     async def session_operation(
