@@ -9,7 +9,7 @@ import pytest
 
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.session_graph import SessionGraphRunner
-from sglang_omni.pipeline.sessions import SessionGraphRuntime
+from sglang_omni.pipeline.sessions import NodeInbox, Session, SessionGraphRuntime
 from sglang_omni.proto import OmniRequest
 from sglang_omni.proto.session import (
     ControlEdge,
@@ -394,3 +394,91 @@ async def test_a_node_merges_the_clocks_of_its_sources(tmp_path):
                 TimedChunk("control", 10, 0, 2, {"type": "configure"}, "session"),
             )
         await coordinator.close_session(identity)
+
+
+class NodeOutputsRunner(SessionGraphRunner):
+    """Graph routing over one node whose outputs are given; node controls are recorded."""
+
+    def __init__(self, node_outputs: list[OutputChunk]) -> None:
+        super().__init__()
+        self.node_outputs = node_outputs
+        self.controls: list[TimedChunk] = []
+
+    async def session_outputs(self, session_identity):
+        for output in self.node_outputs:
+            yield output
+
+    async def control_session(
+        self, session_identity, event, *, stages=None, should_preempt=False
+    ):
+        self.controls.append(event)
+
+
+def reply_runtime(sessions: SessionGraphRunner) -> SessionGraphRuntime:
+    """A graph of one `reply` node interrupted by the client, with its node session registered."""
+    node = SessionIdentity("graph:reply")
+    sessions.sessions[node.id] = Session(
+        session_identity=node,
+        request=OmniRequest(None),
+        stages=("reply",),
+        bindings={},
+        limits=SessionLimits(),
+        is_node=True,
+    )
+    return SessionGraphRuntime(
+        session_identity=SessionIdentity("graph"),
+        graph=SessionGraph(
+            nodes={
+                "reply": SessionNode(
+                    ("reply",),
+                    ("input",),
+                    controls=(ControlEdge("input", "interrupt"),),
+                )
+            },
+            publish={"reply": ("text_delta", "session")},
+        ),
+        nodes={"reply": node},
+        limits=SessionLimits(),
+        inboxes={"reply": NodeInbox()},
+        outputs=asyncio.Queue(),
+        client_sequences={"reply": {}},
+    )
+
+
+def reply_output(output_format: str, payload: dict, turn: int) -> OutputChunk:
+    modality = "control" if output_format == "session" else "text"
+    return OutputChunk(
+        SessionIdentity("graph:reply"),
+        0,
+        0,
+        modality,
+        0,
+        0,
+        payload,
+        output_format,
+        turn=turn,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_node_publishes_only_the_end_of_the_interrupted_turn():
+    sessions = NodeOutputsRunner(
+        [
+            reply_output("text_delta", {"text": "stale"}, 1),
+            reply_output("session", {"type": "turn.done"}, 1),
+            reply_output("session", {"type": "turn.interrupted"}, 1),
+            reply_output("text_delta", {"text": "next"}, 2),
+        ]
+    )
+    graph = reply_runtime(sessions)
+    interrupt = TimedChunk("control", 0, 0, 0, {"type": "interrupt"}, "session", turn=1)
+    await sessions.control_graph(graph, interrupt, None, False)
+    assert sessions.controls == [interrupt]
+    await sessions.route_graph_outputs(graph, "reply")
+    published = []
+    while not graph.outputs.empty():
+        published.append(graph.outputs.get_nowait()[0])
+    assert [(item.payload, item.turn) for item in published] == [
+        ({"type": "turn.interrupted"}, 1),
+        ({"text": "next"}, 2),
+    ]

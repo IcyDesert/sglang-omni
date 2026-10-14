@@ -30,7 +30,12 @@ from sglang_omni.proto.session import (
     TimedChunk,
     wire_size,
 )
-from sglang_omni.proto.streams import INTERRUPT, control_type, edge_event
+from sglang_omni.proto.streams import (
+    INTERRUPT,
+    control_type,
+    edge_event,
+    is_interrupted_reply,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +364,12 @@ class SessionGraphRunner(CoordinatorSessions):
             else:
                 pass
             chunk = output_chunk(output)
+            if name in graph.interrupted_turns and is_interrupted_reply(
+                chunk, graph.interrupted_turns[name]
+            ):
+                continue
+            else:
+                pass
             control_targets = graph.graph.control_targets(name, edge_event(chunk))
             if control_targets:
                 for target, edge in control_targets:
