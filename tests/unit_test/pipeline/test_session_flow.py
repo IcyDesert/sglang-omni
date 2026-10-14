@@ -304,3 +304,20 @@ async def test_control_reaches_every_stage_of_the_route_or_the_named_stages(
         ("sink", "interrupt"),
         ("sink", "truncate"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_an_open_session_read_holds_no_generation_slot(tmp_path):
+    async with pipeline(tmp_path) as (coordinator, _, _):
+        coordinator.max_in_flight = 1
+        session_identity = await coordinator.open_session(OmniRequest(None))
+        outputs = coordinator.session_outputs(session_identity)
+        try:
+            await coordinator.append_session(session_identity, chunk(0))
+            received = [
+                await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
+                for _ in range(2)
+            ]
+            assert [item.kind for item in received] == ["data", "input_done"]
+        finally:
+            await outputs.aclose()

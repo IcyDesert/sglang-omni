@@ -577,7 +577,8 @@ class Coordinator(SessionGraphRunner):
         if (
             not should_bypass_admission
             and self.max_in_flight is not None
-            and len(self.requests) >= self.max_in_flight
+            and sum(info.counts_toward_admission for info in self.requests.values())
+            >= self.max_in_flight
         ):
             logger.warning(
                 "Rejecting request %s before pipeline submit: in-flight cap "
@@ -622,6 +623,7 @@ class Coordinator(SessionGraphRunner):
                 if terminal_stages is None
                 else terminal_stages
             ),
+            counts_toward_admission=not should_bypass_admission,
         )
 
         # Create future for completion
