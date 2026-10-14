@@ -145,3 +145,25 @@ def test_client_disconnect_closes_the_session():
         open_session(websocket)
         websocket.close()
         assert client.closed.wait(timeout=5)
+
+
+def test_control_reaches_the_session_and_is_answered():
+    client = FakeClient()
+    event = TimedChunk("control", 0.0, 0.0, 0, {"type": "interrupt"}, "session", turn=2)
+    with connect(client) as websocket:
+        open_session(websocket)
+        send(
+            websocket,
+            {
+                "op": "control",
+                "chunk": event.to_dict(),
+                "stages": ["sink"],
+                "should_preempt": True,
+            },
+        )
+        assert receive(websocket) == {"op": "controlled", "seq": 0}
+        send(websocket, {"op": "control", "chunk": event.to_dict()})
+        assert receive(websocket) == {"op": "controlled", "seq": 0}
+        send(websocket, {"op": "close"})
+        assert receive(websocket) == {"op": "closed"}
+    assert client.controlled == [(event, ["sink"], True), (event, None, False)]

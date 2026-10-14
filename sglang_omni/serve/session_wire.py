@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 
 import msgpack
 import msgspec
@@ -90,11 +91,33 @@ class SessionWire:
             await asyncio.gather(output_task, receive_task, return_exceptions=True)
 
     async def receive_operations(self) -> None:
+        assert self.session_identity is not None
         while True:
             message = await self.receive()
             operation = message.get("op")
             if operation == "append":
-                await self.append(TimedChunk.from_dict(message.get("chunk")))
+                chunk = TimedChunk.from_dict(message.get("chunk"))
+                await self.report(
+                    self.client.append_session(self.session_identity, chunk),
+                    chunk.seq,
+                    "accepted",
+                )
+            elif operation == "control":
+                event = TimedChunk.from_dict(message.get("chunk"))
+                await self.report(
+                    self.client.control_session(
+                        self.session_identity,
+                        event,
+                        stages=msgspec.convert(
+                            message.get("stages"), type=list[str] | None
+                        ),
+                        should_preempt=msgspec.convert(
+                            message.get("should_preempt", False), type=bool
+                        ),
+                    ),
+                    event.seq,
+                    "controlled",
+                )
             elif operation == "close":
                 return
             elif operation == "open":
@@ -102,19 +125,19 @@ class SessionWire:
             else:
                 raise ValueError(f"unknown session operation {operation!r}")
 
-    async def append(self, chunk: TimedChunk) -> None:
-        assert self.session_identity is not None
+    async def report(
+        self, operation: Coroutine[None, None, object], seq: int, done: str
+    ) -> None:
+        """Run an append or a control and answer it with `done`; a full queue rejects it and keeps the session open."""
         try:
-            await self.client.append_session(self.session_identity, chunk)
+            await operation
         except Exception as exc:
             if QueueFullError.matches(exc):
-                await self.send(
-                    {"op": "rejected", "seq": chunk.seq, "reason": str(exc)}
-                )
+                await self.send({"op": "rejected", "seq": seq, "reason": str(exc)})
                 return
             else:
                 raise
-        await self.send({"op": "accepted", "seq": chunk.seq})
+        await self.send({"op": done, "seq": seq})
 
     async def forward_outputs(self) -> None:
         assert self.session_identity is not None
