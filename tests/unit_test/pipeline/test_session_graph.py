@@ -519,3 +519,26 @@ def test_a_graph_append_keeps_the_input_contract():
         sessions.append_graph(graph, TimedChunk("image", 0, 0, 2, b"png"))
     assert graph.next_input == 2
 
+
+def test_a_drop_oldest_append_that_cannot_confirm_the_dropped_input_changes_nothing():
+    sessions = SessionGraphRunner()
+    edge = DataEdge("input", capacity=1, overflow="drop_oldest")
+    graph = input_runtime(
+        {name: SessionNode((name,), (edge,)) for name in NODES},
+        SessionLimits(max_output_chunks=1),
+    )
+    sessions.append_graph(graph, chunk(0))
+    graph.outputs.put_nowait(None)
+    with pytest.raises(QueueFullError):
+        sessions.append_graph(graph, chunk(1))
+    assert graph.next_input == 1
+    assert graph.pending_input_done == {0: 2}
+    assert [[item[2] for item in graph.inboxes[name].queued] for name in NODES] == [
+        [0],
+        [0],
+    ]
+    graph.outputs.get_nowait()
+    assert sessions.append_graph(graph, chunk(1)) == 1
+    confirmed = graph.outputs.get_nowait()[0]
+    assert (confirmed.kind, confirmed.input_seq) == ("input_done", 0)
+    assert graph.pending_input_done == {1: 2}

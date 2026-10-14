@@ -232,10 +232,26 @@ class SessionGraphRunner(CoordinatorSessions):
             if graph.inboxes[name].counts[GRAPH_INPUT]
             >= self.edge_capacity(graph, name, GRAPH_INPUT)
         ]
+        # Note (Junnan Li): Every input the append confirms, its own or a dropped one, needs an output slot before anything changes.
+        dropped_inputs = Counter(
+            next(
+                seq
+                for source, _, seq in graph.inboxes[name].queued
+                if source == GRAPH_INPUT
+            )
+            for name in full
+        )
+        confirmations = sum(
+            count == graph.pending_input_done[seq]
+            for seq, count in dropped_inputs.items()
+        ) + (0 if reading_nodes else 1)
         if any(
             graph.graph.nodes[name].bound(GRAPH_INPUT).overflow == "block"
             for name in full
-        ) or (not reading_nodes and graph.outputs.full()):
+        ) or (
+            graph.outputs.maxsize > 0
+            and graph.outputs.qsize() + confirmations > graph.outputs.maxsize
+        ):
             raise QueueFullError()
         else:
             pass
