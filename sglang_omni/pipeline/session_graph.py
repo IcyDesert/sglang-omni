@@ -16,6 +16,7 @@ from sglang_omni.pipeline.sessions import (
     CoordinatorSessions,
     NodeInbox,
     SessionGraphRuntime,
+    admit_input,
     check_timing,
     output_chunk,
 )
@@ -221,6 +222,9 @@ class SessionGraphRunner(CoordinatorSessions):
             raise ValueError("input seq must be contiguous within an open index")
         else:
             check_timing(chunk, graph.modality_end_ms)
+        chunk, _ = admit_input(
+            chunk, graph.limits, graph.modality_end_ms, graph.ended_modalities
+        )
         reading_nodes = graph.graph.reading_nodes(GRAPH_INPUT, chunk.format)
         full = [
             name
@@ -254,6 +258,10 @@ class SessionGraphRunner(CoordinatorSessions):
             inbox.counts[GRAPH_INPUT] += 1
             inbox.wake.set()
         graph.modality_end_ms[chunk.modality] = chunk.t_start_ms + chunk.duration_ms
+        if chunk.eos:
+            graph.ended_modalities.add(chunk.modality)
+        else:
+            pass
         graph.next_input += 1
         return chunk.seq
 

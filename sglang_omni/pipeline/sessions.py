@@ -64,6 +64,38 @@ def check_timing(chunk: TimedChunk, modality_end_ms: dict[str, float] | None) ->
         pass
 
 
+def admit_input(
+    chunk: TimedChunk,
+    limits: SessionLimits,
+    modality_end_ms: dict[str, float],
+    ended_modalities: set[str],
+) -> tuple[TimedChunk, int]:
+    """Input a session can take: none after its modality's EOS, within max_chunk_bytes and max_modalities; returns it with its wire size."""
+    if chunk.modality in ended_modalities:
+        raise ValueError("input after EOS")
+    else:
+        pass
+    if isinstance(chunk.payload, bytes):
+        encoded_bytes = wire_size(chunk.to_dict())
+    else:
+        # Note (Junnan Li): Snapshot a mutable payload so later caller edits cannot reach it.
+        encoded = msgpack.packb(chunk.to_dict(), use_bin_type=True)
+        encoded_bytes = len(encoded)
+        chunk = TimedChunk.from_dict(msgpack.unpackb(encoded, raw=False))
+    if encoded_bytes > limits.max_chunk_bytes:
+        raise ValueError(
+            f"input chunk is {encoded_bytes} bytes; max_chunk_bytes is "
+            f"{limits.max_chunk_bytes}"
+        )
+    elif (
+        chunk.modality not in modality_end_ms
+        and len(modality_end_ms) >= limits.max_modalities
+    ):
+        raise QueueFullError()
+    else:
+        return chunk, encoded_bytes
+
+
 def output_chunk(output: OutputChunk) -> TimedChunk:
     """A data output as the chunk a reader or a control operation receives."""
     return TimedChunk(
@@ -147,6 +179,7 @@ class SessionGraphRuntime:
     client_sequences: dict[str, dict[int, int]] = field(default_factory=dict)
     pending_input_done: dict[int, int] = field(default_factory=dict)
     modality_end_ms: dict[str, float] = field(default_factory=dict)
+    ended_modalities: set[str] = field(default_factory=set)
     next_input: int = 0
     next_output: int = 0
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
@@ -355,36 +388,13 @@ class CoordinatorSessions:
             raise ValueError("input seq must be contiguous within an open index")
         else:
             pass
-        if chunk.modality in session.ended_modalities:
-            raise ValueError("input after EOS")
-        else:
-            pass
         check_timing(chunk, None if session.is_node else session.modality_end_ms)
-        if isinstance(chunk.payload, bytes):
-            encoded_bytes = wire_size(chunk.to_dict())
-        else:
-            # Note (Junnan Li): Snapshot a mutable payload so later caller edits cannot reach it.
-            encoded = msgpack.packb(chunk.to_dict(), use_bin_type=True)
-            encoded_bytes = len(encoded)
-            chunk = TimedChunk.from_dict(msgpack.unpackb(encoded, raw=False))
-        limits = session.limits
-        if encoded_bytes > limits.max_chunk_bytes:
-            raise ValueError(
-                f"input chunk is {encoded_bytes} bytes; max_chunk_bytes is "
-                f"{limits.max_chunk_bytes}"
-            )
-        else:
-            pass
+        chunk, encoded_bytes = admit_input(
+            chunk, session.limits, session.modality_end_ms, session.ended_modalities
+        )
         if (
-            session.pending_count >= limits.max_pending_chunks
-            or session.pending_bytes + encoded_bytes > limits.max_pending_bytes
-        ):
-            raise QueueFullError()
-        else:
-            pass
-        if (
-            chunk.modality not in session.modality_end_ms
-            and len(session.modality_end_ms) >= limits.max_modalities
+            session.pending_count >= session.limits.max_pending_chunks
+            or session.pending_bytes + encoded_bytes > session.limits.max_pending_bytes
         ):
             raise QueueFullError()
         else:

@@ -7,6 +7,7 @@ import asyncio
 
 import pytest
 
+from sglang_omni.admission import QueueFullError
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.session_graph import SessionGraphRunner
 from sglang_omni.pipeline.sessions import NodeInbox, Session, SessionGraphRuntime
@@ -482,3 +483,39 @@ async def test_an_interrupted_node_publishes_only_the_end_of_the_interrupted_tur
         ({"type": "turn.interrupted"}, 1),
         ({"text": "next"}, 2),
     ]
+
+
+def input_runtime(
+    nodes: dict[str, SessionNode], limits: SessionLimits
+) -> SessionGraphRuntime:
+    """An open graph of `nodes` whose tasks are not started, so client input stays in their inboxes."""
+    return SessionGraphRuntime(
+        session_identity=SessionIdentity("graph"),
+        graph=SessionGraph(nodes=nodes, publish={}),
+        nodes={name: SessionIdentity(f"graph:{name}") for name in nodes},
+        limits=limits,
+        inboxes={name: NodeInbox() for name in nodes},
+        outputs=asyncio.Queue(maxsize=limits.max_output_chunks),
+        client_sequences={name: {} for name in nodes},
+    )
+
+
+def test_a_graph_append_keeps_the_input_contract():
+    sessions = SessionGraphRunner()
+    graph = input_runtime(
+        {"reply": SessionNode(("reply",), ("input",))},
+        SessionLimits(max_chunk_bytes=256, max_modalities=2),
+    )
+    with pytest.raises(ValueError, match="max_chunk_bytes"):
+        sessions.append_graph(graph, TimedChunk("audio", 0, 20, 0, bytes(512)))
+    payload = {"text": "first"}
+    sessions.append_graph(graph, TimedChunk("text", 0, 0, 0, payload, "text_delta"))
+    payload["text"] = "edited"
+    assert graph.inboxes["reply"].queued[0][1].payload == {"text": "first"}
+    sessions.append_graph(graph, TimedChunk("audio", 0, 20, 1, b"pcm", eos=True))
+    with pytest.raises(ValueError, match="after EOS"):
+        sessions.append_graph(graph, TimedChunk("audio", 20, 20, 2, b"pcm"))
+    with pytest.raises(QueueFullError):
+        sessions.append_graph(graph, TimedChunk("image", 0, 0, 2, b"png"))
+    assert graph.next_input == 2
+
