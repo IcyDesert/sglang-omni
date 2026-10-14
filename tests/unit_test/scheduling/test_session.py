@@ -563,3 +563,40 @@ def test_context_exhaustion_releases_append_unit() -> None:
     assert not bridge.units_by_request_id
     assert bridge.sessions[identity.id].unit is None
     scheduler.session_controller.get.return_value.abort_req.assert_called_once()
+
+
+def test_an_ar_stage_holds_the_read_takes_a_control_and_answers_the_read_at_close():
+    identity = SessionIdentity("session-1")
+    scheduler = Mock(spec=OmniScheduler)
+    scheduler.max_running_requests = 4
+    scheduler.session_controller = Mock()
+    scheduler.session_controller.open.return_value = SimpleNamespace(success=True)
+    scheduler.session_controller.get.return_value = None
+    scheduler.tree_cache = SimpleNamespace(slots={})
+    scheduler.outbox = queue.Queue()
+    scheduler.aborted_request_ids = set()
+    adapter = Mock()
+    scheduler.session_bridge = ARSessionBridge(scheduler, adapter)
+    event = control_chunk("interrupt")
+
+    def route(request_id: str, operation: str, **fields) -> list[tuple[str, dict]]:
+        payload = operation_payload(request_id, operation, identity, **fields)
+        assert not OmniScheduler.route_session_input(scheduler, payload)
+        answered = []
+        while not scheduler.outbox.empty():
+            message = scheduler.outbox.get_nowait()
+            answered.append((message.request_id, message.data.data))
+        return answered
+
+    assert route("open", "open") == [("open", {"opened": True})]
+    assert route("read", "read") == []
+    assert route("control", "control", chunk=event) == [
+        ("control", {"controlled": True})
+    ]
+    adapter.control.assert_called_once_with(identity, event)
+    with pytest.raises(ValueError, match="preempt"):
+        route("preempt", "control", chunk=event, should_preempt=True)
+    assert route("close", "close") == [
+        ("read", {"closed": True}),
+        ("close", {"closed": True}),
+    ]

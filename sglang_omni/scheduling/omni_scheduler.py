@@ -1119,18 +1119,18 @@ class OmniScheduler(Generic[RequestDataT]):
         elif bridge is None:
             raise ValueError("AR streaming sessions are not enabled for this stage")
         elif operation.operation != "append":
-            session_payload = bridge.apply_operation(payload, operation)
-            if payload.request_id in self.aborted_request_ids:
-                return False
-            else:
-                self.outbox.put(
-                    OutgoingMessage(
-                        request_id=payload.request_id,
-                        type="result",
-                        data=session_payload,
+            for session_payload in bridge.apply_operation(payload, operation):
+                if session_payload.request_id in self.aborted_request_ids:
+                    pass
+                else:
+                    self.outbox.put(
+                        OutgoingMessage(
+                            request_id=session_payload.request_id,
+                            type="result",
+                            data=session_payload,
+                        )
                     )
-                )
-                return False
+            return False
         else:
             unit = bridge.accept(payload, operation)
             chunk = unit.chunk

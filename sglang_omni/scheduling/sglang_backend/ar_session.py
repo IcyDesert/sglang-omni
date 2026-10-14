@@ -120,6 +120,9 @@ class ARSessionAdapter:
     def close(self, session_identity: SessionIdentity) -> None:
         """Release auxiliary history after streaming session work and KV are released."""
 
+    def control(self, session_identity: SessionIdentity, event: TimedChunk) -> None:
+        """Handle a control event; an adapter without control semantics lets it pass."""
+
     def prepare_unit(
         self,
         session_identity: SessionIdentity,
@@ -186,6 +189,8 @@ class BridgeSession:
     unit: SessionUnit | None = None
     # note (Junnan Li): KV rebuilds need embeddings from every completed unit.
     embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
+    # The session's read; an AR stage emits only inside appends, so the close answers it.
+    output_read: StagePayload | None = None
 
 
 class ARSessionBridge:
@@ -206,7 +211,8 @@ class ARSessionBridge:
 
     def apply_operation(
         self, payload: StagePayload, operation: SessionOperation
-    ) -> StagePayload:
+    ) -> list[StagePayload]:
+        """Apply an operation other than append; returns the operations it answers, none for a read the close answers."""
         session_identity = operation.session_identity
         operation_kind = operation.operation
         session = self.sessions.get(session_identity.id)
@@ -226,18 +232,34 @@ class ARSessionBridge:
                 )
                 self.adapter.open(session_identity, payload.request)
                 payload.data = {"opened": True}
+                return [payload]
             else:
                 raise ValueError("streaming session open failed")
         elif operation_kind == "close":
-            if session is not None:
-                self.close_session(session)
-            else:
-                pass
-                # note (chenyang): coding style, each if should be closed by else.
             payload.data = {"closed": True}
+            if session is not None:
+                return [*self.close_session(session), payload]
+            else:
+                # note (chenyang): coding style, each if should be closed by else.
+                return [payload]
+        elif session is None:
+            raise ValueError("unknown session open index")
+        elif operation_kind == "read":
+            if session.output_read is not None:
+                raise ValueError("session already has an output reader")
+            else:
+                session.output_read = payload
+                return []
+        elif operation_kind == "control":
+            assert operation.chunk is not None, "control operation carries no event"
+            if operation.should_preempt:
+                raise ValueError("an AR session stage does not preempt its appends")
+            else:
+                self.adapter.control(session_identity, operation.chunk)
+                payload.data = {"controlled": True}
+                return [payload]
         else:
             raise ValueError("unknown session operation")
-        return payload
 
     def accept(self, payload: StagePayload, operation: SessionOperation) -> SessionUnit:
         chunk = operation.chunk
@@ -585,10 +607,16 @@ class ARSessionBridge:
             pass
         self.release_streaming_session(session.session_identity.id)
 
-    def close_session(self, session: BridgeSession) -> None:
+    def close_session(self, session: BridgeSession) -> list[StagePayload]:
+        """Release the session; returns its read, answered."""
         self.close_streaming_session(session)
         self.adapter.close(session.session_identity)
         self.sessions.pop(session.session_identity.id)
+        if session.output_read is None:
+            return []
+        else:
+            session.output_read.data = {"closed": True}
+            return [session.output_read]
 
     def close_open_sessions(self) -> None:
         adapter_failures: dict[str, Exception] = {}
