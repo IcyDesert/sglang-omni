@@ -80,6 +80,7 @@ class FakeSessionClient:
         *,
         stages: list[str] | None = None,
         should_preempt: bool = False,
+        is_ordered: bool = True,
     ) -> None:
         assert session_identity == self.identity
         self.controlled.append((event, stages, should_preempt))

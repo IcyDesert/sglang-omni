@@ -410,7 +410,13 @@ class NodeOutputsRunner(SessionGraphRunner):
             yield output
 
     async def control_session(
-        self, session_identity, event, *, stages=None, should_preempt=False
+        self,
+        session_identity,
+        event,
+        *,
+        stages=None,
+        should_preempt=False,
+        is_ordered=True,
     ):
         self.controls.append(event)
 

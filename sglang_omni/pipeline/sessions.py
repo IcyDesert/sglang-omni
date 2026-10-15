@@ -586,13 +586,16 @@ class CoordinatorSessions:
         *,
         stages: list[str] | None = None,
         should_preempt: bool = False,
+        is_ordered: bool = True,
     ) -> None:
         """Deliver a control event to the named logical stages, or to every stage of the route.
 
-        A control keeps its arrival order among the appends and controls of
-        the session; with should_preempt it goes out once the earlier appends
-        have reached their owners, which cancel the ones still in flight.
-        A graph delivers the event along its control edges from `input`.
+        An ordered control keeps its arrival order among the appends and
+        controls of the session; with should_preempt it goes out once the
+        earlier appends have reached their owners, which cancel the ones
+        still in flight. A control that is not ordered goes out at once and
+        only holds the appends after it. A graph orders the client's
+        controls and sends its node control edges' events at once.
         """
         graph = self.graphs.get(session_identity.id)
         if graph is not None and graph.session_identity == session_identity:
@@ -619,7 +622,7 @@ class CoordinatorSessions:
         barrier = (session.next_input, object())
         session.control_barriers.append(barrier)
         try:
-            while True:
+            while is_ordered:
                 if session.is_closing:
                     raise RuntimeError("session is closing")
                 elif (

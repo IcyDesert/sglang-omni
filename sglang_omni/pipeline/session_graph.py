@@ -115,6 +115,7 @@ class SessionGraphRunner(CoordinatorSessions):
             event,
             stages=None if edge.target_stages is None else list(edge.target_stages),
             should_preempt=edge.should_preempt or should_preempt,
+            is_ordered=edge.source == GRAPH_INPUT,
         )
 
     async def open_graph(

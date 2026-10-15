@@ -18,7 +18,7 @@ from multiprocessing.context import SpawnProcess
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict
+from typing import Literal, Protocol, TypeAlias, TypedDict
 
 import pytest
 
@@ -393,7 +393,9 @@ def chunk(seq: int, eos: bool = False) -> TimedChunk:
     return TimedChunk("audio", seq * 20, 20, seq, b"pcm", eos=eos)
 
 
-PipelineResources = tuple[Coordinator, Queue[StageEvent], list[SpawnProcess]]
+PipelineResources: TypeAlias = (
+    "tuple[Coordinator, Queue[StageEvent], list[SpawnProcess]]"
+)
 
 
 def event_log(events: Queue[StageEvent]) -> list[StageEvent]:
