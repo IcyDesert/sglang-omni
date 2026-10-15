@@ -4,7 +4,7 @@
 from collections.abc import Iterable
 
 from sglang_omni.client.client import Client
-from sglang_omni.models.nemotron_voicechat.duplex_config import STAGES
+from sglang_omni.config.schema import PipelineConfig
 from sglang_omni.models.nemotron_voicechat.payload_types import (
     INPUT_SAMPLE_RATE,
     OUTPUT_SAMPLE_RATE,
@@ -90,7 +90,6 @@ def make_adapter(
 
     return CoordinatorAdapter(
         client,
-        stages=STAGES,
         request_builder=request,
         output_converter=VoiceChatOutput(),
         atomic_consumption=True,
@@ -99,8 +98,12 @@ def make_adapter(
 
 
 def deployment(
-    client: Client, *, session_limits: SessionLimits | None = None
+    client: Client,
+    pipeline_config: PipelineConfig | None = None,
+    *,
+    session_limits: SessionLimits | None = None,
 ) -> RealtimeDeployment:
+    """The serving layer passes the pipeline config; the Session shape comes from it through the coordinator."""
     return RealtimeDeployment(
         Capabilities(
             interaction="native",
