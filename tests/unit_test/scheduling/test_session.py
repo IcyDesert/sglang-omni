@@ -30,6 +30,7 @@ from sglang_omni.scheduling.session import (
     SessionScheduler,
 )
 from sglang_omni.scheduling.sglang_backend.ar_session import (
+    ARSessionAdapter,
     ARSessionBridge,
     BridgeSession,
     SessionUnit,
@@ -594,9 +595,55 @@ def test_an_ar_stage_holds_the_read_takes_a_control_and_answers_the_read_at_clos
         ("control", {"controlled": True})
     ]
     adapter.control.assert_called_once_with(identity, event)
-    with pytest.raises(ValueError, match="preempt"):
-        route("preempt", "control", chunk=event, should_preempt=True)
+    assert route("preempt", "control", chunk=event, should_preempt=True) == [
+        ("preempt", {"controlled": True})
+    ]
     assert route("close", "close") == [
         ("read", {"closed": True}),
         ("close", {"closed": True}),
     ]
+
+
+@pytest.mark.parametrize("should_preempt", [False, True])
+def test_ar_session_control_preserves_session(should_preempt: bool) -> None:
+    identity = SessionIdentity("voicechat")
+    event = TimedChunk("control", 0, 0, 0, {"responses": []}, format="tool_response")
+    scheduler = Mock(spec=OmniScheduler)
+    scheduler.aborted_request_ids = set()
+    scheduler.outbox = queue.Queue()
+    scheduler.session_controller = Mock()
+    adapter = ARSessionAdapter()
+    adapter.control = Mock(wraps=adapter.control)
+    bridge = ARSessionBridge(scheduler, adapter)
+    scheduler.session_bridge = bridge
+    session = BridgeSession(session_identity=identity)
+    bridge.sessions[identity.id] = session
+    bridge.accept(
+        StagePayload("append", OmniRequest(None), {}),
+        SessionOperation("append", identity, ("thinker",), event),
+    )
+    payload = StagePayload(
+        "control",
+        OmniRequest(
+            None,
+            metadata=operation_metadata(
+                "control", identity, event, should_preempt=should_preempt
+            ),
+        ),
+        {},
+    )
+    assert not OmniScheduler.route_session_input(scheduler, payload)
+    assert scheduler.outbox.get_nowait().data.data == {"controlled": True}
+    adapter.control.assert_called_once_with(identity, event)
+    assert bridge.sessions[identity.id] is session
+    assert (session.unit is None) == should_preempt
+    assert scheduler.abort.call_count == int(should_preempt)
+    for invalid_identity in (
+        SessionIdentity("missing"),
+        SessionIdentity(identity.id, 2),
+    ):
+        with pytest.raises(ValueError, match="unknown|stale"):
+            bridge.apply_operation(
+                payload,
+                SessionOperation("control", invalid_identity, ("thinker",), event),
+            )

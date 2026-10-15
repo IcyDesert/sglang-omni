@@ -663,7 +663,6 @@ class SessionControlEdgeConfig(BaseModel):
     kind: Literal["control"]
     source: str
     event: str
-    target_stages: list[str] | None = None
     preempt: bool = False
 
     def edge(self) -> ControlEdge:
@@ -671,9 +670,6 @@ class SessionControlEdgeConfig(BaseModel):
         return ControlEdge(
             source=self.source,
             event=self.event,
-            target_stages=(
-                None if self.target_stages is None else tuple(self.target_stages)
-            ),
             should_preempt=self.preempt,
         )
 

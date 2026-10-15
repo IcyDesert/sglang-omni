@@ -87,7 +87,7 @@ class SessionGraphRunner(CoordinatorSessions):
         The client's own input stays.
         """
         if control_type(event) == INTERRUPT and event.turn is not None:
-            graph.interrupted_turns[target] = event.turn
+            graph.interrupted_turns.setdefault(target, set()).add(event.turn)
             inbox = graph.inboxes[target]
             inbox.queued = deque(
                 item
@@ -110,10 +110,13 @@ class SessionGraphRunner(CoordinatorSessions):
             node.pending = kept
         else:
             pass
+        if control_type(event) is None and self.is_interrupted(graph, target, event):
+            return
+        else:
+            pass
         await self.control_session(
             graph.nodes[target],
             event,
-            stages=None if edge.target_stages is None else list(edge.target_stages),
             should_preempt=edge.should_preempt or should_preempt,
             is_ordered=edge.source == GRAPH_INPUT,
         )
@@ -294,14 +297,14 @@ class SessionGraphRunner(CoordinatorSessions):
     def is_interrupted(
         self, graph: SessionGraphRuntime, target: str, chunk: TimedChunk
     ) -> bool:
-        return (
-            chunk.turn is not None and graph.interrupted_turns.get(target) == chunk.turn
+        return chunk.turn is not None and chunk.turn in graph.interrupted_turns.get(
+            target, set()
         )
 
     async def put_graph_inbox(
         self, graph: SessionGraphRuntime, target: str, source: str, chunk: TimedChunk
     ) -> None:
-        """Queue a node's chunk on its edge into `target`; a full edge holds the producer or drops its own oldest chunk, and a chunk of the turn last interrupted at `target` is dropped."""
+        """Queue a node's chunk on its edge into `target`; a full edge holds the producer or drops its own oldest chunk, and a chunk of any turn interrupted at `target` is dropped."""
         inbox = graph.inboxes[target]
         capacity = self.edge_capacity(graph, target, source)
         overflow = graph.graph.nodes[target].bound(source).overflow
@@ -389,8 +392,9 @@ class SessionGraphRunner(CoordinatorSessions):
             else:
                 pass
             chunk = output_chunk(output)
-            if name in graph.interrupted_turns and is_interrupted_reply(
-                chunk, graph.interrupted_turns[name]
+            if any(
+                is_interrupted_reply(chunk, turn)
+                for turn in graph.interrupted_turns.get(name, ())
             ):
                 continue
             else:

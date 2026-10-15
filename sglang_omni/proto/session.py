@@ -84,7 +84,11 @@ class SessionIdentity:
 
 @dataclass(frozen=True)
 class TimedChunk:
-    """Input seq is global across modalities within one open_index; turn stamps the chunks of one reply."""
+    """Input seq is global within one open_index; turn identifies one cancellable reply.
+
+    All producers contributing to a reply preserve its turn, including tools.
+    Tool call IDs identify individual calls; they are not reply turns.
+    A producer without a reply-turn contract leaves turn unset."""
 
     modality: str
     t_start_ms: float
@@ -183,13 +187,12 @@ class ControlEdge:
     """A control event of `source` delivered to the node as a control operation, not as input.
 
     `source` is `input` or a node, `event` the control type it carries;
-    `target_stages` narrows the delivery to those stages of the node and
+    Every stage on the node route receives the event in route order;
     `should_preempt` cancels the node's in-flight appends first.
     """
 
     source: str
     event: str
-    target_stages: tuple[str, ...] | None = None
     should_preempt: bool = False
 
 
