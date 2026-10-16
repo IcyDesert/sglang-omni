@@ -2,6 +2,7 @@
 """Adapt Python tool functions to a CPU Session stage."""
 
 import asyncio
+import logging
 
 from sglang_omni.models.tools.runner import ToolRunner
 from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -14,6 +15,8 @@ from sglang_omni.scheduling.session import (
     SessionHooks,
     SessionScheduler,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ToolHooks(SessionHooks):
@@ -32,7 +35,17 @@ class ToolHooks(SessionHooks):
         self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
     ) -> StagePayload:
         if chunk.format == TOOL_CALL:
-            responses = asyncio.run(self.runner.respond_all(tool_calls_of(chunk)))
+            calls = tool_calls_of(chunk)
+            responses = asyncio.run(self.runner.respond_all(calls))
+            for call, answered in zip(calls, responses):
+                logger.info(
+                    "tool %s %s(%s) -> %s turn=%s",
+                    call.id,
+                    call.name,
+                    call.arguments,
+                    answered.response,
+                    chunk.turn,
+                )
             response = tool_response_chunk(responses, chunk.turn)
             context.emit(
                 TimedChunk(
