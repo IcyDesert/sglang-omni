@@ -174,8 +174,8 @@ class SessionGraphRuntime:
     inboxes: dict[str, NodeInbox]
     outputs: asyncio.Queue[tuple[OutputChunk, int] | None]
     output_bytes: int = 0
-    # The last turn an interrupt named to each node; that turn's chunks from other nodes no longer reach it.
-    interrupted_turns: dict[str, int] = field(default_factory=dict)
+    # note (Junnan Li): Interrupted reply IDs remain fenced until the graph closes; late tools may outlive later replies.
+    interrupted_turns: dict[str, set[int]] = field(default_factory=dict)
     client_sequences: dict[str, dict[int, int]] = field(default_factory=dict)
     pending_input_done: dict[int, int] = field(default_factory=dict)
     modality_end_ms: dict[str, float] = field(default_factory=dict)

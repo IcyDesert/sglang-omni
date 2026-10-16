@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
 from sglang_omni.admission import QueueFullError
+from sglang_omni.config.schema import SessionControlEdgeConfig
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.session_graph import SessionGraphRunner
 from sglang_omni.pipeline.sessions import NodeInbox, Session, SessionGraphRuntime
@@ -23,6 +25,7 @@ from sglang_omni.proto.session import (
     TimedChunk,
     wire_size,
 )
+from tests.unit_test.fixtures.session_outputs import control_chunk
 from tests.unit_test.fixtures.session_pipeline import (
     chunk,
     event_log,
@@ -67,7 +70,7 @@ def test_graph_declaration_names_its_sources_and_readers():
         ("right", ControlEdge("left", "interrupt", should_preempt=True)),
     )
     assert graph.control_targets("input", "interrupt") == (
-        ("right", ControlEdge("input", "interrupt", ("right",))),
+        ("right", ControlEdge("input", "interrupt")),
     )
     assert graph.control_targets("left", "turn.done") == ()
     assert graph.reading_nodes("left", "session") == ()
@@ -142,7 +145,7 @@ def control_graph() -> SessionGraph:
                 inputs=(),
                 controls=(
                     ControlEdge("left", "interrupt", should_preempt=True),
-                    ControlEdge("input", "interrupt", ("right",)),
+                    ControlEdge("input", "interrupt"),
                 ),
             ),
         },
@@ -548,3 +551,50 @@ def test_a_drop_oldest_append_that_cannot_confirm_the_dropped_input_changes_noth
     confirmed = graph.outputs.get_nowait()[0]
     assert (confirmed.kind, confirmed.input_seq) == ("input_done", 0)
     assert graph.pending_input_done == {1: 2}
+
+
+def test_control_edge_does_not_address_internal_stages():
+    with pytest.raises(ValueError, match="target_stages"):
+        SessionControlEdgeConfig(
+            kind="control",
+            source="tool",
+            event="tool_response",
+            target_stages=["perception"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_node_control_broadcast_and_late_tool_reply_fence(tmp_path):
+    async with pipeline(tmp_path) as (coordinator, events, _):
+        coordinator.session_graph = SessionGraph(
+            {"model": SessionNode(("source", "sink"), ("input",))}, {}
+        )
+        identity = await coordinator.open_session(OmniRequest(None))
+        graph = coordinator.graphs[identity.id]
+        for event, turns in (("interrupt", (41, 42)), ("tool_response", (41, 42, 43))):
+            for turn in turns:
+                chunk = replace(
+                    control_chunk(event, turn=turn),
+                    format="session" if event == "interrupt" else event,
+                )
+                await coordinator.control_edge(
+                    graph,
+                    "model",
+                    ControlEdge("input", event, should_preempt=True),
+                    chunk,
+                )
+        controls = []
+
+        def received_controls():
+            controls.extend(
+                event for event in event_log(events) if event[0] == "control"
+            )
+            return len(controls) == 6
+
+        await wait_until(received_controls)
+        assert [(event[1], event[3]) for event in controls] == [
+            (stage, event)
+            for event in ("interrupt", "interrupt", "tool_response")
+            for stage in ("source", "sink")
+        ]
+        await coordinator.close_session(identity)

@@ -8,7 +8,7 @@ Every node of the Session is an entry of `session_nodes`, and `session_publish` 
 
 `inputs` lists the nodes a node reads; `input` is the Session's own input, its audio, its `commit` and other controls. `node:format` takes only that format from that node; two nodes never send the same format to one reader, and the audio format of `input` is the Session input's alone.
 
-An input written `{kind: control, source, event, target_stages, preempt}` is a control edge. Its `event` is a control type of the source's `session` chunks or the format of its other chunks, such as `tool_response`; the event is handed to the node as a `control` operation, outside its input queue, to every stage of its route or to `target_stages` only, and travels on no other edge and to no client. With `preempt` the stages cancel the node's in-flight appends first. The client's `interrupt` reaches a node through a control edge from `input`.
+An input written `{kind: control, source, event, preempt}` is a control edge. Its `event` is a control type of the source's `session` chunks or the format of its other chunks, such as `tool_response`; the event is handed to the node as a `control` operation, outside its input queue, to every stage of its route in route order, and travels on no other edge and to no client. With `preempt` the stages cancel the node's in-flight appends first. The client's `interrupt` reaches a node through a control edge from `input`.
 
 An input of a stage node written `{source, capacity, overflow}` bounds its edge. The inputs naming one source are one edge into the node; it holds at most `capacity` chunks the node's own session has not accepted yet, by default the Session's `max_pending_chunks`. When the edge is full, `overflow: block`, the default, holds the producing node until the node takes a chunk, and rejects the client's append as a full queue; `overflow: drop_oldest` drops the edge's oldest chunk and lets the producer go on; on the client's edge the dropped input is confirmed to the client like a taken one, so a real-time node such as a full-duplex model hears the newest audio instead of a backlog. Two inputs of one source that declare different bounds fail the declaration.
 
@@ -38,3 +38,15 @@ An `interrupt` naming a turn that reaches a node on a control edge first drops t
 A Session takes four operations: `open`, `append`, `control` and `close`. `Client.control_session(identity, event, stages=None, should_preempt=False)` delivers a `session` control chunk such as `interrupt` to every stage of the Session's route, or to the named stages, in the Session's arrival order with its appends; `should_preempt` cancels the stages' in-flight appends first. On a Session graph the event follows the control edges declared from `input`. A Session delivers its outputs as the nodes produce them, between appends as well as during one, so a client that has spoken may wait for the replies without appending.
 
 A `/v1/session` client opens the Session the pipeline declares; the open frame carries `params`, and the Session's limits are the deployment's. An `append` frame carries a `chunk` and is answered with `accepted`; a `control` frame carries the event as its `chunk`, with optional `stages` and `should_preempt`, and is answered with `controlled`. Both answers carry the chunk's seq, and a full queue answers either with `rejected` and leaves the Session open.
+
+A chunk's `turn` identifies a cancellable reply within the Session, not a tool
+call or an input audio frame. All work belonging to that reply preserves the
+same ID, including tool responses. Interrupted reply IDs remain fenced for the
+lifetime of the graph, including tool results carried by control edges. Session
+control commands such as interrupt and truncate remain deliverable. Nodes must discard any matching
+work they have already buffered when they receive the interrupt.
+
+A producer without reply boundaries leaves `turn` unset. VoiceChat's continuous
+duplex stream does not currently allocate reply turns; tool call IDs identify its
+individual calls. Passing through a supplied `turn` does not add native speech
+interruption or reply-boundary detection to VoiceChat.

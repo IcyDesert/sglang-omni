@@ -252,12 +252,13 @@ class ARSessionBridge:
                 return []
         elif operation_kind == "control":
             assert operation.chunk is not None, "control operation carries no event"
-            if operation.should_preempt:
-                raise ValueError("an AR session stage does not preempt its appends")
+            if operation.should_preempt and session.unit is not None:
+                self.cancel(session.unit.request_id)
             else:
-                self.adapter.control(session_identity, operation.chunk)
-                payload.data = {"controlled": True}
-                return [payload]
+                pass
+            self.adapter.control(session_identity, operation.chunk)
+            payload.data = {"controlled": True}
+            return [payload]
         else:
             raise ValueError("unknown session operation")
 
