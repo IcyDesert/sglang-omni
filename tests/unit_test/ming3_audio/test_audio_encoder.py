@@ -7,7 +7,7 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sglang_omni.models.ming3_audio.audio_encoder import (
+from sglang_omni.modules.ming_audio.audio_encoder import (
     AudioEncoderConfig,
     Ming3AudioEncoder,
 )
