@@ -986,7 +986,7 @@ async def test_an_interrupt_drops_released_audio_still_waiting_for_the_client():
     runner = SessionGraphRunner()
     delivery = asyncio.create_task(runner.deliver_paced_outputs(graph, "speaker"))
     await asyncio.sleep(0.05)
-    graph.interrupted_turns["speaker"] = 1
+    graph.interrupted_turns["speaker"] = {1}
     graph.output_bytes -= pacer.purge(1)
     assert (await graph.outputs.get())[0] is filler
     graph.output_bytes += 3300

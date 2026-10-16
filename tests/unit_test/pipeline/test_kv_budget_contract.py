@@ -25,7 +25,7 @@ from sglang_omni.models.registry import import_pipeline_configs
 KV_BYTES = 2 * 1024**3
 # Configs built from a declaration rather than a model path, with a declaration that names engine stages.
 DECLARED_EXAMPLES = {
-    "StreamingCascadePipelineConfig": "examples/streaming_cascade/profiles/qwen3-omni/launch.yaml"
+    "StreamingCascadePipelineConfig": "examples/streaming_cascade/profiles/nemotron-stage-qwen3-tts/launch.yaml"
 }
 
 
