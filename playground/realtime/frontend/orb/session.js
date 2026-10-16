@@ -1,4 +1,4 @@
-// Protocol state for one native full-duplex realtime session; no DOM, no audio.
+// Protocol state for one realtime session (native full duplex or turn based); no DOM, no audio.
 // app.js wires it to the page; the Node tests drive it with a fake socket.
 
 // The server grants the input rate in session.updated; this is only the fallback.
@@ -59,6 +59,9 @@ export class DuplexSession {
     this.units = [];
     this.unitAudio = new Map();
     this.responseOpen = false;
+    this.responseId = null;
+    // Turn-based servers report the user's speech from their VAD.
+    this.userSpeaking = false;
     this.transcript = "";
     this.lastLatencyMs = null;
     this.errors = [];
@@ -92,6 +95,10 @@ export class DuplexSession {
       else if (frame.status === "rejected") rejected += 1;
     }
     return { sent: this.frames.length, accepted, rejected, skipped: this.framesSkipped };
+  }
+
+  get turnBased() {
+    return Boolean(this.granted) && this.granted.interaction === "turn_based";
   }
 
   get unitMs() {
@@ -336,15 +343,20 @@ export class DuplexSession {
         }
         break;
       }
+      case "input_audio_buffer.speech_started":
+      case "input_audio_buffer.speech_stopped":
+        this.userSpeaking = event.type === "input_audio_buffer.speech_started";
+        break;
       case "response.created":
         this.responseOpen = true;
-        this.emit("response", { open: true, id: event.response && event.response.id });
+        this.responseId = (event.response && event.response.id) || null;
+        this.emit("response", { open: true, id: this.responseId });
         break;
       case "response.output_audio.delta": {
         const bytes = base64ToBytes(event.delta || "");
         const unitId = extension.unit_id || "unknown";
         this.unitAudio.set(unitId, (this.unitAudio.get(unitId) || 0) + bytes.byteLength / 2);
-        this.emit("audio", bytes);
+        this.emit("audio", { bytes, responseId: event.response_id || this.responseId });
         break;
       }
       case "response.output_text.delta":
@@ -354,6 +366,7 @@ export class DuplexSession {
         break;
       case "response.done":
         this.responseOpen = false;
+        this.responseId = null;
         if (this.transcript && !this.transcript.endsWith("\n")) this.transcript += "\n";
         this.emit("response", { open: false, id: event.response && event.response.id, status: event.response && event.response.status });
         break;

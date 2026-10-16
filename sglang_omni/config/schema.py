@@ -12,7 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.main import IncEx
 from typing_extensions import Unpack
 
-from sglang_omni.proto.session import ControlEdge, DataEdge, SessionGraph, SessionNode
+from sglang_omni.proto.session import (
+    DEFAULT_MAX_OUTPUT_LEAD_MS,
+    ControlEdge,
+    DataEdge,
+    SessionGraph,
+    SessionNode,
+)
 
 if TYPE_CHECKING:
     from sglang_omni.serve.realtime.transcription_session import StreamingASRStrategy
@@ -246,6 +252,16 @@ class FactoryArgs(BaseModel):
             )
         else:
             pass
+
+
+class ServiceConfig(BaseModel):
+    """A service the pipeline talks to, started before it when its port does not answer."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
+    port: int = Field(gt=0, lt=65536)
+    env: dict[str, str] = Field(default_factory=dict)
 
 
 class PlacementConfig(BaseModel):
@@ -697,6 +713,8 @@ class SessionNodeConfig(BaseModel):
     inputs: list[str | SessionDataEdgeConfig | SessionControlEdgeConfig] = Field(
         min_length=1
     )
+    execution: str | None = None
+    "Import path of the coordinator-side component running this node over its stages."
 
 
 class PipelineConfig(BaseModel):
@@ -755,6 +773,10 @@ class PipelineConfig(BaseModel):
     "The Session as a graph of stage routes; empty when the Session is the one route from the entry stage."
     session_publish: dict[str, list[str]] = Field(default_factory=dict)
     "Per node of the graph, the chunk formats that reach the client."
+    max_output_lead_ms: float = Field(default=DEFAULT_MAX_OUTPUT_LEAD_MS, gt=0)
+    "How far ahead of real time, counted from a reply's start, a Session delivers the reply's audio; an interruption cannot take back audio already delivered."
+    services: list[ServiceConfig] = Field(default_factory=list)
+    "The services started in this order before the pipeline, each waited for until its /v1/models answers."
 
     def model_dump(self, **kwargs: Unpack[ModelDumpOptions]) -> dict[str, object]:
         """Dump with each stage serialized by its runtime class.
@@ -907,6 +929,7 @@ class PipelineConfig(BaseModel):
         nodes = {
             name: SessionNode(
                 stages=tuple(node.stages),
+                execution=node.execution,
                 inputs=tuple(
                     entry if isinstance(entry, str) else entry.edge()
                     for entry in node.inputs
@@ -1070,6 +1093,12 @@ class PipelineConfig(BaseModel):
     def validate_general(self) -> None:
         if not self.model_path:
             raise ValueError("Model path is required")
+        else:
+            pass
+        names = [service.name for service in self.services]
+        ports = [service.port for service in self.services]
+        if len(set(names)) != len(names) or len(set(ports)) != len(ports):
+            raise ValueError("services must have distinct names and ports")
         else:
             pass
         for stage in self.stages:

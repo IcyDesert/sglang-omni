@@ -19,7 +19,7 @@ JsonObject = dict[str, JsonValue]
 SessionType = Literal["realtime", "transcription"]
 SessionState = Literal["CREATED", "OPEN", "CLOSING", "CLOSED"]
 MAX_EVENT_ID_LENGTH = 256
-Interaction = Literal["native"]
+Interaction = Literal["native", "turn_based"]
 TailPolicy = Literal["flush", "pad", "reject"]
 PartialStyle = Literal["append_only", "revising"]
 
@@ -202,6 +202,13 @@ class ImageAppendEvent(ClientEvent):
     sglang: ImageAppendMetadata
 
 
+class ConversationItemTruncateEvent(ClientEvent):
+    type: Literal["conversation.item.truncate"]
+    item_id: str
+    content_index: int
+    audio_end_ms: float
+
+
 class SessionCommandEvent(ClientEvent):
     type: Literal[
         "input_audio_buffer.clear",
@@ -209,14 +216,23 @@ class SessionCommandEvent(ClientEvent):
         "session.close",
         "input_audio_buffer.commit",
         "response.create",
+        "response.cancel",
     ]
 
 
 CLIENT_EVENT: TypeAdapter[
-    SessionUpdateEvent | AudioAppendEvent | ImageAppendEvent | SessionCommandEvent
+    SessionUpdateEvent
+    | AudioAppendEvent
+    | ImageAppendEvent
+    | ConversationItemTruncateEvent
+    | SessionCommandEvent
 ] = TypeAdapter(
     Annotated[
-        SessionUpdateEvent | AudioAppendEvent | ImageAppendEvent | SessionCommandEvent,
+        SessionUpdateEvent
+        | AudioAppendEvent
+        | ImageAppendEvent
+        | ConversationItemTruncateEvent
+        | SessionCommandEvent,
         Field(discriminator="type"),
     ]
 )

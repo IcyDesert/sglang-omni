@@ -43,6 +43,7 @@ import asyncio
 import queue
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
@@ -63,7 +64,11 @@ from sglang_omni.proto.session import (
     TimedChunk,
     find_session_operation,
 )
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import (
+    IncomingMessage,
+    OutgoingMessage,
+    emit_session_release,
+)
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 DEFAULT_MAX_OPEN_SESSIONS = 64
@@ -101,6 +106,11 @@ class SessionHooks:
         self, session_identity: SessionIdentity, emit: ChunkEmitter
     ) -> None:
         """Take the session's output stream for chunks emitted outside an append; a stage that emits only inside appends lets it pass."""
+
+    def attach_output_error_handler(
+        self, session_identity: SessionIdentity, fail: Callable[[BaseException], None]
+    ) -> None:
+        """Report a background producer failure on the session's output read."""
 
     def append(
         self,
@@ -377,6 +387,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         else:
             pass
         self.finish_operation(request_id)
+        emit_session_release(self, request_id)
 
     def run_batch(
         self, batch: list[IncomingMessage], loop: asyncio.AbstractEventLoop
@@ -596,6 +607,17 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                 )
             )
 
+    def fail_output(
+        self, session_identity: SessionIdentity, error: BaseException
+    ) -> None:
+        with self.session_table_lock:
+            session = self.open_sessions.get(session_identity)
+            reader = None if session is None else session.output_read
+        if reader is not None:
+            self.emit_error(reader.request_id, error, self.outbox)
+        else:
+            pass
+
     def check_usage(self, session_identity: SessionIdentity) -> None:
         """Fail only the session whose state outgrew its own budget.
 
@@ -631,6 +653,9 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         try:
             self.session_hooks.open(session_identity, request)
             session.is_open = True
+            self.session_hooks.attach_output_error_handler(
+                session_identity, partial(self.fail_output, session_identity)
+            )
             self.session_hooks.attach_output_stream(
                 session_identity, partial(self.emit_output, session_identity)
             )

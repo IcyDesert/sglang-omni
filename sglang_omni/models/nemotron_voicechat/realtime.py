@@ -104,6 +104,7 @@ def deployment(
     session_limits: SessionLimits | None = None,
 ) -> RealtimeDeployment:
     """The serving layer passes the pipeline config; the Session shape comes from it through the coordinator."""
+    limits = session_limits if session_limits is not None else SessionLimits()
     return RealtimeDeployment(
         Capabilities(
             interaction="native",
@@ -113,11 +114,8 @@ def deployment(
             native_unit_ms=80,
             tail_policy="pad",
         ),
-        lambda: make_adapter(client, session_limits),
-        limits=(
-            RuntimeLimits(cleanup_timeout_s=session_limits.operation_timeout_s)
-            if session_limits is not None
-            else RuntimeLimits()
-        ),
+        lambda: make_adapter(client, limits),
+        limits=RuntimeLimits(cleanup_timeout_s=limits.operation_timeout_s),
+        session_limits=limits,
         max_connections=1,
     )

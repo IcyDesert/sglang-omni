@@ -20,7 +20,11 @@ from collections.abc import Coroutine, Sequence
 from typing import Awaitable, Callable, Generic, Protocol
 
 from sglang_omni.proto.request import StagePayload
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import (
+    IncomingMessage,
+    OutgoingMessage,
+    emit_session_release,
+)
 from sglang_omni.scheduling.threaded_simple_scheduler import ComputeInput, ComputeResult
 
 logger = logging.getLogger(__name__)
@@ -66,6 +70,7 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
+        self.session_release_tracking: set[str] = set()
         self.requires_tp_work_fanout: bool = True
         self.fn = compute_fn
         self.batch_fn = batch_compute_fn
@@ -307,6 +312,7 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
                 msg = self.next_message()
                 if msg.type == "new_request":
                     if self.consume_if_aborted(msg.request_id):
+                        emit_session_release(self, msg.request_id)
                         continue
                     else:
                         pass
@@ -328,6 +334,9 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
                                 exc,
                                 self.outbox,
                             )
+                    finally:
+                        for finished_msg in batch:
+                            emit_session_release(self, finished_msg.request_id)
                 else:
                     pass
         finally:
@@ -364,6 +373,7 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
                 else:
                     pass
                 if self.consume_if_aborted(msg.request_id):
+                    emit_session_release(self, msg.request_id)
                     continue
                 else:
                     pass
@@ -385,6 +395,8 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
                         "SimpleScheduler: compute_fn failed for %s", msg.request_id
                     )
                     self.emit_error(msg.request_id, exc, self.outbox)
+                finally:
+                    emit_session_release(self, msg.request_id)
 
         bridge_task = asyncio.create_task(bridge_inbox())
         worker_tasks = [

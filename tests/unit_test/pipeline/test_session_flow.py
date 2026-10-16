@@ -2,19 +2,48 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from multiprocessing.queues import Queue
 from typing import Literal
 
 import pytest
 
-from sglang_omni.pipeline.sessions import Session
+from sglang_omni.pipeline.session_execution import SessionEmitter, SessionWork
+from sglang_omni.pipeline.sessions import CoordinatorSessions, Session
 from sglang_omni.proto import OmniRequest
-from sglang_omni.proto.session import TimedChunk, find_session_operation
+from sglang_omni.proto.session import (
+    SessionIdentity,
+    SessionLimits,
+    TimedChunk,
+    find_session_operation,
+)
 from tests.unit_test.fixtures.session_outputs import control_chunk
 from tests.unit_test.fixtures.session_pipeline import chunk, event_log, pipeline
 
 IN_FLIGHT_ACCEPT_TIMEOUT_S = 1
 STAGE_REPLY_TIMEOUT_S = 5
+
+
+def test_delayed_graph_start_cannot_resurrect_released_owner() -> None:
+    coordinator = CoordinatorSessions()
+    session = Session(
+        session_identity=SessionIdentity("graph"),
+        request=OmniRequest(None),
+        stages=("source", "sink"),
+        bindings={},
+        limits=SessionLimits(),
+        owned_by_execution=True,
+    )
+    coordinator.sessions["graph"] = session
+    session.work_owners["request"] = {"source", "sink"}
+    session.work_released["request"] = asyncio.Event()
+    coordinator.handle_session_work_release("request", "sink")
+    coordinator.handle_session_work_start("request", "sink")
+    assert not session.work_released["request"].is_set()
+    coordinator.handle_session_work_release("request", "source")
+    assert session.work_released["request"].is_set()
+    coordinator.handle_session_work_start("request", "source")
+    assert session.work_released["request"].is_set()
 
 
 def append_owners(events: Queue) -> list[str]:
@@ -393,3 +422,80 @@ async def test_a_control_follows_the_appends_accepted_before_it(linear_pair) -> 
             "configure",
             2,
         ]
+
+
+class HeldInputExecution:
+    """Execution component that echoes each input and holds the first one until the test releases it."""
+
+    def __init__(self, work: SessionWork) -> None:
+        self.work = work
+        self.emitter: SessionEmitter | None = None
+        self.first_append_gate = asyncio.Event()
+        self.controls: list[TimedChunk] = []
+        self.is_closed = False
+
+    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
+        self.emitter = emitter
+
+    async def append(self, chunk: TimedChunk) -> None:
+        assert self.emitter is not None
+        await self.emitter.emit_output(replace(chunk, payload={"echo": chunk.seq}))
+        if chunk.seq == 0:
+            await self.first_append_gate.wait()
+        else:
+            pass
+
+    async def control(self, event: TimedChunk) -> None:
+        self.controls.append(event)
+
+    async def close(self) -> None:
+        self.is_closed = True
+        await self.work.release_all(1)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execution_component_drives_the_session_without_model_knowledge(
+    linear_pair,
+):
+    coordinator, events, _ = linear_pair
+    executions: list[HeldInputExecution] = []
+
+    def factory(work: SessionWork) -> HeldInputExecution:
+        executions.append(HeldInputExecution(work))
+        return executions[0]
+
+    coordinator.session_execution_factories["held"] = factory
+    identity = await coordinator.open_route(
+        OmniRequest(None),
+        stages=["source", "sink"],
+        limits=None,
+        session_id=None,
+        execution="held",
+    )
+    execution = executions[0]
+    outputs = coordinator.session_outputs(identity)
+    await coordinator.append_session(identity, chunk(0))
+    await coordinator.append_session(identity, chunk(1))
+    echoed = await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S)
+    assert echoed.payload == {"echo": 0} and echoed.input_seq == 0
+    assert coordinator.sessions[identity.id].pending_count == 2
+    execution.first_append_gate.set()
+    received = [
+        await asyncio.wait_for(anext(outputs), STAGE_REPLY_TIMEOUT_S) for _ in range(3)
+    ]
+    assert [(item.kind, item.input_seq) for item in received] == [
+        ("input_done", 0),
+        ("data", 1),
+        ("input_done", 1),
+    ]
+    assert coordinator.sessions[identity.id].pending_count == 0
+    interrupt = control_chunk("interrupt")
+    await coordinator.control_session(identity, interrupt, should_preempt=True)
+    assert execution.controls == [interrupt]
+    with pytest.raises(ValueError, match="whole control"):
+        await coordinator.control_session(identity, interrupt, stages=["sink"])
+    assert append_owners(events) == [] and control_owners(events) == []
+    await outputs.aclose()
+    assert execution.is_closed
+    assert not coordinator.sessions
+    coordinator.session_execution_factories.pop("held")

@@ -150,6 +150,8 @@ Supported Models
    cookbook/auk.md
    cookbook/cosmos3_nano.md
 
+   cookbook/streaming_cascade.md
+
 .. toctree::
    :maxdepth: 1
    :caption: General Usage

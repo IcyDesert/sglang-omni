@@ -15,7 +15,11 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import (
+    IncomingMessage,
+    OutgoingMessage,
+    emit_session_release,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,7 @@ class StreamingDetokenizeScheduler:
     ) -> None:
         self.inbox: queue.Queue[IncomingMessage] = queue.Queue()
         self.outbox: queue.Queue[OutgoingMessage] = queue.Queue()
+        self.session_release_tracking: set[str] = set()
         self.tokenizer = tokenizer
         self.eos_token_id = eos_token_id
         self.build_result = build_result
@@ -114,6 +119,7 @@ class StreamingDetokenizeScheduler:
     def abort(self, request_id: str) -> None:
         self.request_states.pop(request_id, None)
         self.done_seen.pop(request_id, None)
+        emit_session_release(self, request_id)
 
     def ensure_request_state(self, request_id: str) -> RequestState:
         request_state = self.request_states.get(request_id)
@@ -220,3 +226,4 @@ class StreamingDetokenizeScheduler:
                 data=request_state.payload,
             )
         )
+        emit_session_release(self, request_id)

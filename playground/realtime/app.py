@@ -39,7 +39,11 @@ async def warmup(api_base: str) -> None:
             response.raise_for_status()
             capabilities = await response.json()
         if not capabilities.get("native_full_duplex"):
-            raise RuntimeError("Playground warmup requires native full duplex")
+            logger.info(
+                f"Skipping warmup: {capabilities['interaction']} deployments "
+                "generate through their own services"
+            )
+            return
         else:
             pass
         modes = (

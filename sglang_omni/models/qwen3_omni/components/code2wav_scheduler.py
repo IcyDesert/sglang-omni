@@ -36,7 +36,11 @@ from sglang_omni.platforms import current_platform
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import (
+    IncomingMessage,
+    OutgoingMessage,
+    emit_session_release,
+)
 from sglang_omni.scheduling.streaming_vocoder import (
     StreamingVocoderBase,
     vocoder_decode_stream_priority,
@@ -1181,7 +1185,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def release_stream_resources(
         self, request_id: str, state: Code2WavStreamState
     ) -> None:
-        del request_id
+        pending_slot = state.pending.slot if state.pending is not None else None
         if state.pending is not None:
             self.retire_slot(state.pending.slot)
             state.pending = None
@@ -1200,6 +1204,24 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             event.record(read_stream)
             self.retired_chunks.append(RetiredChunks(event=event, chunks=state.chunks))
             state.chunks = []
+        else:
+            pass
+        if request_id in self.session_release_tracking:
+            if pending_slot is not None:
+                pending_slot.synchronize()
+            else:
+                pass
+            if self.device.type == "cuda":
+                read_stream = self.decode_stream or torch.cuda.default_stream(
+                    self.device
+                )
+                read_stream.synchronize()
+                self.reap_retired()
+            else:
+                pass
+            state.chunks.clear()
+            state.audio_parts.clear()
+            emit_session_release(self, request_id)
         else:
             pass
 

@@ -16,13 +16,19 @@ import msgpack
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.pipeline.replicas import assign_replica_bindings
+from sglang_omni.pipeline.session_delivery import DeliveryPacer
+from sglang_omni.pipeline.session_execution import (
+    SessionExecution,
+    SessionExecutionFactory,
+)
 from sglang_omni.profiler.duplex_events import (
     emit_session_output_event,
     emit_session_unit_event,
     emit_session_unit_ready_event,
 )
-from sglang_omni.proto import OmniRequest, StreamMessage
+from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
 from sglang_omni.proto.session import (
+    DEFAULT_MAX_OUTPUT_LEAD_MS,
     SESSION_METADATA_KEY,
     OutputChunk,
     SessionGraph,
@@ -33,6 +39,7 @@ from sglang_omni.proto.session import (
     TimedChunk,
     wire_size,
 )
+from sglang_omni.proto.streams import INTERRUPT, TURN_DONE, control_type
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +124,13 @@ class Session:
     stages: tuple[str, ...]
     bindings: dict[str, int]
     limits: SessionLimits
-    # A node of a graph merges the clocks of its sources; only a client's input keeps one timeline per modality.
+    owned_by_execution: bool = False
+    # A node of a graph merges its sources' clocks and ends; only a client's input keeps one timeline and one EOS per modality.
     is_node: bool = False
+    work_owners: dict[str, set[str]] = field(default_factory=dict)
+    work_released: dict[str, asyncio.Event] = field(default_factory=dict)
+    released_work_owners: dict[str, set[str]] = field(default_factory=dict)
+    execution: SessionExecution | None = None
     opened: list[str] = field(default_factory=list)
     pending: deque[PendingSessionChunk] = field(default_factory=deque)
     pending_bytes: int = 0
@@ -128,8 +140,10 @@ class Session:
     in_flight_append: Literal["accepted", "submitted"] | None = None
     outputs: deque[tuple[OutputChunk, int]] = field(default_factory=deque)
     output_bytes: int = 0
+    pacer: DeliveryPacer | None = None
     next_input: int = 0
     next_output: int = 0
+    next_delivered: int = 0
     modality_end_ms: dict[str, float] = field(default_factory=dict)
     ended_modalities: set[str] = field(default_factory=set)
     wake: asyncio.Event = field(default_factory=asyncio.Event)
@@ -164,7 +178,8 @@ class SessionGraphRuntime:
     input seq back to the client seq it carries, and the client's input_done
     arrives once every input node has confirmed its copy. A node's inbox
     holds what its edges carry until its node session accepts it, each
-    edge within its own bound.
+    edge within its own bound. A node that publishes audio publishes
+    through its pacer in `pacers`.
     """
 
     session_identity: SessionIdentity
@@ -174,10 +189,19 @@ class SessionGraphRuntime:
     inboxes: dict[str, NodeInbox]
     outputs: asyncio.Queue[tuple[OutputChunk, int] | None]
     output_bytes: int = 0
+    pacers: dict[str, DeliveryPacer] = field(default_factory=dict)
     # note (Junnan Li): Interrupted reply IDs remain fenced until the graph closes; late tools may outlive later replies.
     interrupted_turns: dict[str, set[int]] = field(default_factory=dict)
     client_sequences: dict[str, dict[int, int]] = field(default_factory=dict)
     pending_input_done: dict[int, int] = field(default_factory=dict)
+    output_end_ms: float = 0.0
+    reply_start_ms: float = 0.0
+    open_turns: set[int] = field(default_factory=set)
+    reply_starts: dict[int, tuple[float, float]] = field(default_factory=dict)
+    eos_confirmed: set[str] = field(default_factory=set)
+    eos_wake: asyncio.Event = field(default_factory=asyncio.Event)
+    end_input: TimedChunk | None = None
+    drain_task: asyncio.Task[None] | None = None
     modality_end_ms: dict[str, float] = field(default_factory=dict)
     ended_modalities: set[str] = field(default_factory=set)
     next_input: int = 0
@@ -194,7 +218,8 @@ class SessionGraphRuntime:
 class CoordinatorSessions:
     """Coordinator-owned sessions over fixed stage routes and graphs of them."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_output_lead_ms: float = DEFAULT_MAX_OUTPUT_LEAD_MS) -> None:
+        self.max_output_lead_ms = max_output_lead_ms
         self.is_sessions_stopping = False
         self.next_open_index = 1
         self.session_unavailable_stages: set[str] = set()
@@ -204,6 +229,7 @@ class CoordinatorSessions:
         self.session_graph: SessionGraph | None = None
         self.session_stream_handlers: dict[str, SessionStreamHandler] = {}
         self.session_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self.session_execution_factories: dict[str, SessionExecutionFactory] = {}
 
     def owned_session_task(
         self, coroutine: Coroutine[None, None, None]
@@ -274,8 +300,9 @@ class CoordinatorSessions:
         limits: SessionLimits | None,
         session_id: str | None,
         is_node: bool = False,
+        execution: str | None = None,
     ) -> SessionIdentity:
-        """Open fixed owners in upstream order before accepting input; a client route begins at entry_stage."""
+        """Open fixed owners in upstream order before accepting input; a client route begins at entry_stage, and with `execution` that component runs the session while the owners track the requests it starts."""
         if (
             self.is_sessions_stopping
             or not self.running
@@ -292,8 +319,13 @@ class CoordinatorSessions:
             stages=owners,
             bindings=bindings,
             limits=limits or SessionLimits(),
+            owned_by_execution=execution is not None,
             is_node=is_node,
         )
+        if not is_node:
+            session.pacer = DeliveryPacer(self.max_output_lead_ms, session.output_wake)
+        else:
+            pass
         self.next_open_index += 1
         self.sessions[session_id] = session
         try:
@@ -310,13 +342,7 @@ class CoordinatorSessions:
                 else:
                     pass
                 session.request = replace(request, inputs=None)
-                # Note (Junnan Li): The read precedes appends so the owner attaches it before emitting output.
-                request_id = await self.submit_session_operation(
-                    session, "read", owner=session.stages[-1]
-                )
-                session.read_task = asyncio.create_task(
-                    self.read_session(session, request_id)
-                )
+                await self.attach_session_output(session, request, execution)
         except BaseException:
             await asyncio.shield(
                 self.owned_session_task(self.close_session_state(session))
@@ -361,6 +387,28 @@ class CoordinatorSessions:
             )
         else:
             return bindings, owners
+
+    async def attach_session_output(
+        self, session: Session, request: OmniRequest, execution: str | None
+    ) -> None:
+        """Open the named execution component on the session, or else send the terminal owner's read."""
+        if execution is not None:
+            factory = self.session_execution_factories.get(execution)
+            if factory is None:
+                raise ValueError("unknown session execution component")
+            else:
+                session.execution = factory(CoordinatorSessionWork(self, session))
+            await session.execution.open(
+                request, CoordinatorSessionEmitter(self, session)
+            )
+        else:
+            # Note (Junnan Li): The read is sent before any append, so the owner attaches it before an output can be emitted.
+            request_id = await self.submit_session_operation(
+                session, "read", owner=session.stages[-1]
+            )
+            session.read_task = asyncio.create_task(
+                self.read_session(session, request_id)
+            )
 
     async def append_session(
         self,
@@ -411,7 +459,7 @@ class CoordinatorSessions:
         session.pending_bytes += encoded_bytes
         session.next_input += 1
         session.modality_end_ms[chunk.modality] = chunk.t_start_ms + chunk.duration_ms
-        if chunk.eos:
+        if chunk.eos and not session.is_node:
             session.ended_modalities.add(chunk.modality)
         else:
             pass
@@ -428,13 +476,22 @@ class CoordinatorSessions:
             session_identity=session.session_identity,
             input_chunk=chunk,
         )
+
+        if chunk.eos and session.pacer is not None:
+            session.pacer.end_input()
+        else:
+            pass
         session.wake.set()
         return chunk.seq
 
     async def session_outputs(
         self, session_identity: SessionIdentity
     ) -> AsyncIterator[OutputChunk]:
-        """One output consumer; disconnect closes the owned session."""
+        """One output consumer; disconnect closes the owned session.
+
+        A client route delivers through its pacer and numbers what it
+        delivers; a released turn.done returns to the route as a control.
+        """
         graph = self.graphs.get(session_identity.id)
         if graph is not None and graph.session_identity == session_identity:
             async for output in self.graph_outputs(graph):
@@ -448,21 +505,37 @@ class CoordinatorSessions:
         else:
             pass
         session.has_output_consumer = True
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 session.output_wake.clear()
-                while session.outputs and not session.is_closing:
-                    output, size = session.outputs.popleft()
-                    session.output_bytes -= size
-                    yield output
+                if session.pacer is None:
+                    while session.outputs and not session.is_closing:
+                        output, size = session.outputs.popleft()
+                        session.output_bytes -= size
+                        yield output
+                else:
+                    while session.outputs and not session.is_closing:
+                        output, size = session.outputs.popleft()
+                        session.output_bytes -= session.pacer.offer(output, size)
+                    session.pacer.unsent.extend(session.pacer.release(loop.time()))
+                    while session.pacer.unsent and not session.is_closing:
+                        output, size = session.pacer.unsent.popleft()
+                        session.output_bytes -= size
+                        self.return_turn_end(session.session_identity, output)
+                        seq = session.next_delivered
+                        session.next_delivered += 1
+                        yield replace(output, seq=seq)
                 if session.is_closed:
                     if session.error is not None:
                         raise session.error
                     else:
                         pass
                     return
-                else:
+                elif session.pacer is None or session.is_closing:
                     await session.output_wake.wait()
+                else:
+                    await session.pacer.wait()
         finally:
             session.has_output_consumer = False
             await asyncio.shield(
@@ -535,15 +608,19 @@ class CoordinatorSessions:
                 chunk = pending_chunk.chunk
                 session.in_flight_append = "accepted"
                 try:
-                    request_id = await self.submit_session_operation(
-                        session,
-                        "append",
-                        chunk=chunk,
-                        request_id=pending_chunk.request_id,
-                    )
-                    session.in_flight_append = "submitted"
-                    session.wake.set()
-                    await self.finish_session_operation(session, "append", request_id)
+                    if session.execution is not None:
+                        session.in_flight_append = "submitted"
+                        session.wake.set()
+                        await session.execution.append(chunk)
+                    else:
+                        request_id = await self.submit_session_operation(
+                            session, "append", chunk=chunk, request_id=pending_chunk.request_id
+                        )
+                        session.in_flight_append = "submitted"
+                        session.wake.set()
+                        await self.finish_session_operation(
+                            session, "append", request_id
+                        )
                     self.emit_session_output(
                         session,
                         pending_chunk.request_id,
@@ -557,8 +634,12 @@ class CoordinatorSessions:
                     session.pending_bytes -= pending_chunk.encoded_bytes
                     session.wake.set()
         except Exception as exc:
-            session.error = exc
-            self.owned_session_task(self.close_session_state(session))
+            self.fail_session(session, exc)
+
+    def fail_session(self, session: Session, error: BaseException) -> None:
+        """End the session with its first error; its output stream raises it."""
+        session.error = session.error or error
+        self.owned_session_task(self.close_session_state(session))
 
     async def read_session(self, session: Session, request_id: str) -> None:
         """Hold the terminal owner's read until that owner closes the session; a read that ends any other way fails the session."""
@@ -574,8 +655,7 @@ class CoordinatorSessions:
         except Exception as exc:
             error = exc
         if error is not None:
-            session.error = session.error or error
-            self.owned_session_task(self.close_session_state(session))
+            self.fail_session(session, error)
         else:
             pass
 
@@ -596,6 +676,7 @@ class CoordinatorSessions:
         still in flight. A control that is not ordered goes out at once and
         only holds the appends after it. A graph orders the client's
         controls and sends its node control edges' events at once.
+        An execution component receives the event itself and stops its own work.
         """
         graph = self.graphs.get(session_identity.id)
         if graph is not None and graph.session_identity == session_identity:
@@ -606,6 +687,8 @@ class CoordinatorSessions:
         session = self.get_session(session_identity)
         if session.is_closing or session.is_closed:
             raise RuntimeError("session is closing")
+        elif control_type(event) == INTERRUPT and session.pacer is not None:
+            session.output_bytes -= session.pacer.purge(event.turn)
         else:
             pass
         owners = [
@@ -613,7 +696,13 @@ class CoordinatorSessions:
             for owner in session.stages
             if stages is None or self.replica_topology.logical_name(owner) in stages
         ]
-        if stages is not None and len(owners) != len(stages):
+        if session.execution is not None and stages is not None:
+            raise ValueError("an execution component takes the whole control")
+        elif (
+            session.execution is None
+            and stages is not None
+            and len(owners) != len(stages)
+        ):
             raise ValueError(
                 f"control stages {stages} are not all on the session route"
             )
@@ -637,14 +726,17 @@ class CoordinatorSessions:
                 else:
                     session.wake.clear()
                     await session.wake.wait()
-            for owner in owners:
-                await self.session_operation(
-                    session,
-                    "control",
-                    owner=owner,
-                    chunk=event,
-                    should_preempt=should_preempt,
-                )
+            if session.execution is not None:
+                await session.execution.control(event)
+            else:
+                for owner in owners:
+                    await self.session_operation(
+                        session,
+                        "control",
+                        owner=owner,
+                        chunk=event,
+                        should_preempt=should_preempt,
+                    )
         finally:
             session.control_barriers.remove(barrier)
             session.wake.set()
@@ -687,6 +779,7 @@ class CoordinatorSessions:
             stages=session.stages,
             chunk=chunk,
             should_preempt=should_preempt,
+            owned_by_execution=session.owned_by_execution,
         )
         request = replace(
             session.request,
@@ -807,10 +900,118 @@ class CoordinatorSessions:
         else:
             pass
 
+    def handle_session_work_release(self, request_id: str, owner: str) -> None:
+        for session in self.sessions.values():
+            owners = session.work_owners.get(request_id)
+            if owners is not None:
+                session.released_work_owners.setdefault(request_id, set()).add(owner)
+                owners.discard(owner)
+                if not owners:
+                    session.work_released[request_id].set()
+                else:
+                    pass
+                return
+            else:
+                pass
+
+    def handle_session_work_start(self, request_id: str, owner: str) -> None:
+        for session in self.sessions.values():
+            owners = session.work_owners.get(request_id)
+            if owners is not None:
+                if owner not in session.stages:
+                    raise ValueError("work started outside session owners")
+                elif owner in session.released_work_owners.get(request_id, set()):
+                    pass
+                else:
+                    owners.add(owner)
+                    session.work_released[request_id].clear()
+                return
+            else:
+                pass
+
+    async def stream_session_request(
+        self,
+        identity: SessionIdentity,
+        request_id: str,
+        request: OmniRequest,
+        terminal_stages: set[str] | None = None,
+    ) -> AsyncIterator[CompleteMessage | StreamMessage]:
+        """Run one pipeline request owned by the session; its owners report the work they start and release."""
+        session = self.get_session(identity)
+        if session.is_closing:
+            raise RuntimeError("session is closing")
+        elif request_id in session.work_owners:
+            raise ValueError("request ID is already owned by this session")
+        else:
+            pass
+        operation = SessionOperation(
+            "append", identity, session.stages, owned_by_execution=True
+        )
+        request = replace(
+            request,
+            metadata={
+                **request.metadata,
+                SESSION_METADATA_KEY: operation.to_dict(),
+            },
+        )
+        queue: asyncio.Queue[CompleteMessage | StreamMessage] = asyncio.Queue()
+        track_session_request(session, request_id)
+        try:
+            try:
+                await self.submit_request(
+                    request_id,
+                    request,
+                    stream_queue=queue,
+                    target_stage=session.stages[0],
+                    terminal_stages=terminal_stages,
+                    replica_bindings=session.bindings,
+                )
+            except Exception:
+                # Note (Junnan Li): A refused submission reached no stage, so no owner will release it.
+                forget_session_request(session, request_id)
+                raise
+            terminals = self.expected_terminal_stages(request_id)
+            completed: set[str] = set()
+            while True:
+                message = await queue.get()
+                if isinstance(message, CompleteMessage):
+                    if not message.success:
+                        raise RuntimeError(message.error or "session work failed")
+                    else:
+                        completed.add(
+                            self.replica_topology.logical_name(message.from_stage)
+                        )
+                    yield message
+                    if not terminals or completed >= terminals:
+                        break
+                    else:
+                        pass
+                else:
+                    yield message
+        finally:
+            future = self.completion_futures.get(request_id)
+            if future is not None:
+                await self.release_submission(request_id, future)
+            else:
+                pass
+            if request_id in session.work_owners:
+                await asyncio.wait_for(
+                    session.work_released[request_id].wait(),
+                    session.limits.operation_timeout_s,
+                )
+                forget_session_request(session, request_id)
+            else:
+                pass
+
     def begin_session_close(self, session: Session) -> None:
         session.is_closing = True
         # Note (Junnan Li): Close fences output like cancel; queued data is dropped, not drained.
         session.outputs.clear()
+        if session.pacer is not None:
+            session.pacer.items.clear()
+            session.pacer.unsent.clear()
+        else:
+            pass
         session.output_bytes = 0
         session.wake.set()
         session.output_wake.set()
@@ -842,6 +1043,32 @@ class CoordinatorSessions:
         if session.read_task is not None:
             session.read_task.cancel()
             await asyncio.gather(session.read_task, return_exceptions=True)
+        else:
+            pass
+        if session.execution is not None:
+            try:
+                await asyncio.wait_for(
+                    session.execution.close(),
+                    max(0, cleanup_deadline_s - asyncio.get_running_loop().time()),
+                )
+            except asyncio.TimeoutError as exc:
+                logger.error(
+                    f"Session execution close timed out: session={session.session_identity.id} owners={session.work_owners}",
+                    exc_info=exc,
+                )
+                self.fail_session_cleanup(session, exc)
+                return
+            except Exception as exc:
+                if session.work_owners:
+                    logger.error(
+                        f"Session execution close failed: session={session.session_identity.id} owners={session.work_owners}",
+                        exc_info=exc,
+                    )
+                    self.fail_session_cleanup(session, exc)
+                    return
+                else:
+                    # Note (Junnan Li): The execution released all its work, so its error ends this session only.
+                    session.error = session.error or exc
         else:
             pass
         if session.pump is not None and session.pump is not asyncio.current_task():
@@ -908,3 +1135,89 @@ class CoordinatorSessions:
         for graph in list(self.graphs.values()):
             graph.error = RuntimeError(message)
         await self.stop_sessions()
+
+    def return_turn_end(
+        self, session_identity: SessionIdentity, output: OutputChunk
+    ) -> None:
+        """A published turn.done returns to the node that published it as a control once delivered, through its pacer when it has one: the reply has reached the client."""
+        if control_type(output) == TURN_DONE:
+            self.owned_session_task(
+                self.control_session(
+                    session_identity, output_chunk(output), is_ordered=False
+                )
+            )
+        else:
+            pass
+
+
+def track_session_request(session: Session, request_id: str) -> None:
+    """The request starts on the session's first owner, which holds it until it reports the release."""
+    session.work_owners[request_id] = {session.stages[0]}
+    session.work_released[request_id] = asyncio.Event()
+    session.released_work_owners[request_id] = set()
+
+
+def forget_session_request(session: Session, request_id: str) -> None:
+    session.work_owners.pop(request_id, None)
+    session.work_released.pop(request_id, None)
+    session.released_work_owners.pop(request_id, None)
+
+
+class CoordinatorSessionEmitter:
+    """Session output channel handed to an execution component."""
+
+    def __init__(self, sessions: CoordinatorSessions, session: Session) -> None:
+        self.sessions = sessions
+        self.session = session
+
+    async def emit_output(self, chunk: TimedChunk) -> None:
+        self.sessions.emit_session_output(
+            self.session, self.session.session_identity.id, chunk.seq, chunk
+        )
+
+    def fail(self, error: BaseException) -> None:
+        self.sessions.fail_session(self.session, error)
+
+
+class CoordinatorSessionWork:
+    """Stage ownership of the pipeline requests an execution component starts."""
+
+    def __init__(self, sessions: CoordinatorSessions, session: Session) -> None:
+        self.sessions = sessions
+        self.session = session
+        self.session_id = session.session_identity.id
+        self.operation_timeout_s = session.limits.operation_timeout_s
+
+    def stream(
+        self,
+        request_id: str,
+        request: OmniRequest,
+        terminal_stages: set[str] | None = None,
+    ) -> AsyncIterator[CompleteMessage | StreamMessage]:
+        return self.sessions.stream_session_request(
+            self.session.session_identity, request_id, request, terminal_stages
+        )
+
+    async def abort(self, request_id: str) -> bool:
+        if request_id in self.session.work_owners:
+            return await self.sessions.abort(request_id)
+        else:
+            return False
+
+    async def release_all(self, timeout_s: float) -> None:
+        session = self.session
+        deadline_s = asyncio.get_running_loop().time() + timeout_s
+        for request_id, owners in list(session.work_owners.items()):
+            if owners:
+                await self.sessions.abort(request_id)
+                await asyncio.wait_for(
+                    session.work_released[request_id].wait(),
+                    max(0, deadline_s - asyncio.get_running_loop().time()),
+                )
+            else:
+                pass
+            forget_session_request(session, request_id)
+        if session.work_owners:
+            raise RuntimeError("session still owns unreleased backend work")
+        else:
+            pass

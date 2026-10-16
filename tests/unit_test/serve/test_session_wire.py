@@ -10,6 +10,9 @@ from starlette.websockets import WebSocketDisconnect
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto.session import SessionLimits, TimedChunk
+from sglang_omni.serve.openai_api import create_app
+from sglang_omni.serve.realtime.manager import RealtimeDeployment
+from sglang_omni.serve.realtime.types import Capabilities
 from sglang_omni.serve.session_wire import register_session_wire
 from tests.unit_test.fixtures.session_client import FakeSessionClient
 
@@ -180,6 +183,20 @@ def test_a_client_may_not_request_session_limits():
 def test_sessions_open_with_the_deployment_limits():
     client = FakeClient()
     with connect(client, SessionLimits(idle_timeout_s=5.0)) as websocket:
+        open_session(websocket)
+    _, limits, _ = client.opened[0]
+    assert limits == SessionLimits(idle_timeout_s=5.0)
+
+
+def test_the_app_opens_sessions_with_the_realtime_deployment_session_limits():
+    client = FakeClient()
+    deployment = RealtimeDeployment(
+        Capabilities(),
+        adapter_factory=lambda: None,
+        session_limits=SessionLimits(idle_timeout_s=5.0),
+    )
+    app = create_app(client, model_name="test", realtime_deployment=deployment)
+    with TestClient(app).websocket_connect("/v1/session") as websocket:
         open_session(websocket)
     _, limits, _ = client.opened[0]
     assert limits == SessionLimits(idle_timeout_s=5.0)

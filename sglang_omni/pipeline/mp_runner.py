@@ -152,6 +152,26 @@ class StageLaunchKwargs(TypedDict):
     can_accept_stream_before_payload: bool
     disable_direct_cuda_ipc_payload: bool
     replica_topology: dict[str, list[str]]
+    owns_session_requests: bool
+
+
+def session_executions(config: PipelineConfig) -> set[str]:
+    """The execution components the Session graph names."""
+    return {
+        node.execution
+        for node in config.session_nodes.values()
+        if node.execution is not None
+    }
+
+
+def execution_stages(config: PipelineConfig) -> set[str]:
+    """The stages that run the requests of an execution-held node and track their ownership."""
+    return {
+        stage
+        for node in config.session_nodes.values()
+        if node.execution is not None
+        for stage in node.stages
+    }
 
 
 def build_stage_groups(
@@ -261,6 +281,7 @@ def build_stage_groups(
             can_accept_stream_before_payload=stage_cfg.can_accept_stream_before_payload,
             disable_direct_cuda_ipc_payload=stage_cfg.disable_direct_cuda_ipc_payload,
             replica_topology=replica_topology.to_dict(),
+            owns_session_requests=logical_stage_name in execution_stages(config),
         )
         if tp_size == 1:
             single_stage_specs[stage_cfg.name] = build_single_stage_spec(
@@ -787,11 +808,19 @@ class MultiProcessPipelineRunner:
                     self.config.session_route if session_graph is None else None
                 ),
                 session_graph=session_graph,
+                max_output_lead_ms=self.config.max_output_lead_ms,
             )
             logger.info(
                 f"Coordinator stream backlog cap: "
                 f"max_total_backlog_bytes={stream_delivery.max_total_backlog_bytes}"
             )
+
+            coordinator = (
+                self._coordinator
+            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            for execution in session_executions(self.config):
+                factory = import_string(execution)(coordinator, self.config)
+                coordinator.session_execution_factories[execution] = factory
             if max_in_flight is not None:
                 logger.info(
                     "Coordinator in-flight cap=%s (generation running+queued)",

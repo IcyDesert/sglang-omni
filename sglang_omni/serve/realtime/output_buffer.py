@@ -1,6 +1,7 @@
 """Realtime output delivery and completion state."""
 
 import asyncio
+import math
 from collections import deque
 from dataclasses import dataclass, replace
 
@@ -9,6 +10,7 @@ from sglang_omni.serve.realtime.output import (
     AudioDelta,
     AudioFinished,
     ContextLimitError,
+    InputTranscription,
     OutputEvent,
     ResponseEvent,
     ResponseFinished,
@@ -24,9 +26,21 @@ from sglang_omni.serve.realtime.types import (
     Unit,
 )
 
+# Note (Junnan Li): The JSON of one server event around its audio or text: type, event and item ids, indexes.
+ENVELOPE_BYTES = 256
+
 
 def envelope_size_bytes(envelope: Envelope) -> int:
-    return len(repr(envelope.event).encode())
+    """The bytes the event puts on the websocket: its base64 audio or UTF-8 text plus the envelope."""
+    event = envelope.event
+    if isinstance(event, AudioDelta):
+        return math.ceil(len(event.pcm) / 3) * 4 + ENVELOPE_BYTES
+    elif isinstance(
+        event, (TextDelta, TextFinished, ResponseFinished, InputTranscription)
+    ):
+        return len(event.text.encode()) + ENVELOPE_BYTES
+    else:
+        return ENVELOPE_BYTES
 
 
 @dataclass(kw_only=True)
@@ -59,10 +73,7 @@ class OutputBuffer:
 
     def enqueue(self, envelope: Envelope) -> None:
         size_bytes = envelope_size_bytes(envelope)
-        if (
-            len(self.queued_envelopes) >= self.limits.max_output_events
-            or self.queued_bytes + size_bytes > self.limits.max_output_bytes
-        ):
+        if self.queued_bytes + size_bytes > self.limits.max_output_bytes:
             raise RuntimeError("outbound event budget exhausted")
         else:
             pass
@@ -150,13 +161,11 @@ class OutputBuffer:
     def start_response(self, response_id: str, modalities: tuple[str, ...]) -> None:
         if response_id in self.responses:
             raise RuntimeError("duplicate response creation")
-        elif len(self.responses) >= self.limits.max_output_events:
-            raise RuntimeError("unfinished response budget exhausted")
         else:
             self.responses[response_id] = ResponseState(output_modalities=modalities)
 
     def finish_responses(self, status: ResponseStatus, reason: str) -> None:
-        """Reserve at most three closing events per bounded response slot."""
+        """Queue at most three closing events per visible response."""
         for response_id, response_state in list(self.responses.items()):
             if (
                 response_state.is_terminal_sent

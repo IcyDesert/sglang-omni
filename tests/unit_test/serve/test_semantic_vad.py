@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+from sglang_omni.audio.vad import VAD_FRAME_SAMPLES, Emit, VADEvent
 from sglang_omni.serve.realtime.semantic_vad import (
     SemanticTurnDetector,
     SemanticVADConfig,
@@ -19,7 +20,6 @@ from sglang_omni.serve.realtime.smart_turn import (
     load_smart_turn,
 )
 from sglang_omni.serve.realtime.turn_detector import build_turn_detector
-from sglang_omni.serve.realtime.vad import VAD_FRAME_SAMPLES, Emit, VADEvent
 
 
 class FakeSpeechModel:

@@ -23,7 +23,7 @@ class IncomingMessage:
 @dataclass
 class OutgoingMessage:
     request_id: str
-    type: Literal["result", "stream", "error", "kv_transfer", "admitted", "wakeup"]
+    type: Literal["result", "stream", "error", "kv_transfer", "admitted", "wakeup", "released"]
     data: object = None
     target: str | None = None
     metadata: dict[str, object] | None = None
@@ -48,6 +48,8 @@ def put_messages(
 
 class StageScheduler(Protocol):
     """Scheduler lifecycle and message queues consumed by a pipeline stage."""
+
+    session_release_tracking: set[str]
 
     @property
     def inbox(self) -> Queue[IncomingMessage]: ...
@@ -78,3 +80,11 @@ class ResultOwningScheduler(StageScheduler, Protocol):
     def claim_result(self, result: object, *, terminal: bool) -> bool: ...
 
     def release_result(self, result: object, *, delivered: bool) -> None: ...
+
+def emit_session_release(scheduler: StageScheduler, request_id: str) -> None:
+    """Tell the stage that a session-owned request holds nothing here any more."""
+    if request_id in scheduler.session_release_tracking:
+        scheduler.session_release_tracking.discard(request_id)
+        scheduler.outbox.put(OutgoingMessage(request_id=request_id, type="released"))
+    else:
+        pass

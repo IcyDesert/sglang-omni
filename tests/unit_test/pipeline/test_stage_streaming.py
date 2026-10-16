@@ -17,6 +17,12 @@ from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher, LocalStrea
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
+from sglang_omni.proto.session import (
+    SESSION_METADATA_KEY,
+    SessionIdentity,
+    SessionOperation,
+    TimedChunk,
+)
 from sglang_omni.relay.shm import ShmRelay
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from tests.unit_test.fixtures.trace_capture import capture_comm_trace, events_named
@@ -173,6 +179,54 @@ async def make_relay_payload(
         to_stage=to_stage,
         data_ref=data_ref.to_dict(),
     )
+
+
+def thinker_stage(control_plane: FakeControlPlane, scheduler: object) -> Stage:
+    return Stage(
+        name="thinker",
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={},
+        control_plane=control_plane,
+        relay=FakeRelay(),
+        scheduler=scheduler,
+    )
+
+
+@pytest.mark.asyncio
+async def test_aborted_graph_payload_acknowledges_reserved_owner() -> None:
+    control_plane = FakeControlPlane()
+    stage = thinker_stage(control_plane, SimpleNamespace(outbox=queue.Queue()))
+    operation = SessionOperation(
+        "append",
+        SessionIdentity("session"),
+        ("thinker",),
+        TimedChunk("audio", 0, 20, 0, b"pcm"),
+        owned_by_execution=True,
+    )
+    payload = StagePayload(
+        "request",
+        OmniRequest(None, metadata={SESSION_METADATA_KEY: operation.to_dict()}),
+        {},
+    )
+    stage.aborted.add("request")
+    await stage.receive_payload_from_stage("request", "preprocessing", payload)
+    assert len(control_plane.completions) == 1
+    assert control_plane.completions[0].result == {"session_work_released": True}
+
+
+def test_graph_abort_before_scheduler_submission_releases_reservation() -> None:
+    scheduler = SimpleNamespace(
+        outbox=queue.Queue(),
+        session_release_tracking=set(),
+        abort=lambda request_id: None,
+    )
+    stage = thinker_stage(FakeControlPlane(), scheduler)
+    stage.session_request_ownership = SimpleNamespace(operations={})
+    stage.on_abort("request")
+    released = scheduler.outbox.get_nowait()
+    assert (released.request_id, released.type) == ("request", "released")
 
 
 def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
@@ -890,7 +944,7 @@ def test_terminal_request_can_be_readmitted_after_cleanup() -> None:
         await stage.receive_local_payload(
             "req",
             "tts_engine",
-            SimpleNamespace(request_id="req"),
+            StagePayload(request_id="req", request=OmniRequest(inputs=None), data={}),
         )
         incoming = scheduler.inbox.get_nowait()
         assert incoming.request_id == "req"

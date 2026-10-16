@@ -41,6 +41,7 @@ from sglang_omni.pipeline.tp_control import (
 from sglang_omni.platforms import current_platform, get_platform_spec
 from sglang_omni.proto import AbortMessage, AdminResultMessage
 from sglang_omni.scheduling.message import StageScheduler
+from sglang_omni.scheduling.session_request_ownership import SessionRequestOwnership
 from sglang_omni.utils.gpu_compat import (
     apply_gpu_compat_env_defaults,
     get_gpu_compat_env_defaults,
@@ -97,6 +98,9 @@ class StageLaunchConfig:
     total_reserve_bytes: int | None = None
     enforce_total_reserve: bool = True
 
+    # A stage of an execution-held Session node tracks which requests belong to
+    # which session, so the coordinator can abort and release them.
+    owns_session_requests: bool = False
     # Routing: static next stage(s)
     next_stages: str | list[str] | None = None
     route_fn: str | None = None
@@ -1115,6 +1119,10 @@ def construct_stage(
     else:
         pass
 
+    if spec.owns_session_requests:
+        stage.session_request_ownership = SessionRequestOwnership(scheduler)
+    else:
+        pass
     return stage
 
 

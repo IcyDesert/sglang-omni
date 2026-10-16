@@ -16,9 +16,15 @@ from sglang_omni.config import (
     ProcessConfig,
     StageConfig,
 )
+from sglang_omni.config.placement import StagePlacementPlan, apply_placement_policy
+from sglang_omni.config.session_audio import AudioSessionPipelineConfig, StageGroup
+from sglang_omni.models.qwen3_omni.session_node import SESSION_PORTS
 from sglang_omni.platforms import current_platform
 from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
 from sglang_omni.serve.server_warmup import WARMUP_MAX_TOKENS, warmup_tone_wav_bytes
+
+from sglang_omni.proto.session import GRAPH_INPUT
+from sglang_omni.proto.streams import IMAGE, SessionPorts
 from sglang_omni.utils.cpu import effective_cpu_count
 
 _PKG = "sglang_omni.models.qwen3_omni"
@@ -522,9 +528,80 @@ class Qwen3OmniSpeechColocatedPipelineConfig(Qwen3OmniSpeechPipelineConfig):
     )
 
 
+def qwen_session_stages() -> list[StageConfig]:
+    return speech_stages(
+        thinker_gpu=0,
+        talker_gpu=0,
+        process_by_stage=COLOCATED_SPEECH_PROCESSES,
+        enable_partial_start=True,
+    )
+
+
+class QwenSessionPlacementPolicy:
+    """Apply the Qwen placement policy to its stages inside the Session graph."""
+
+    def validate(
+        self, config: AudioSessionPipelineConfig, plan: StagePlacementPlan
+    ) -> None:
+        for model in config.model_configs():
+            apply_placement_policy(model, plan)
+
+
+class Qwen3OmniSessionPipelineConfig(AudioSessionPipelineConfig):
+    """Qwen execution and VAD nodes using shared audio Session facilities."""
+
+    stage_groups: ClassVar[tuple[StageGroup, ...]] = (
+        *AudioSessionPipelineConfig.stage_groups,
+        StageGroup(
+            qwen_session_stages, Qwen3OmniSpeechColocatedPipelineConfig, SESSION_PORTS
+        ),
+    )
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        **AudioSessionPipelineConfig.stage_config_types,
+        **Qwen3OmniSpeechColocatedPipelineConfig.stage_config_types,
+    }
+    tensor_parallel_disable_custom_all_reduce_stages: ClassVar[tuple[str, ...]] = (
+        Qwen3OmniSpeechColocatedPipelineConfig.tensor_parallel_disable_custom_all_reduce_stages
+    )
+    placement_policy: str | None = (
+        "sglang_omni.models.qwen3_omni.config.QwenSessionPlacementPolicy"
+    )
+
+    @classmethod
+    def code2wav_stage(cls) -> str | None:
+        return Qwen3OmniSpeechColocatedPipelineConfig.code2wav_stage()
+
+    @classmethod
+    def topology_gated_custom_all_reduce_stages(cls) -> set[str]:
+        return (
+            Qwen3OmniSpeechColocatedPipelineConfig.topology_gated_custom_all_reduce_stages()
+        )
+
+    def session_ports(self) -> SessionPorts:
+        ports = super().session_ports()
+        blind_readers = sorted(
+            name
+            for name, node in self.session_graph().nodes.items()
+            if node.edges().get(GRAPH_INPUT, frozenset()) is None
+            and (
+                self.node_ports(name, self.session_nodes[name]) is None
+                or IMAGE
+                not in self.node_ports(name, self.session_nodes[name]).input_modalities
+            )
+        )
+        if IMAGE in ports.input_modalities and blind_readers:
+            raise ValueError(
+                f"nodes {blind_readers} read every format of {GRAPH_INPUT!r}, camera frames among them, "
+                "which they do not take; name the formats they read, such as input:pcm16 and input:session"
+            )
+        else:
+            return ports
+
+
 EntryClass = Qwen3OmniSpeechPipelineConfig
 
 Variants = {
+    "session": Qwen3OmniSessionPipelineConfig,
     "text": Qwen3OmniPipelineConfig,
     "speech": Qwen3OmniSpeechPipelineConfig,
     "speech-colocated": Qwen3OmniSpeechColocatedPipelineConfig,

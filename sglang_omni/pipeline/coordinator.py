@@ -38,7 +38,12 @@ from sglang_omni.proto import (
     is_update_action,
 )
 from sglang_omni.proto.admin import AdminResponse
-from sglang_omni.proto.session import SessionGraph
+from sglang_omni.proto.session import (
+    DEFAULT_MAX_OUTPUT_LEAD_MS,
+    SESSION_WORK_RELEASED,
+    SESSION_WORK_STARTED,
+    SessionGraph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +148,7 @@ class Coordinator(SessionGraphRunner):
         max_total_backlog_bytes: int | None = None,
         session_route: Callable[[], list[str]] | None = None,
         session_graph: SessionGraph | None = None,
+        max_output_lead_ms: float = DEFAULT_MAX_OUTPUT_LEAD_MS,
     ) -> None:
         """Initialize coordinator.
 
@@ -164,8 +170,10 @@ class Coordinator(SessionGraphRunner):
             session_route: Gives the stage chain a Session follows when the
                 caller names none; session_graph the node graph it is
                 instead. A pipeline declares one of them.
+            max_output_lead_ms: How far ahead of real time, counted from
+                a reply's start, a Session delivers the reply's audio.
         """
-        super().__init__()
+        super().__init__(max_output_lead_ms)
         if session_route is not None and session_graph is not None:
             raise ValueError(
                 "pass session_route or session_graph, not both: a pipeline's "
@@ -868,6 +876,20 @@ class Coordinator(SessionGraphRunner):
 
     async def handle_completion(self, msg: CompleteMessage) -> None:
         """Handle a completion message from a stage."""
+        if (
+            isinstance(msg.result, dict)
+            and msg.result.get(SESSION_WORK_STARTED) is True
+        ):
+            self.handle_session_work_start(msg.request_id, msg.from_stage)
+            return
+        elif (
+            isinstance(msg.result, dict)
+            and msg.result.get(SESSION_WORK_RELEASED) is True
+        ):
+            self.handle_session_work_release(msg.request_id, msg.from_stage)
+            return
+        else:
+            pass
         request_id = msg.request_id
         logger.debug(
             "Coordinator received completion: req=%s from %s success=%s",

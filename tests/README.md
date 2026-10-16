@@ -1002,3 +1002,11 @@ that happened to contain an older version of the test.
   fences cover shutdown during abort/append hooks and the open/append window
   between the final hook check and owner unlock, requiring exactly-once cleanup
   after native work returns without blocking shutdown.
+
+### Streaming cascade
+
+`unit_test/models/test_streaming_cascade.py`, `unit_test/pipeline/test_streaming_cascade.py`, `unit_test/serve/test_session_bridge.py`, `unit_test/serve/test_session_wire.py`, `unit_test/serve/test_realtime_turn_based.py` and `unit_test/pipeline/test_session_graph.py` cover the cascade and the turn-based realtime interaction on CPU with loopback services; `test_model/test_streaming_cascade_realtime.py` runs against live services as described in the [cascade cookbook](../docs/cookbook/streaming_cascade.md).
+
+```bash
+python -m pytest tests/unit_test/models/test_streaming_cascade.py tests/unit_test/pipeline/test_streaming_cascade.py tests/unit_test/serve/test_session_bridge.py tests/unit_test/serve/test_session_wire.py tests/unit_test/serve/test_realtime_turn_based.py tests/unit_test/pipeline/test_session_graph.py -q
+```

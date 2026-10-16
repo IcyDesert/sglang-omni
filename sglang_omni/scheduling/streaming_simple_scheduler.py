@@ -23,7 +23,11 @@ from typing import Callable
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import StagePayload
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import (
+    IncomingMessage,
+    OutgoingMessage,
+    emit_session_release,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,7 @@ class StreamingSimpleScheduler:
     ) -> None:
         self.inbox: queue_mod.Queue[IncomingMessage] = queue_mod.Queue()
         self.outbox: queue_mod.Queue[OutgoingMessage] = queue_mod.Queue()
+        self.session_release_tracking: set[str] = set()
         self.requires_tp_work_fanout: bool = True
 
         self.compute_fn = compute_fn
@@ -90,6 +95,7 @@ class StreamingSimpleScheduler:
         self.completed_non_streaming_request_ids: set[str] = set()
         self.state_lock = threading.RLock()
         self.abort_lock = threading.Lock()
+        self.compute_request_ids: set[str] = set()
 
     def is_streaming_payload(
         self,
@@ -200,6 +206,11 @@ class StreamingSimpleScheduler:
     def abort(self, request_id: str) -> None:
         self.abort_state(request_id)
         self.cleanup_aborted_request(request_id)
+        with self.state_lock:
+            if request_id not in self.compute_request_ids:
+                emit_session_release(self, request_id)
+            else:
+                pass
 
     def abort_state(self, request_id: str) -> None:
         self.record_aborted_request_id(request_id)
@@ -269,6 +280,7 @@ class StreamingSimpleScheduler:
                 pass
 
     def record_completed_non_streaming_request_id(self, request_id: str) -> None:
+        emit_session_release(self, request_id)
         with self.state_lock:
             self.completed_non_streaming_request_ids.add(request_id)
             if (
@@ -442,8 +454,17 @@ class StreamingSimpleScheduler:
         else:
             pass
         try:
+            with self.state_lock:
+                self.compute_request_ids.update(message.request_id for message in batch)
             self.handle_new_request_batch_with_loop(batch, loop)
         finally:
+            with self.state_lock:
+                for message in batch:
+                    self.compute_request_ids.discard(message.request_id)
+                    if self.is_aborted(message.request_id):
+                        emit_session_release(self, message.request_id)
+                    else:
+                        pass
             if owns_loop:
                 loop.close()
             else:
@@ -682,6 +703,7 @@ class StreamingSimpleScheduler:
                     pass
             if not self.is_aborted(request_id):
                 self.clear_request_state(request_id)
+                emit_session_release(self, request_id)
             else:
                 pass
 

@@ -517,6 +517,7 @@ def test_context_exhaustion_releases_append_unit() -> None:
     )
     scheduler = Mock(spec=OmniScheduler)
     scheduler.scheduler_thread_id = None
+    scheduler.session_release_tracking = set()
     scheduler.request_admission_lock = threading.RLock()
     scheduler.deferred_request_payloads = {}
     scheduler.pending_request_builds = {}

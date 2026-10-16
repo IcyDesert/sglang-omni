@@ -9,9 +9,12 @@ from typing import Literal, TypedDict
 
 import msgpack
 import msgspec
+from typing_extensions import NotRequired
 
 SESSION_METADATA_KEY: Literal["omni_session"] = "omni_session"
 GRAPH_INPUT = "input"
+SESSION_WORK_STARTED = "session_work_started"
+SESSION_WORK_RELEASED = "session_work_released"
 # Note (Junnan Li): msgspec encodes bytes as base64 text by default; keep them native on both sides.
 BUILTIN_TYPES = (bytes,)
 ChunkPayload = bytes | dict[str, object] | None
@@ -23,6 +26,7 @@ DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_CHUNK_BYTES = 1024 * 1024
 DEFAULT_OPERATION_TIMEOUT_S = 30.0
 DEFAULT_IDLE_TIMEOUT_S = 300.0
+DEFAULT_MAX_OUTPUT_LEAD_MS = 1000.0
 # Note (Junnan Li): Msgpack bin headers grow by 1 byte at 256 bytes and 3 bytes at 65536.
 MSGPACK_BIN8_LIMIT = 256
 MSGPACK_BIN16_LIMIT = 65536
@@ -69,6 +73,7 @@ class SessionOperationDict(TypedDict):
     stages: list[str]
     chunk: TimedChunkDict | None
     should_preempt: bool
+    owned_by_execution: NotRequired[bool]
 
 
 @dataclass(frozen=True)
@@ -224,11 +229,14 @@ class SessionNode:
     `<node>:<format>`, or a `DataEdge` naming one of these with the bound
     of its edge; without a format the node takes every chunk its source
     emits. The inputs naming one source are one edge. `controls` are the
-    control edges the node receives.
+    control edges the node receives. `execution` names the
+    coordinator-side component that runs the node over its stages instead
+    of the stages holding the session.
     """
 
     stages: tuple[str, ...]
     inputs: tuple[str | DataEdge, ...]
+    execution: str | None = None
     controls: tuple[ControlEdge, ...] = ()
 
     def edges(self) -> dict[str, frozenset[str] | None]:
@@ -268,6 +276,8 @@ class SessionGraph:
 
     nodes: dict[str, SessionNode]
     publish: dict[str, tuple[str, ...]]
+    # note (Junnan Li): Reply components may emit untimed chunks; the coordinator gives their published outputs one shared media clock.
+    shared_timeline: bool = False
 
     def __post_init__(self) -> None:
         if not self.nodes or GRAPH_INPUT in self.nodes:
@@ -413,7 +423,10 @@ class SessionOperation:
     chunk and targets one stage, and with should_preempt that stage cancels
     the session's in-flight appends as soon as the control arrives. A read
     targets the terminal owner and stays open until the close answers it; the
-    chunks the stage emits outside an append stream on it.
+    chunks the stage emits outside an append stream on it. Requests of
+    a node held by an execution carry owned_by_execution: they follow the
+    pipeline's own edges within the session's stages and report the work they
+    start and release; other session requests pass through the stages in order.
     """
 
     operation: SessionOperationKind
@@ -421,15 +434,21 @@ class SessionOperation:
     stages: tuple[str, ...]
     chunk: TimedChunk | None = None
     should_preempt: bool = False
+    owned_by_execution: bool = False
 
     def to_dict(self) -> SessionOperationDict:
-        return {
+        fields: SessionOperationDict = {
             "operation": self.operation,
             "session_identity": self.session_identity.to_dict(),
             "stages": list(self.stages),
             "chunk": None if self.chunk is None else self.chunk.to_dict(),
             "should_preempt": self.should_preempt,
         }
+        if self.owned_by_execution:
+            fields["owned_by_execution"] = True
+        else:
+            pass
+        return fields
 
     @classmethod
     def from_dict(cls, data: object) -> SessionOperation:

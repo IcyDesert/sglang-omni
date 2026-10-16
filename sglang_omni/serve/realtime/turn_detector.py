@@ -6,8 +6,9 @@ import math
 from dataclasses import dataclass, replace
 from typing import Mapping, Protocol
 
+from sglang_omni.audio.vad import Emit, StreamingVAD, VADConfig
+
 from .semantic_vad import SemanticEOUModel, SemanticTurnDetector, SemanticVADConfig
-from .vad import Emit, StreamingVAD, VADConfig
 
 
 class TurnDetector(Protocol):

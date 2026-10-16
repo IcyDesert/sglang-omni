@@ -1,4 +1,4 @@
-// Voice page for a native full-duplex /v1/realtime session, proxied by playground/realtime/app.py.
+// Voice page for a /v1/realtime session (native full duplex or turn based), proxied by playground/realtime/app.py.
 import { DuplexSession } from "./session.js";
 import { Camera } from "./camera.js";
 import { Orb } from "./orb.js";
@@ -156,11 +156,23 @@ function mood(micLevel, modelLevel, now) {
     if (remoteBusy) return { mood: "idle", level: 0, line: "Someone else is talking to it, try again soon" };
     return { mood: "idle", level: 0, line: "" };
   }
+  if (session.turnBased) return turnMood(micLevel, modelLevel, now);
   if (now - lastModelLoudAt < MODEL_HOLD_MS) return { mood: "speaking", level: modelLevel, line: "" };
   if (muted) return { mood: "idle", level: 0, line: "Microphone muted" };
   if (!captureStream) return { mood: "idle", level: 0, line: startingMic ? "Allow the microphone to start" : "Microphone off" };
   if (now - lastMicLoudAt < MIC_HOLD_MS) return { mood: "user", level: micLevel, line: "Listening" };
   if (session.responseOpen && awaitingAudio) return { mood: "thinking", level: 0, line: "Thinking…" };
+  return { mood: "listening", level: micLevel, line: "Listening" };
+}
+
+// Turn-based servers announce the user's speech and the reply, so the orb follows those events;
+// the output level only covers the tail still playing after response.done.
+function turnMood(micLevel, modelLevel, now) {
+  if (session.userSpeaking) return { mood: "user", level: micLevel, line: "Listening" };
+  if (session.responseOpen && awaitingAudio) return { mood: "thinking", level: 0, line: "Thinking…" };
+  if (session.responseOpen || now - lastModelLoudAt < MODEL_HOLD_MS) return { mood: "speaking", level: modelLevel, line: "" };
+  if (muted) return { mood: "idle", level: 0, line: "Microphone muted" };
+  if (!captureStream) return { mood: "idle", level: 0, line: startingMic ? "Allow the microphone to start" : "Microphone off" };
   return { mood: "listening", level: micLevel, line: "Listening" };
 }
 
@@ -354,7 +366,7 @@ function sessionListeners() {
       // One tap starts everything: the microphone follows the grant.
       startMic().catch((error) => warn(`Microphone: ${error.message}`, true));
     },
-    audio: (bytes) => {
+    audio: ({ bytes, responseId }) => {
       if (!playbackNode) return;
       awaitingAudio = false;
       const samples = pcm16ToFloat(bytes, session.outputRate, playbackContext.sampleRate);
@@ -366,13 +378,18 @@ function sessionListeners() {
         if (mutedQuietMs < UNMUTE_QUIET_MS) return;
         mutedResponse = false;
       }
-      playbackNode.port.postMessage({ type: "push", samples }, [samples.buffer]);
+      playbackNode.port.postMessage({ type: "push", samples, responseId }, [samples.buffer]);
     },
-    response: ({ open }) => {
+    response: ({ open, id, status }) => {
       if (open) mutedResponse = false;
       awaitingAudio = open;
       setButtons();
-      if (playbackNode) playbackNode.port.postMessage({ type: open ? "open" : "flush" });
+      if (playbackNode) {
+        if (open) playbackNode.port.postMessage({ type: "open" });
+        // A cancelled reply stops now; a completed one plays out what is buffered.
+        else if (status === "cancelled") playbackNode.port.postMessage({ type: "cancel", responseId: id });
+        else playbackNode.port.postMessage({ type: "flush" });
+      }
       // A new answer means whatever is still queued belongs to the previous one.
       if (open && playbackNode) playbackNode.port.postMessage({ type: "trim", keepSamples: Math.round(playbackContext.sampleRate * 0.5) });
       renderTranscript();

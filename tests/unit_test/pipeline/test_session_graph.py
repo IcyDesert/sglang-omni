@@ -11,9 +11,11 @@ import pytest
 from sglang_omni.admission import QueueFullError
 from sglang_omni.config.schema import SessionControlEdgeConfig
 from sglang_omni.pipeline.coordinator import Coordinator
+from sglang_omni.pipeline.session_delivery import DeliveryPacer
+from sglang_omni.pipeline.session_execution import SessionEmitter, SessionWork
 from sglang_omni.pipeline.session_graph import SessionGraphRunner
 from sglang_omni.pipeline.sessions import NodeInbox, Session, SessionGraphRuntime
-from sglang_omni.proto import OmniRequest
+from sglang_omni.proto import CompleteMessage, OmniRequest
 from sglang_omni.proto.session import (
     ControlEdge,
     DataEdge,
@@ -25,8 +27,10 @@ from sglang_omni.proto.session import (
     TimedChunk,
     wire_size,
 )
+from sglang_omni.proto.streams import AUDIO, IMAGE, IMAGE_FRAME, PCM16
 from tests.unit_test.fixtures.session_outputs import control_chunk
 from tests.unit_test.fixtures.session_pipeline import (
+    VAD_FACTORY,
     chunk,
     event_log,
     pipeline,
@@ -272,6 +276,45 @@ async def test_input_fans_out_to_every_reader_and_input_done_waits_for_all(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_camera_frames_reach_only_the_nodes_that_read_them(tmp_path):
+    names = ["vad", "seeing", "cascade"]
+    graph = SessionGraph(
+        nodes={
+            "vad": SessionNode(
+                stages=("vad",), inputs=("input:pcm16", "input:session")
+            ),
+            "seeing": SessionNode(
+                stages=("seeing",), inputs=("input:pcm16", "input:image_frame")
+            ),
+            "cascade": SessionNode(stages=("cascade",), inputs=("input:pcm16",)),
+        },
+        publish={},
+    )
+    assert graph.reading_nodes("input", IMAGE_FRAME) == ("seeing",)
+    async with pipeline(tmp_path, names=names) as (coordinator, events, _):
+        coordinator.session_graph = graph
+        identity = await coordinator.open_session(OmniRequest(None, {}))
+        outputs = coordinator.session_outputs(identity)
+        frame = TimedChunk(IMAGE, 0, 0, 0, b"\xff\xd8frame", format=IMAGE_FRAME)
+        audio = TimedChunk(AUDIO, 0, 20, 1, b"pcm", format=PCM16)
+        await coordinator.append_session(identity, frame)
+        await coordinator.append_session(identity, audio)
+        received = await collect(outputs, 2)
+        assert [(item.kind, item.input_seq) for item in received] == [
+            ("input_done", 0),
+            ("input_done", 1),
+        ]
+        appends = [event for event in event_log(events) if event[0] == "append"]
+        assert sorted(event[1] for event in appends) == [
+            "cascade",
+            "seeing",
+            "seeing",
+            "vad",
+        ]
+        await coordinator.close_session(identity)
+
+
+@pytest.mark.asyncio
 async def test_failed_node_open_closes_the_nodes_already_open(tmp_path):
     async with pipeline(tmp_path, names=NODES) as (coordinator, events, _):
         coordinator.session_graph = chain_graph()
@@ -320,8 +363,316 @@ async def test_open_without_a_route_follows_the_pipeline_route(tmp_path):
             await coordinator.open_session(OmniRequest(None))
 
 
+class EchoExecution:
+    """Runs one pipeline request per input through the node's stages and emits the terminal result."""
+
+    def __init__(
+        self,
+        work: SessionWork,
+        terminal_stages: set[str] | None = None,
+        params: dict[str, object] | None = None,
+    ) -> None:
+        self.work = work
+        self.terminal_stages = terminal_stages
+        self.params = params or {}
+        self.emitter: SessionEmitter | None = None
+        self.request_ids: list[str] = []
+
+    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
+        self.emitter = emitter
+
+    async def append(self, chunk: TimedChunk) -> None:
+        assert self.emitter is not None
+        request_id = f"echo-{self.work.session_id}-{chunk.seq}"
+        self.request_ids.append(request_id)
+        async for message in self.work.stream(
+            request_id,
+            OmniRequest(None, {**self.params, "seq": chunk.seq}),
+            self.terminal_stages,
+        ):
+            if isinstance(message, CompleteMessage):
+                await self.emitter.emit_output(
+                    TimedChunk(
+                        "text", chunk.t_start_ms, 0, chunk.seq, message.result, "text"
+                    )
+                )
+            else:
+                pass
+        assert request_id not in self.work.session.work_owners
+
+    async def close(self) -> None:
+        await self.work.release_all(5)
+
+
+ECHO_GRAPH = SessionGraph(
+    nodes={
+        "model": SessionNode(
+            stages=("source", "sink"), inputs=("input",), execution="echo"
+        )
+    },
+    publish={"model": ("text",)},
+)
+
+
+@pytest.mark.parametrize(
+    ("other_terminals", "terminal_stages"),
+    [((), None), (("other",), {"sink"})],
+    ids=["pipeline-terminal", "beside-other-terminals"],
+)
+@pytest.mark.asyncio
+async def test_execution_node_runs_its_requests_through_its_owners(
+    tmp_path, other_terminals, terminal_stages
+):
+    """A request ends at the pipeline's terminal, or at its node's last stage when the pipeline has other terminals."""
+    async with pipeline(
+        tmp_path,
+        session_request_owners=frozenset({"source", "sink"}),
+        other_terminals=other_terminals,
+    ) as (coordinator, events, _):
+        executions: list[EchoExecution] = []
+
+        def factory(work: SessionWork) -> EchoExecution:
+            executions.append(EchoExecution(work, terminal_stages))
+            return executions[-1]
+
+        coordinator.session_execution_factories["echo"] = factory
+        coordinator.session_route = None
+        coordinator.session_graph = ECHO_GRAPH
+        identity = await coordinator.open_session(OmniRequest(None))
+        outputs = coordinator.session_outputs(identity)
+        await coordinator.append_session(identity, chunk(0))
+        await coordinator.append_session(identity, chunk(1))
+        received = await collect(outputs, 4)
+        data = [item for item in received if item.kind == "data"]
+        assert [item.input_seq for item in received if item.kind == "input_done"] == [
+            0,
+            1,
+        ]
+        assert [item.payload["stage"] for item in data] == ["sink", "sink"]
+        assert [item.payload["echo"] for item in data] == [{"seq": 0}, {"seq": 1}]
+        node = coordinator.sessions[f"{identity.id}:model"]
+        assert not node.work_owners
+        await outputs.aclose()
+        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
+        log = event_log(events)
+        computed = [(event[1], event[2]) for event in log if event[0] == "compute"]
+        assert computed == [
+            (stage, request_id)
+            for request_id in executions[0].request_ids
+            for stage in ("source", "sink")
+        ]
+        assert [event[1] for event in log if event[0] == "append"] == []
+
+
 def text_ends_at_text_stage(request: OmniRequest) -> list[str]:
     return ["text"] if request.params.get("text_only") else ["text", "audio"]
+
+
+@pytest.mark.asyncio
+async def test_execution_request_without_terminals_ends_where_the_pipeline_resolves(
+    tmp_path,
+):
+    graph = SessionGraph(
+        nodes={
+            "model": SessionNode(
+                stages=("text", "audio"), inputs=("input",), execution="echo"
+            )
+        },
+        publish={"model": ("text",)},
+    )
+    async with pipeline(
+        tmp_path,
+        names=["text", "audio"],
+        session_request_owners=frozenset({"text", "audio"}),
+        terminal_stages_resolver=text_ends_at_text_stage,
+    ) as (coordinator, events, _):
+
+        def factory(work: SessionWork) -> EchoExecution:
+            return EchoExecution(work, params={"text_only": True})
+
+        coordinator.session_execution_factories["echo"] = factory
+        coordinator.session_graph = graph
+        identity = await coordinator.open_session(OmniRequest(None))
+        outputs = coordinator.session_outputs(identity)
+        await coordinator.append_session(identity, chunk(0))
+        received = await collect(outputs, 2)
+        assert [(item.kind, item.input_seq) for item in received] == [
+            ("data", 0),
+            ("input_done", 0),
+        ]
+        assert received[0].payload["stage"] == "text"
+        assert not coordinator.sessions[f"{identity.id}:model"].work_owners
+        await outputs.aclose()
+        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
+        log = event_log(events)
+        assert [event[1] for event in log if event[0] == "compute"] == ["text"]
+
+
+class FailingRequestExecution:
+    """Runs its first input's request in the background, as a component does, and raises that request's failure when it closes."""
+
+    def __init__(self, work: SessionWork, fail_on: str | None) -> None:
+        self.work = work
+        self.fail_on = fail_on
+        self.emitter: SessionEmitter | None = None
+        self.task: asyncio.Task[None] | None = None
+
+    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
+        self.emitter = emitter
+
+    async def append(self, chunk: TimedChunk) -> None:
+        self.task = asyncio.create_task(self.run(chunk))
+
+    async def run(self, chunk: TimedChunk) -> None:
+        assert self.emitter is not None
+        params = {"seq": chunk.seq, "fail_on": self.fail_on}
+        async for message in self.work.stream(
+            f"request-{self.work.session_id}-{chunk.seq}", OmniRequest(None, params)
+        ):
+            if isinstance(message, CompleteMessage):
+                await self.emitter.emit_output(
+                    TimedChunk(
+                        "text", chunk.t_start_ms, 0, chunk.seq, message.result, "text"
+                    )
+                )
+            else:
+                pass
+
+    async def control(self, event: TimedChunk) -> None:
+        pass
+
+    async def close(self) -> None:
+        assert self.task is not None
+        await asyncio.wait({self.task})
+        await self.work.release_all(5)
+        if self.task.exception() is not None:
+            raise self.task.exception()
+        else:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_a_failed_execution_request_fails_its_session_but_not_the_stages(
+    tmp_path,
+):
+    async with pipeline(
+        tmp_path, session_request_owners=frozenset({"source", "sink"})
+    ) as (coordinator, _, _):
+        executions: list[FailingRequestExecution] = []
+
+        def factory(work: SessionWork) -> FailingRequestExecution:
+            executions.append(
+                FailingRequestExecution(work, "sink" if not executions else None)
+            )
+            return executions[-1]
+
+        coordinator.session_execution_factories["echo"] = factory
+        coordinator.session_route = None
+        coordinator.session_graph = ECHO_GRAPH
+        failed = await coordinator.open_session(OmniRequest(None))
+        outputs = coordinator.session_outputs(failed)
+        await coordinator.append_session(failed, chunk(0))
+        assert (await asyncio.wait_for(anext(outputs), OUTPUT_TIMEOUT_S)).kind == (
+            "input_done"
+        )
+        await wait_until(lambda: executions[0].task.done())
+        await coordinator.close_session(failed)
+        with pytest.raises(RuntimeError, match="compute failed on sink"):
+            await asyncio.wait_for(anext(outputs), OUTPUT_TIMEOUT_S)
+        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
+        assert not coordinator.session_unavailable_stages
+        identity = await coordinator.open_session(OmniRequest(None))
+        outputs = coordinator.session_outputs(identity)
+        await coordinator.append_session(identity, chunk(0))
+        received = await collect(outputs, 2)
+        data = [item for item in received if item.kind == "data"]
+        assert [item.payload["echo"]["seq"] for item in data] == [0]
+        await outputs.aclose()
+        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
+
+
+@pytest.mark.asyncio
+async def test_an_execution_request_refused_admission_leaves_no_owner(tmp_path):
+    async with pipeline(
+        tmp_path, session_request_owners=frozenset({"source", "sink"})
+    ) as (coordinator, _, _):
+        executions: list[EchoExecution] = []
+
+        def factory(work: SessionWork) -> EchoExecution:
+            executions.append(EchoExecution(work))
+            return executions[-1]
+
+        coordinator.session_execution_factories["echo"] = factory
+        coordinator.session_route = None
+        coordinator.session_graph = ECHO_GRAPH
+        identity = await coordinator.open_session(OmniRequest(None))
+        coordinator.max_in_flight = 0
+        with pytest.raises(QueueFullError):
+            await asyncio.wait_for(
+                anext(executions[0].work.stream("refused", OmniRequest(None))),
+                OUTPUT_TIMEOUT_S,
+            )
+        assert not coordinator.sessions[f"{identity.id}:model"].work_owners
+        await coordinator.close_session(identity)
+        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
+        assert not coordinator.session_unavailable_stages
+
+
+def vad_graph() -> SessionGraph:
+    return SessionGraph(
+        nodes={
+            "vad": SessionNode(stages=("vad",), inputs=("input",)),
+            "right": SessionNode(stages=("right",), inputs=("input", "vad:session")),
+        },
+        publish={"vad": ("session",)},
+    )
+
+
+def audio(seq: int, payload: bytes, eos: bool = False) -> TimedChunk:
+    return TimedChunk("audio", seq * 100, 100, seq, payload, "pcm16", eos=eos)
+
+
+@pytest.mark.asyncio
+async def test_the_vad_node_publishes_speech_boundaries_that_its_readers_also_take(
+    tmp_path,
+):
+    async with pipeline(
+        tmp_path, names=["vad", "right"], factories={"vad": VAD_FACTORY}
+    ) as (coordinator, events, _):
+        coordinator.session_graph = vad_graph()
+        identity = await coordinator.open_session(
+            OmniRequest(None, {"emit_every": 1000})
+        )
+        outputs = coordinator.session_outputs(identity)
+        await coordinator.append_session(identity, audio(0, bytes(3200)))
+        await coordinator.append_session(identity, audio(1, b"\x00\x10" * 1600))
+        await coordinator.append_session(identity, audio(2, bytes(3200)))
+        received = await collect(outputs, 5)
+        boundaries = [
+            (item.payload["type"], item.payload["t_ms"], item.t_start_ms)
+            for item in received
+            if item.kind == "data"
+        ]
+        assert boundaries == [
+            ("speech.started", 100, 100),
+            ("speech.stopped", 200, 200),
+        ]
+        assert [item.input_seq for item in received if item.kind == "input_done"] == [
+            0,
+            1,
+            2,
+        ]
+        appended: list[int] = []
+
+        def right_took_every_chunk() -> bool:
+            appended.extend(
+                e[3] for e in event_log(events) if e[:2] == ("append", "right")
+            )
+            return len(appended) >= 5
+
+        await wait_until(right_took_every_chunk)
+        assert sorted(appended) == [0, 1, 2, 3, 4]
+        await coordinator.close_session(identity)
 
 
 def hop_graph() -> SessionGraph:
@@ -524,7 +875,7 @@ def test_a_graph_append_keeps_the_input_contract():
     sessions.append_graph(graph, TimedChunk("audio", 0, 20, 1, b"pcm", eos=True))
     with pytest.raises(ValueError, match="after EOS"):
         sessions.append_graph(graph, TimedChunk("audio", 20, 20, 2, b"pcm"))
-    with pytest.raises(QueueFullError):
+    with pytest.raises(ValueError, match="after EOS"):
         sessions.append_graph(graph, TimedChunk("image", 0, 0, 2, b"png"))
     assert graph.next_input == 2
 
@@ -598,3 +949,56 @@ async def test_node_control_broadcast_and_late_tool_reply_fence(tmp_path):
             for stage in ("source", "sink")
         ]
         await coordinator.close_session(identity)
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_drops_released_audio_still_waiting_for_the_client():
+    identity = SessionIdentity("graph", 1)
+    graph = SessionGraphRuntime(
+        session_identity=identity,
+        graph=SessionGraph(
+            nodes={"speaker": SessionNode(stages=("speaker",), inputs=("input",))},
+            publish={"speaker": ("pcm16",)},
+        ),
+        nodes={"speaker": SessionIdentity("graph:speaker", 1)},
+        limits=SessionLimits(max_output_chunks=1),
+        inboxes={},
+        outputs=asyncio.Queue(maxsize=1),
+    )
+    pacer = DeliveryPacer(250, asyncio.Event())
+    graph.pacers["speaker"] = pacer
+
+    def reply(kind: str | None, turn: int) -> OutputChunk:
+        if kind is None:
+            return OutputChunk(
+                identity, 0, 0, "audio", 0, 100, bytes(3200), "pcm16", turn=turn
+            )
+        else:
+            return OutputChunk(
+                identity, 0, 0, "control", 0, 0, {"type": kind}, "session", turn=turn
+            )
+
+    filler = reply(None, 0)
+    graph.outputs.put_nowait((filler, 0))
+    pacer.offer(reply("turn.started", 1), 10)
+    pacer.offer(reply(None, 1), 3300)
+    graph.output_bytes = 3310
+    runner = SessionGraphRunner()
+    delivery = asyncio.create_task(runner.deliver_paced_outputs(graph, "speaker"))
+    await asyncio.sleep(0.05)
+    graph.interrupted_turns["speaker"] = 1
+    graph.output_bytes -= pacer.purge(1)
+    assert (await graph.outputs.get())[0] is filler
+    graph.output_bytes += 3300
+    pacer.offer(reply(None, 1), 3300)
+    await asyncio.sleep(0.05)
+    assert graph.outputs.empty() and graph.output_bytes == 0
+    graph.output_bytes += 10
+    graph.output_bytes -= pacer.offer(reply("turn.interrupted", 1), 10)
+    delivered, _ = await asyncio.wait_for(graph.outputs.get(), OUTPUT_TIMEOUT_S)
+    await asyncio.sleep(0.05)
+    delivery.cancel()
+    await asyncio.gather(delivery, return_exceptions=True)
+    assert delivered.payload == {"type": "turn.interrupted"}
+    assert graph.outputs.empty()
+    assert graph.output_bytes == 10

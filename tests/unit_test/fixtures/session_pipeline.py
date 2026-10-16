@@ -11,7 +11,7 @@ import logging
 import multiprocessing
 import threading
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from multiprocessing.context import SpawnProcess
@@ -22,6 +22,7 @@ from typing import Literal, Protocol, TypeAlias, TypedDict
 
 import pytest
 
+from sglang_omni.audio.vad import VADConfig
 from sglang_omni.config.schema import (
     REPLICA_SEPARATOR,
     PipelineConfig,
@@ -29,6 +30,7 @@ from sglang_omni.config.schema import (
     StageConfig,
 )
 from sglang_omni.config.topology import compile_logical_processes
+from sglang_omni.models.vad.session import VADHooks
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.replicas import expand_replica_stages
 from sglang_omni.pipeline.sessions import Session
@@ -82,6 +84,7 @@ class HookState:
     emit_control: str | None
     # Seconds after an append completes at which the control is emitted on the session's output stream.
     emit_after_s: float
+    reply_ms: float
 
 
 def number_param(params: Mapping[str, object], key: str, default: float) -> float:
@@ -131,7 +134,32 @@ def read_hook_state(
         emit_format=text_param(params, "emit_format"),
         emit_control=text_param(params, "emit_control"),
         emit_after_s=number_param(params, "emit_after", 0),
+        reply_ms=number_param(params, "emit_reply_ms", 0),
     )
+
+
+REPLY_UNIT_MS = 100
+
+
+def reply_chunks(reply_ms: float) -> list[TimedChunk]:
+    """Turn 1 with `reply_ms` of 16 kHz pcm16 audio in 100 ms chunks, all at once."""
+    units = int(reply_ms // REPLY_UNIT_MS)
+    return [
+        control_chunk("turn.started", turn=1),
+        *(
+            TimedChunk(
+                "audio",
+                index * REPLY_UNIT_MS,
+                REPLY_UNIT_MS,
+                0,
+                bytes(REPLY_UNIT_MS * 32),
+                "pcm16",
+                turn=1,
+            )
+            for index in range(units)
+        ),
+        control_chunk("turn.done", units * REPLY_UNIT_MS, turn=1),
+    ]
 
 
 class Hooks(SessionHooks):
@@ -175,6 +203,11 @@ class Hooks(SessionHooks):
                 assert payload.data["tensor"].item() == state.count
             else:
                 pass
+            if state.reply_ms and state.count == 1:
+                for emitted in reply_chunks(state.reply_ms):
+                    context.emit(emitted)
+                payload.data = {"count": state.count}
+                return payload
             if state.count % state.emit_every and not chunk.eos:
                 payload.data = {"count": state.count}
                 return payload
@@ -259,6 +292,39 @@ def make_session_scheduler(name: str, events: Queue[StageEvent]) -> SessionSched
     return SessionScheduler(Hooks(name, events), compute_fn=compute)
 
 
+class LoudnessDetector:
+    """A speech detector for the VAD stage: speech is any non-zero byte, boundaries fall on chunk starts."""
+
+    def __init__(self, config: VADConfig) -> None:
+        self.config = config
+        self.is_speech = False
+        self.last_speech_offset = 0
+        self.samples = 0
+
+    def boundaries(self, pcm: bytes) -> list[tuple[bool, int]]:
+        loud = any(pcm)
+        found = [] if loud == self.is_speech else [(loud, self.samples)]
+        self.is_speech = loud
+        self.samples += len(pcm) // 2
+        if loud:
+            self.last_speech_offset = self.samples
+        else:
+            pass
+        return found
+
+    def reset(self) -> None:
+        self.is_speech = False
+        self.last_speech_offset = 0
+        self.samples = 0
+
+
+def make_vad_scheduler(name: str, events: Queue[StageEvent]) -> SessionScheduler:
+    return SessionScheduler(VADHooks(VADConfig(), LoudnessDetector))
+
+
+VAD_FACTORY = f"{__name__}.make_vad_scheduler"
+
+
 def worker(spec: StageLaunchConfig, ready: Event) -> None:
     from sglang_omni.pipeline.stage_workers import construct_stage
 
@@ -281,12 +347,18 @@ async def pipeline(
     replicate_entry: bool = False,
     list_next: bool = False,
     names: list[str] | None = None,
+    session_request_owners: frozenset[str] = frozenset(),
     factories: Mapping[str, str] | None = None,
+    other_terminals: tuple[str, ...] = (),
+    terminal_stages_resolver: Callable[[OmniRequest], list[str]] | None = None,
 ) -> AsyncIterator[tuple[Coordinator, Queue[StageEvent], list[SpawnProcess]]]:
     """A linear route of synthetic stages, or with `names`, unchained terminal stages.
 
-    `factories` replaces the synthetic hooks of the named
-    stages with another factory taking `name` and `events`.
+    `session_request_owners` are the stages that track the requests of an
+    execution-held node; `factories` replaces the synthetic hooks of the named
+    stages with another factory taking `name` and `events`; `other_terminals`
+    are terminal stages beside the route, as other models of the pipeline;
+    `terminal_stages_resolver` derives the terminal stages of each request.
     """
     factories = factories or {}
     ctx = multiprocessing.get_context("spawn")
@@ -295,7 +367,7 @@ async def pipeline(
         ["source", "middle", "sink"] if stage_count == 3 else ["source", "sink"]
     )
     stages = []
-    for index, name in enumerate(names):
+    for index, name in enumerate([*names, *other_terminals]):
         target = names[index + 1] if is_chained and index + 1 < len(names) else None
         stages.append(
             StageConfig(
@@ -329,6 +401,7 @@ async def pipeline(
         logical_process_plan=plan,
         replica_topology=topology,
         session_route=(lambda: names) if is_chained else None,
+        terminal_stages_resolver=terminal_stages_resolver,
     )
     events = ctx.Queue()
     processes = []
@@ -348,6 +421,7 @@ async def pipeline(
                 abort_endpoint=abort,
                 stage_endpoints=endpoints,
                 replica_topology=topology.to_dict(),
+                owns_session_requests=stage.name in session_request_owners,
             )
             process = ctx.Process(target=worker, args=(spec, ready))
             process.expected_exitcode = 0

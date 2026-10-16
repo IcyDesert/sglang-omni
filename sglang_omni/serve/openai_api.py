@@ -374,7 +374,7 @@ def create_app(
         register_session_wire(
             app,
             limits=(
-                realtime_deployment.limits
+                realtime_deployment.session_limits
                 if realtime_deployment is not None
                 else SessionLimits()
             ),

@@ -8,7 +8,7 @@ from typing import Protocol
 
 import numpy as np
 
-from .vad import (
+from sglang_omni.audio.vad import (
     VAD_FRAME_SAMPLES,
     VAD_SAMPLE_RATE,
     Emit,

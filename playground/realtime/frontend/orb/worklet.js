@@ -69,6 +69,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.queue = [];
     this.headOffset = 0;
     this.queuedSamples = 0;
+    // Response of the samples most recently moved into outBuf.
+    this.outResponseId = null;
     this.started = false;
     this.lastSample = 0;
     this.fadeRemaining = 0;
@@ -83,6 +85,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.underruns = 0;
     this.port.onmessage = ({ data }) => {
       if (data.type === "push" && data.samples) {
+        // Each chunk remembers its response so a cancel drops only that reply.
+        data.samples.responseId = data.responseId;
         this.queue.push(data.samples);
         this.queuedSamples += data.samples.length;
         // A network stall lets audio pile up while the server keeps generating in
@@ -113,6 +117,9 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       } else if (data.type === "flush") {
         this.responseOpen = false;
         if (this.queuedSamples > 0) this.started = true;
+      } else if (data.type === "cancel") {
+        this.responseOpen = false;
+        this.cancel(data.responseId);
       } else if (data.type === "reset") {
         this.responseOpen = false;
         this.target = this.initialSamples;
@@ -130,6 +137,22 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.outPos = 0;
       }
     };
+  }
+
+  // Drops every queued sample of one response; audio of a later response keeps its place.
+  cancel(responseId) {
+    const playing = (this.queue.length && this.queue[0].responseId === responseId) || this.outResponseId === responseId;
+    if (this.queue.length && this.queue[0].responseId === responseId) this.headOffset = 0;
+    this.queue = this.queue.filter((chunk) => chunk.responseId !== responseId);
+    this.queuedSamples = this.queue.reduce((total, chunk) => total + chunk.length, 0) - this.headOffset;
+    if (playing) {
+      this.outBuf = [];
+      this.outPos = 0;
+      this.stretch = null;
+      this.rate = 1;
+      this.fadeRemaining = this.fadeLength;
+    }
+    if (this.queuedSamples === 0) this.started = false;
   }
 
   trim(keepSamples) {
@@ -184,6 +207,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     let left = count;
     while (left > 0 && this.queue.length) {
       const chunk = this.queue[0];
+      this.outResponseId = chunk.responseId;
       const remaining = chunk.length - this.headOffset;
       if (remaining <= left) {
         this.queue.shift();

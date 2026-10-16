@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The Session graph runtime: node sessions joined by bounded edges, and control edges."""
+"""The Session graph runtime: node sessions joined by bounded edges, control edges and paced delivery."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Coroutine
 from dataclasses import replace
 
 from sglang_omni.admission import QueueFullError
+from sglang_omni.pipeline.session_delivery import DeliveryPacer
 from sglang_omni.pipeline.sessions import (
     CoordinatorSessions,
     NodeInbox,
@@ -32,9 +33,19 @@ from sglang_omni.proto.session import (
     wire_size,
 )
 from sglang_omni.proto.streams import (
+    AUDIO,
+    AUDIO_FORMATS,
     INTERRUPT,
+    SPEECH_STARTED,
+    SPEECH_STOPPED,
+    TURN_DONE,
+    TURN_EMPTY,
+    TURN_INTERRUPTED,
+    TURN_QUEUED,
+    TURN_STARTED,
     control_type,
     edge_event,
+    holds_turn_end,
     is_interrupted_reply,
 )
 
@@ -83,7 +94,7 @@ class SessionGraphRunner(CoordinatorSessions):
 
         The target's inbox and its node session's unsent appends lose the
         turn's chunks from other nodes, and a later chunk of the turn no
-        longer enters the inbox.
+        longer enters the inbox; the target's pacer drops the turn's output.
         The client's own input stays.
         """
         if control_type(event) == INTERRUPT and event.turn is not None:
@@ -110,7 +121,9 @@ class SessionGraphRunner(CoordinatorSessions):
             node.pending = kept
         else:
             pass
-        if control_type(event) is None and self.is_interrupted(graph, target, event):
+        if control_type(event) == INTERRUPT and target in graph.pacers:
+            graph.output_bytes -= graph.pacers[target].purge(event.turn)
+        elif control_type(event) is None and self.is_interrupted(graph, target, event):
             return
         else:
             pass
@@ -144,6 +157,11 @@ class SessionGraphRunner(CoordinatorSessions):
             limits=limits,
             inboxes={name: NodeInbox() for name in nodes},
             outputs=asyncio.Queue(maxsize=limits.max_output_chunks),
+            pacers={
+                name: DeliveryPacer(self.max_output_lead_ms, asyncio.Event())
+                for name, formats in graph.publish.items()
+                if AUDIO_FORMATS & set(formats)
+            },
             client_sequences={name: {} for name in nodes},
         )
         self.next_open_index += 1
@@ -175,6 +193,7 @@ class SessionGraphRunner(CoordinatorSessions):
                     ),
                     session_id=f"{session_id}:{name}",
                     is_node=True,
+                    execution=node.execution,
                 )
         except BaseException:
             for identity in reversed(list(nodes.values())):
@@ -183,13 +202,17 @@ class SessionGraphRunner(CoordinatorSessions):
         return nodes
 
     def start_graph_tasks(self, graph: SessionGraphRuntime) -> None:
-        """Start each node's input forwarding and output routing tasks."""
+        """Start, per node, the task feeding its inbox, the task routing its outputs and, with a pacer, the task delivering them."""
         for name in graph.nodes:
             graph.forwarders.append(
                 self.graph_task(graph, name, self.forward_graph_inputs(graph, name))
             )
             graph.tasks.append(
                 self.graph_task(graph, name, self.route_graph_outputs(graph, name))
+            )
+        for name in graph.pacers:
+            graph.tasks.append(
+                self.graph_task(graph, name, self.deliver_paced_outputs(graph, name))
             )
 
     def graph_task(
@@ -222,6 +245,8 @@ class SessionGraphRunner(CoordinatorSessions):
         """Hand client input to every node reading it; rejected input keeps its seq."""
         if graph.is_closing:
             raise RuntimeError("session is closing")
+        elif graph.end_input is not None:
+            raise ValueError("input after EOS")
         elif chunk.seq != graph.next_input:
             raise ValueError("input seq must be contiguous within an open index")
         else:
@@ -277,6 +302,12 @@ class SessionGraphRunner(CoordinatorSessions):
             inbox.queued.append((GRAPH_INPUT, chunk, chunk.seq))
             inbox.counts[GRAPH_INPUT] += 1
             inbox.wake.set()
+        if chunk.eos:
+            graph.end_input = chunk
+            for pacer in graph.pacers.values():
+                pacer.end_input()
+        else:
+            pass
         graph.modality_end_ms[chunk.modality] = chunk.t_start_ms + chunk.duration_ms
         if chunk.eos:
             graph.ended_modalities.add(chunk.modality)
@@ -298,7 +329,7 @@ class SessionGraphRunner(CoordinatorSessions):
         self, graph: SessionGraphRuntime, target: str, chunk: TimedChunk
     ) -> bool:
         return chunk.turn is not None and chunk.turn in graph.interrupted_turns.get(
-            target, set()
+            target, ()
         )
 
     async def put_graph_inbox(
@@ -327,6 +358,7 @@ class SessionGraphRunner(CoordinatorSessions):
         inbox.queued.append((source, chunk, None))
         inbox.counts[source] += 1
         inbox.wake.set()
+        graph.eos_wake.set()
 
     async def forward_graph_inputs(self, graph: SessionGraphRuntime, name: str) -> None:
         """Append one node's inbox in that node's own seq order; a chunk leaves the inbox once its node session accepts it."""
@@ -342,6 +374,29 @@ class SessionGraphRunner(CoordinatorSessions):
                 continue
             else:
                 source, chunk, client_seq = inbox.queued[0]
+            if chunk.eos and client_seq is not None:
+                earlier = graph.graph.order()[: graph.graph.order().index(name)]
+                waiting = (
+                    set(earlier)
+                    & set(graph.graph.reading_nodes(GRAPH_INPUT, chunk.format))
+                    - graph.eos_confirmed
+                )
+                node = graph.graph.nodes[name]
+                # Note (Junnan Li): A node with a feedback edge takes the client EOS after the open turns end, so it still reads their replies' feedback.
+                if waiting or (
+                    graph.open_turns
+                    and any(node.bound(source).feedback for source in node.edges())
+                ):
+                    if len(inbox.queued) > 1:
+                        inbox.queued.rotate(-1)
+                    else:
+                        graph.eos_wake.clear()
+                        await graph.eos_wake.wait()
+                    continue
+                else:
+                    pass
+            else:
+                pass
             try:
                 await self.append_session(identity, replace(chunk, seq=seq))
             except QueueFullError:
@@ -368,7 +423,12 @@ class SessionGraphRunner(CoordinatorSessions):
                 deadline = None
 
     async def route_graph_outputs(self, graph: SessionGraphRuntime, name: str) -> None:
-        """Deliver one node's outputs to its readers and, when published, to the client."""
+        """Deliver one node's outputs to its readers and, when published, to the client.
+
+        A node with a pacer hands it what it publishes, and its published
+        turn.done reaches the readers only when the pacer releases it; a
+        node without one gets its published turn.done back once published.
+        """
         async for output in self.session_outputs(graph.nodes[name]):
             if output.kind == "input_done":
                 client_seq = graph.client_sequences[name].pop(output.input_seq, None)
@@ -407,19 +467,113 @@ class SessionGraphRunner(CoordinatorSessions):
             else:
                 pass
             is_published = graph.graph.is_published(name, output.format)
-            for reader in graph.graph.reading_nodes(name, output.format):
-                await self.put_graph_inbox(graph, reader, name, chunk)
-            if is_published:
+            if is_published and graph.graph.shared_timeline:
+                output = self.time_graph_output(graph, output)
+                chunk = output_chunk(output)
+            else:
+                pass
+            pacer = graph.pacers.get(name)
+            if not holds_turn_end(chunk, pacer is not None, is_published):
+                for reader in graph.graph.reading_nodes(name, output.format):
+                    await self.put_graph_inbox(graph, reader, name, chunk)
+            else:
+                pass
+            if is_published and pacer is not None:
+                if output.turn in graph.reply_starts:
+                    pacer.reply_start_ms, pacer.reply_started_at = graph.reply_starts[
+                        output.turn
+                    ]
+                else:
+                    pass
+                size = self.reserve_graph_output(graph, name, output)
+                graph.output_bytes -= pacer.offer(output, size)
+            elif is_published:
                 await self.publish_graph_output(
                     graph, output, self.reserve_graph_output(graph, name, output)
                 )
+                self.return_turn_end(graph.nodes[name], output)
             else:
                 pass
+
+    def time_graph_output(
+        self, graph: SessionGraphRuntime, output: OutputChunk
+    ) -> OutputChunk:
+        """Timestamp published reply chunks on the graph's shared media clock."""
+        input_end_ms = graph.modality_end_ms.get(AUDIO, 0.0)
+        event = control_type(output)
+        if output.format in AUDIO_FORMATS:
+            start = max(graph.output_end_ms, graph.reply_start_ms)
+            graph.output_end_ms = start + output.duration_ms
+        elif event == TURN_STARTED:
+            start = max(graph.output_end_ms, input_end_ms)
+            graph.reply_start_ms = start
+        elif event == TURN_DONE:
+            start = max(graph.output_end_ms, graph.reply_start_ms)
+        elif event == TURN_INTERRUPTED:
+            graph.output_end_ms = input_end_ms
+            start = input_end_ms
+        elif event in (SPEECH_STARTED, SPEECH_STOPPED):
+            return output
+        else:
+            start = input_end_ms
+        return replace(output, t_start_ms=start)
+
+    async def deliver_paced_outputs(
+        self, graph: SessionGraphRuntime, name: str
+    ) -> None:
+        """Publish what one node's pacer releases; a released turn.done reaches the readers and returns to the node as a control."""
+        pacer = graph.pacers[name]
+        loop = asyncio.get_running_loop()
+        while True:
+            pacer.unsent.extend(pacer.release(loop.time()))
+            while pacer.unsent:
+                # Note (Junnan Li): A released chunk waits in the pacer, where an interrupt still drops it, until the client's queue has room.
+                if graph.outputs.full():
+                    await asyncio.sleep(FULL_QUEUE_RETRY_S)
+                    continue
+                else:
+                    pass
+                output, size = pacer.unsent.popleft()
+                if any(
+                    is_interrupted_reply(output, turn)
+                    for turn in graph.interrupted_turns.get(name, ())
+                ):
+                    graph.output_bytes -= size
+                    continue
+                else:
+                    pass
+                await self.publish_graph_output(graph, output, size)
+                if control_type(output) == TURN_DONE:
+                    for reader in graph.graph.reading_nodes(name, output.format):
+                        await self.put_graph_inbox(
+                            graph, reader, name, output_chunk(output)
+                        )
+                else:
+                    pass
+                self.return_turn_end(graph.nodes[name], output)
+            await pacer.wait()
 
     async def publish_graph_output(
         self, graph: SessionGraphRuntime, output: OutputChunk, size: int
     ) -> None:
         """Hand a node output to the client, counted as `size` bytes of the output budget."""
+        event = control_type(output)
+        if event == TURN_QUEUED:
+            graph.open_turns.add(output.turn)
+        elif event in (TURN_DONE, TURN_EMPTY, TURN_INTERRUPTED):
+            graph.open_turns.discard(output.turn)
+            graph.eos_wake.set()
+        else:
+            pass
+        if event == TURN_STARTED:
+            graph.reply_starts[output.turn] = (
+                output.t_start_ms,
+                asyncio.get_running_loop().time(),
+            )
+        elif event in (TURN_DONE, TURN_EMPTY, TURN_INTERRUPTED):
+            graph.reply_starts.pop(output.turn, None)
+        else:
+            pass
         published = replace(
             output,
             session_identity=graph.session_identity,
@@ -447,12 +601,49 @@ class SessionGraphRunner(CoordinatorSessions):
         self, graph: SessionGraphRuntime, name: str, chunk: TimedChunk
     ) -> None:
         """One reader is done with the client's input `chunk`, by taking or by dropping it; the client hears of it once every reader is."""
+        if chunk.eos:
+            graph.eos_confirmed.add(name)
+            graph.eos_wake.set()
+        else:
+            pass
         graph.pending_input_done[chunk.seq] -= 1
         if graph.pending_input_done[chunk.seq] == 0:
             del graph.pending_input_done[chunk.seq]
-            self.emit_graph_input_done(graph, name, chunk)
+            if chunk.eos:
+                graph.drain_task = asyncio.create_task(
+                    self.drain_graph(graph, name, chunk)
+                )
+                graph.tasks.append(graph.drain_task)
+            else:
+                self.emit_graph_input_done(graph, name, chunk)
         else:
             pass
+
+    async def drain_graph(
+        self, graph: SessionGraphRuntime, name: str, chunk: TimedChunk
+    ) -> None:
+        """EOS confirms only after routed work and published reply turns finish."""
+        deadline = asyncio.get_running_loop().time() + graph.limits.operation_timeout_s
+        try:
+            while (
+                graph.open_turns
+                or graph.pending_input_done
+                or any(inbox.queued for inbox in graph.inboxes.values())
+                or any(
+                    self.sessions[identity.id].pending_count
+                    or self.sessions[identity.id].outputs
+                    for identity in graph.nodes.values()
+                )
+                or any(pacer.items for pacer in graph.pacers.values())
+            ):
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("Session graph did not drain after EOS")
+                else:
+                    await asyncio.sleep(FULL_QUEUE_RETRY_S)
+            self.emit_graph_input_done(graph, name, chunk)
+        except Exception as error:
+            graph.error = graph.error or error
+            self.begin_graph_close(graph)
 
     def emit_graph_input_done(
         self, graph: SessionGraphRuntime, name: str, chunk: TimedChunk
