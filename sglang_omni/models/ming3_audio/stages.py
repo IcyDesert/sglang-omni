@@ -129,6 +129,8 @@ def create_audio_encoder_executor(
     encoder = Ming3AudioEncoder(
         AudioEncoderConfig.model_validate(configuration["audio_config"]),
         configuration["text_config"]["hidden_size"],
+        should_upcast_layer_norm=False,
+        should_batch_chunks=True,
     )
     encoder.load_checkpoint(model_path)
     encoder = encoder.eval().to(resolved_device, dtype=torch.bfloat16)

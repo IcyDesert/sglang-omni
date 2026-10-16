@@ -44,7 +44,12 @@ def test_encoder_matches_reference() -> None:
         downsampler_stride_list=[2, 2, 2],
         whisper_chunk_size=32,
     )
-    encoder = Ming3AudioEncoder(config, hidden_size=16).eval()
+    encoder = Ming3AudioEncoder(
+        config,
+        hidden_size=16,
+        should_upcast_layer_norm=False,
+        should_batch_chunks=True,
+    ).eval()
     encoder.load_state_dict(
         {
             name.removeprefix("weights."): value
