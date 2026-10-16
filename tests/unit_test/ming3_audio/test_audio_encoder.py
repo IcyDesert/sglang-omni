@@ -60,3 +60,36 @@ def test_encoder_matches_reference() -> None:
     with torch.inference_mode():
         actual = encoder([reference["features.0"], reference["features.1"]])
     torch.testing.assert_close(actual, reference["expected"], rtol=1e-5, atol=1e-6)
+
+
+def test_unbatched_chunks_encode_independently_of_neighbors() -> None:
+    torch.manual_seed(0)
+    config = AudioEncoderConfig(
+        n_mels=4,
+        n_audio_ctx=32,
+        n_audio_state=8,
+        n_audio_head=2,
+        n_audio_layer=2,
+        downsampler_kernel_size_list=[3],
+        downsampler_stride_list=[2],
+        whisper_chunk_size=32,
+    )
+    encoder = Ming3AudioEncoder(
+        config,
+        hidden_size=16,
+        should_upcast_layer_norm=True,
+        should_batch_chunks=False,
+    ).eval()
+    long_clip = torch.randn(40, config.n_mels)
+    short_clip = torch.randn(9, config.n_mels)
+    with torch.inference_mode():
+        together = encoder([long_clip, short_clip])
+        separate = torch.cat(
+            [
+                encoder([long_clip[:32]]),
+                encoder([long_clip[32:]]),
+                encoder([short_clip]),
+            ]
+        )
+    assert together.shape[0] == config.output_length(40) + config.output_length(9)
+    torch.testing.assert_close(together, separate, rtol=0, atol=0)
