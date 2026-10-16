@@ -40,6 +40,7 @@ class OpenAISpeechSynthesizerConfig(ComponentConfig):
     voice: str = "default"
     reference_audio_path: str = ""
     reference_text: str = ""
+    language: str = ""
     max_sentence_words: int = Field(default=24, gt=0)
     api_key_env: str = "OPENAI_API_KEY"
 
@@ -117,6 +118,15 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
             "response_format": "pcm",
             "stream": True,
         }
+        if self.config.language:
+            # Note (Junnan Li): A sentence with CJK characters is spoken as Chinese whatever the configured language, so a reply in the user's language keeps the right tag.
+            body["language"] = (
+                "Chinese"
+                if any("\u4e00" <= char <= "\u9fff" for char in sentence)
+                else self.config.language
+            )
+        else:
+            pass
         if self.config.reference_audio_path:
             body["references"] = [
                 {

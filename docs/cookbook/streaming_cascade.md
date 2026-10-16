@@ -88,7 +88,7 @@ A profile is one `launch.yaml`. `services` lists the model services to start, ea
 | `openai_transcription` | Recognizer over `/v1/audio/transcriptions` | `base_url`, `model`, `language`, `api_key_env`, `timeout_s` |
 | `dialog` | Conversation history and turn taking | `system_prompt`, `max_history_chars`, `max_text_chars` |
 | `openai_chat` | Language model over `/v1/chat/completions` | `base_url`, `model`, `max_tokens`, `temperature`, `extra_body` (request fields the service takes beyond these, such as `chat_template_kwargs`), `api_key_env`, `timeout_s` |
-| `openai_speech` | Speech synthesis over `/v1/audio/speech` | `base_url`, `model`, `voice`, `reference_audio_path`, `reference_text`, `max_sentence_words`, `api_key_env`, `timeout_s` |
+| `openai_speech` | Speech synthesis over `/v1/audio/speech` | `base_url`, `model`, `voice`, `reference_audio_path`, `reference_text`, `language` (the speech service's language tag for the reply; a sentence with Chinese characters is tagged Chinese), `max_sentence_words`, `api_key_env`, `timeout_s` |
 | `running_transcript` | Cuts utterances from an ASR stage running inside the server | `tail_ms` |
 
 `base_url` and `model` have no defaults. `api_key_env` names an environment variable whose value is sent as a bearer token. The `vad` node is declared with `stages: [vad]`; its `silence_duration_ms` (default 500) sets how long a pause ends an utterance.

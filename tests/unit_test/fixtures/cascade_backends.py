@@ -62,6 +62,15 @@ def backends(request, backend_requests):
                 reference = {"audio_path": "/tmp/ref.wav", "text": "ref"}
                 assert request["references"] == [reference]
                 received_words.append(request["input"])
+                if scenario == "english_tts":
+                    spoken_chinese = any(
+                        "\u4e00" <= char <= "\u9fff" for char in request["input"]
+                    )
+                    assert request["language"] == (
+                        "Chinese" if spoken_chinese else "English"
+                    )
+                else:
+                    assert "language" not in request
                 labeled = scenario != "unlabeled_rate"
                 rate = {"X-Sample-Rate": "24000"} if labeled else {}
                 pcm = SPEECH_SAMPLES.tobytes()

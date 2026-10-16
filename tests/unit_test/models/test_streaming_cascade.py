@@ -317,6 +317,19 @@ async def test_openai_speech_flushes_each_reply_before_turn_done(backends):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["english_tts"], indirect=True)
+async def test_openai_speech_tags_each_sentence_with_its_language(backends):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    inputs = [
+        text_chunk("Hello world. 你好世界。", 1),
+        control_chunk(TURN_DONE, turn=1),
+    ]
+    await drain(build({**tts, "language": "English"}), inputs)
+    assert spoken[-1] == "你好世界。" and " ".join(spoken[:-1]) == "Hello world."
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backends", ["unlabeled_rate"], indirect=True)
 async def test_openai_speech_refuses_audio_of_an_unnamed_rate(backends):
     tts = backends[0].component_graph().node("tts").component.model_dump()
