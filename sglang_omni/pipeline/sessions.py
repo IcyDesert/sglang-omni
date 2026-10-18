@@ -638,6 +638,12 @@ class CoordinatorSessions:
 
     def fail_session(self, session: Session, error: BaseException) -> None:
         """End the session with its first error; its output stream raises it."""
+        if session.error is None:
+            logger.warning(
+                "session %s failed", session.session_identity.id, exc_info=error
+            )
+        else:
+            pass
         session.error = session.error or error
         self.owned_session_task(self.close_session_state(session))
 
@@ -846,10 +852,17 @@ class CoordinatorSessions:
             else:
                 await asyncio.wait_for(run(), session.limits.operation_timeout_s)
         except asyncio.TimeoutError as exc:
-            self.begin_session_close(session)
-            raise TimeoutError(f"session {operation} timed out") from exc
+            error = TimeoutError(f"session {operation} timed out")
+            self.fail_session(session, error)
+            raise error from exc
+        except Exception as exc:
+            # Note (Junnan Li): Fail the session here, not in the pump: the abort below yields, and a pump that wakes to the fenced session exits without seeing this failure.
+            self.fail_session(session, exc)
+            raise
         except BaseException as exc:
-            # Note (Junnan Li): Request abort can yield before the pump sees this fatal failure.
+            logger.warning(
+                "session %s %s failed: %r", session.session_identity.id, operation, exc
+            )
             self.begin_session_close(session)
             future = self.completion_futures.get(request_id)
             if (
@@ -862,7 +875,9 @@ class CoordinatorSessions:
                 # note (Richard Wang): an abort of this operation's request, such
                 # as an admin drop, is a session failure, not a cancel of the
                 # pump, so the pump still closes the session and its owners.
-                raise RuntimeError(f"session {operation} was aborted") from exc
+                error = RuntimeError(f"session {operation} was aborted")
+                self.fail_session(session, error)
+                raise error from exc
             else:
                 raise
         finally:
