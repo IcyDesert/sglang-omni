@@ -40,7 +40,7 @@ To use other services, change a node's `base_url` and `model` in the profile and
 Open the browser page to try the conversation:
 
 ```bash
-python playground/realtime/app.py --api-base http://127.0.0.1:8765 --port 8090
+python playground/cascade/app.py --api-base http://127.0.0.1:8765 --port 8090
 ```
 
 Open `http://127.0.0.1:8090`, speak, and the reply plays as it is produced. Speaking while the reply plays interrupts it.
