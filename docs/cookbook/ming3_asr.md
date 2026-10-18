@@ -7,17 +7,16 @@ embeddings fill the audio placeholder tokens of the transcription prompt.
 ## Run locally
 
 The default placement uses one GPU. Preprocessing runs on the CPU. The audio
-encoder and the language model share GPU 0.
+encoder and the language model share that GPU.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 sgl-omni serve \
-  --model-path inclusionAI/Ming-3.0-asr-tiny --host 127.0.0.1 --port 8011
+sgl-omni serve --model-path inclusionAI/Ming-3.0-asr-tiny
 ```
 
 Transcribe a recording:
 
 ```bash
-curl http://127.0.0.1:8011/v1/audio/transcriptions \
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
   -F model=inclusionAI/Ming-3.0-asr-tiny -F file=@input.wav -F language=en
 ```
 
@@ -68,7 +67,7 @@ blocks repeated 10-grams, which this pipeline does not implement.
 
 ```bash
 python -m pytest tests/unit_test/ming3_asr -q
-python -m benchmarks.eval.benchmark_asr_seedtts --port 8011 \
+python -m benchmarks.eval.benchmark_asr_seedtts --port 8000 \
   --model-path inclusionAI/Ming-3.0-asr-tiny --lang en \
   --concurrencies 32 --repeats 1 --warmup \
   --dataset-revision 27f4c1adee83b5b29b7c4b375f6b976324bda308 \
