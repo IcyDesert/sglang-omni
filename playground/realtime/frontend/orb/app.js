@@ -51,6 +51,7 @@ let captureNode = null;
 let micAnalyser = null;
 let playbackContext = null;
 let playbackNode = null;
+let playbackGeneration = 0;
 let playbackAnalyser = null;
 let playbackRate = 24000;
 let eventChain = Promise.resolve();
@@ -301,6 +302,7 @@ async function ensurePlayback(rate) {
     await playbackContext.resume();
     return;
   }
+  if (playbackNode) playbackNode.port.onmessage = null;
   if (playbackContext) await playbackContext.close().catch(() => {});
   playbackRate = rate;
   playbackContext = new AudioContext({ sampleRate: rate, latencyHint: "interactive" });
@@ -325,13 +327,15 @@ function rmsOf(samples) {
 
 // Sub-second streaming units stall on every network hiccup, so they get a deeper adaptive jitter buffer.
 const STREAMING_UNIT_MS = 500;
+const NATIVE_PLAYBACK = { jitterMs: JITTER_MS, maxJitterMs: JITTER_MS, maxMs: 2500, keepMs: 1500, catchUp: { slow: 0.2, fast: 0.7, skip: 1.5, slowRate: 1.12, fastRate: 1.25 } };
 const STREAMING_PLAYBACK = { jitterMs: 400, maxJitterMs: 900, maxMs: 3500, keepMs: 2200, catchUp: { slow: 0.5, fast: 1.0, skip: 2.0, slowRate: 1.06, fastRate: 1.12 } };
 
 function configurePlayback(unitMs) {
-  if (!playbackNode || !(unitMs > 0) || unitMs >= STREAMING_UNIT_MS) return;
+  if (!playbackNode) return;
   const samples = (ms) => Math.round((playbackContext.sampleRate * ms) / 1000);
-  const { jitterMs, maxJitterMs, maxMs, keepMs, catchUp } = STREAMING_PLAYBACK;
-  playbackNode.port.postMessage({ type: "config", initialSamples: samples(jitterMs), maxJitterSamples: samples(maxJitterMs), maxSamples: samples(maxMs), keepSamples: samples(keepMs), catchUp });
+  const nativeUnitSamples = Number.isFinite(unitMs) && unitMs > 0 ? samples(unitMs) : 0;
+  const { jitterMs, maxJitterMs, maxMs, keepMs, catchUp } = nativeUnitSamples > 0 && unitMs < STREAMING_UNIT_MS ? STREAMING_PLAYBACK : NATIVE_PLAYBACK;
+  playbackNode.port.postMessage({ type: "config", initialSamples: samples(jitterMs), maxJitterSamples: samples(maxJitterMs), maxSamples: samples(maxMs), keepSamples: samples(keepMs), catchUp, nativeUnitSamples });
 }
 
 function pcm16ToFloat(bytes, sourceRate, targetRate) {
@@ -351,7 +355,8 @@ function pcm16ToFloat(bytes, sourceRate, targetRate) {
   return target;
 }
 
-function sessionListeners() {
+function sessionListeners(activeSession) {
+  let boundPlaybackNode = null;
   return {
     state: (state) => {
       if (state !== "ready") stopCamera();
@@ -360,8 +365,20 @@ function sessionListeners() {
     },
     granted: async () => {
       sessionStart = performance.now();
-      await ensurePlayback(session.outputRate);
-      configurePlayback(session.unitMs);
+      await ensurePlayback(activeSession.outputRate);
+      if (session !== activeSession || !isOpen()) return;
+      configurePlayback(activeSession.unitMs);
+      const node = playbackNode;
+      if (node !== boundPlaybackNode) {
+        boundPlaybackNode = node;
+        const generation = ++playbackGeneration;
+        node.port.onmessage = ({ data }) => {
+          if (session !== activeSession || playbackNode !== node || data.type !== "status" || data.generation !== generation) return;
+          const { droppedMs, rate, queueMs, targetMs, playedMs, buffering, underruns, outputRms, responseOpen } = data;
+          activeSession.record("local", { type: "playback.status", generation, droppedMs, rate, queueMs, targetMs, playedMs, buffering, underruns, outputRms, responseOpen });
+        };
+        node.port.postMessage({ type: "reset", generation });
+      }
       setButtons();
       // One tap starts everything: the microphone follows the grant.
       startMic().catch((error) => warn(`Microphone: ${error.message}`, true));
@@ -369,7 +386,7 @@ function sessionListeners() {
     audio: ({ bytes, responseId }) => {
       if (!playbackNode) return;
       awaitingAudio = false;
-      const samples = pcm16ToFloat(bytes, session.outputRate, playbackContext.sampleRate);
+      const samples = pcm16ToFloat(bytes, activeSession.outputRate, playbackContext.sampleRate);
       // After a local interrupt, drop what the model is still saying. Models that
       // answer in turns lift the mute at the next response.created; models that
       // stream one response for the whole session lift it once they fall quiet.
@@ -418,10 +435,11 @@ async function connect() {
   session = null;
   renderTranscript();
   warn("");
-  if (playbackNode) playbackNode.port.postMessage({ type: "reset" });
+  if (playbackNode) playbackNode.port.postMessage({ type: "reset", generation: ++playbackGeneration });
   setButtons();
   let activeSocket = null;
   try {
+    await eventChain;
     // Open playback inside the click so Chrome's autoplay policy lets it run.
     await ensurePlayback(playbackRate);
     activeSocket = new WebSocket(wsUrl());
@@ -433,8 +451,8 @@ async function connect() {
       outputModalities: options.outputModalities,
       instructions: options.instructions,
       extension: options.extension,
-      listeners: sessionListeners(),
     });
+    activeSession.listeners = sessionListeners(activeSession);
     session = activeSession;
     lastSession = activeSession;
     ui.traceBtn.hidden = false;
@@ -448,7 +466,7 @@ async function connect() {
     activeSocket.addEventListener("message", (message) => {
       eventChain = eventChain.then(async () => {
         if (socket !== activeSocket) return;
-        activeSession.handle(JSON.parse(message.data));
+        await activeSession.handle(JSON.parse(message.data));
       }).catch((error) => warn(`Server event: ${error.message}`));
     });
     activeSocket.addEventListener("error", () => {
@@ -463,7 +481,7 @@ async function connect() {
       stopCamera();
       if (CLOSE_MESSAGES[event.code]) warn(CLOSE_MESSAGES[event.code], true);
       if (event.code === 4429) remoteBusy = true;
-      if (playbackNode) playbackNode.port.postMessage({ type: "reset" });
+      if (playbackNode) playbackNode.port.postMessage({ type: "reset", generation: ++playbackGeneration });
       setButtons();
       pollStatus();
     });

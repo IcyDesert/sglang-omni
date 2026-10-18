@@ -54,8 +54,9 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     // (the default) it stays fixed, which suits models that answer in 1 s chunks.
     this.target = this.initialSamples;
     this.maxJitterSamples = this.initialSamples;
+    this.nativeUnitSamples = 0;
+    this.generation = null;
     this.sinceUnderrun = 0;
-    // Backlog (s) beyond the target that starts a gentle / fast catch-up and a skip.
     this.catchUp = { slow: 0.2, fast: 0.7, skip: 1.5, slowRate: 1.12, fastRate: 1.25 };
     this.dropped = 0;
     this.rate = 1;
@@ -100,6 +101,9 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         if (data.maxSamples) this.maxSamples = data.maxSamples;
         if (data.keepSamples) this.keepSamples = data.keepSamples;
         if (data.catchUp) this.catchUp = { ...this.catchUp, ...data.catchUp };
+        if (data.nativeUnitSamples !== undefined) {
+          this.nativeUnitSamples = Number.isSafeInteger(data.nativeUnitSamples) && data.nativeUnitSamples >= 0 ? data.nativeUnitSamples : 0;
+        }
       } else if (data.type === "trim") {
         this.trim(data.keepSamples || 0);
       } else if (data.type === "open") {
@@ -121,6 +125,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.responseOpen = false;
         this.cancel(data.responseId);
       } else if (data.type === "reset") {
+        this.generation = data.generation ?? null;
         this.responseOpen = false;
         this.target = this.initialSamples;
         this.sinceUnderrun = 0;
@@ -131,6 +136,10 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.started = false;
         this.fadeRemaining = this.fadeLength;
         this.playedSamples = 0;
+        this.dropped = 0;
+        this.statusEnergy = 0;
+        this.statusSamples = 0;
+        this.statusCountdown = 0;
         this.stretch = null;
         this.rate = 1;
         this.outBuf = [];
@@ -178,9 +187,10 @@ class PlaybackProcessor extends AudioWorkletProcessor {
   // Seconds-old speech is stale in a duplex talk, so a large backlog is skipped instead of stretched.
   catchUpRate() {
     const { slow, fast, skip, slowRate, fastRate } = this.catchUp;
-    const backlog = (this.queuedSamples - this.target) / sampleRate;
+    const baselineSamples = Math.max(this.target, this.nativeUnitSamples);
+    const backlog = (this.queuedSamples - baselineSamples) / sampleRate;
     if (backlog > skip) {
-      this.trim(this.target + Math.round(sampleRate * fast));
+      this.trim(baselineSamples + Math.round(sampleRate * fast));
       return fastRate;
     } else if (backlog > fast) return fastRate;
     else if (backlog > slow) return slowRate;
@@ -343,6 +353,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       this.statusCountdown = Math.round(sampleRate / 10);
       this.port.postMessage({
         type: "status",
+        generation: this.generation,
+        responseOpen: this.responseOpen,
         droppedMs: Math.round((this.dropped / sampleRate) * 1000),
         rate: this.rate,
         queueMs: this.queuedSamples / sampleRate * 1000,

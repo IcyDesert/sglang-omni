@@ -125,7 +125,7 @@ Thanks to the OpenMoss team for the demo page.
 
 Once the terminal prints `Running on`, open <http://localhost:8080> and click **Start talking** to talk through your microphone; the camera can be turned on during the call. If the server is remote, first run `ssh -N -L 8080:127.0.0.1:8080 USER@SERVER` on your own machine. Open the page through `localhost`, or the browser will not grant microphone access.
 
-The settings panel switches between English and Chinese, changes the voice and adjusts sampling. The download button in the top bar saves the conversation trace; attach it when reporting a problem.
+The settings panel switches between English and Chinese, changes the voice and adjusts sampling. The download button in the top bar saves the conversation trace; attach it when reporting a problem. Local playback status includes playback speed, queued audio, underruns and dropped audio, alongside received audio events.
 
 
 ### Full-duplex protocol
