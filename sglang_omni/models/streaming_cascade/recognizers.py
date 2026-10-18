@@ -130,13 +130,23 @@ class UtteranceRecognizer(StreamComponent):
 
 
 class OpenAITranscriptionRecognizerConfig(ComponentConfig):
-    """Whole-utterance `/v1/audio/transcriptions`; one final transcript per utterance."""
+    """Whole-utterance `/v1/audio/transcriptions`; one final transcript per utterance.
+
+    With `verbose_json` the transcript carries the language the service
+    reports for the utterance; `json` suits a service without it.
+    """
 
     kind: Literal["openai_transcription"] = "openai_transcription"
     base_url: str = Field(pattern=r"^https?://[^/]+")
     model: str
     language: str = ""
+    response_format: Literal["json", "verbose_json"] = "verbose_json"
     api_key_env: str = "OPENAI_API_KEY"
+
+
+class TranscriptionResult(BaseModel):
+    text: str
+    language: str | None = None
 
 
 class RealtimeTranscriptionRecognizerConfig(ComponentConfig):
@@ -174,7 +184,10 @@ class OpenAITranscriptionRecognizer(UtteranceRecognizer):
             return
         else:
             pass
-        data = {"model": self.config.model, "response_format": "json"}
+        data = {
+            "model": self.config.model,
+            "response_format": self.config.response_format,
+        }
         if self.config.language:
             data["language"] = self.config.language
         else:
@@ -191,7 +204,8 @@ class OpenAITranscriptionRecognizer(UtteranceRecognizer):
             },
         )
         response.raise_for_status()
-        yield transcript_chunk(str(response.json()["text"]).strip(), True)
+        result = TranscriptionResult.model_validate(response.json())
+        yield transcript_chunk(result.text.strip(), True, result.language or None)
 
     async def close(self) -> None:
         await self.client.aclose()

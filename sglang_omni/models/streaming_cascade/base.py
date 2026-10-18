@@ -87,28 +87,52 @@ def control_chunk(
     )
 
 
-def transcript_chunk(text: str, is_final: bool) -> TimedChunk:
+def with_language(
+    payload: dict[str, object], language: str | None
+) -> dict[str, object]:
+    """The payload with the user's language when it is known."""
+    if language is None:
+        return payload
+    else:
+        return {**payload, "language": language}
+
+
+def transcript_chunk(
+    text: str, is_final: bool, language: str | None = None
+) -> TimedChunk:
     return TimedChunk(
         TRANSCRIPT,
         0,
         0,
         0,
-        {"text": text, "is_final": is_final},
+        with_language({"text": text, "is_final": is_final}, language),
         format=TRANSCRIPT_FORMAT,
     )
 
 
-def text_chunk(text: str, turn: int) -> TimedChunk:
-    return TimedChunk(TEXT, 0, 0, 0, {"text": text}, format=TEXT_DELTA, turn=turn)
-
-
-def messages_chunk(messages: list[ChatMessage], turn: int) -> TimedChunk:
+def text_chunk(text: str, turn: int, language: str | None = None) -> TimedChunk:
     return TimedChunk(
         TEXT,
         0,
         0,
         0,
-        {"messages": [message_dict(message) for message in messages]},
+        with_language({"text": text}, language),
+        format=TEXT_DELTA,
+        turn=turn,
+    )
+
+
+def messages_chunk(
+    messages: list[ChatMessage], turn: int, language: str | None = None
+) -> TimedChunk:
+    return TimedChunk(
+        TEXT,
+        0,
+        0,
+        0,
+        with_language(
+            {"messages": [message_dict(message) for message in messages]}, language
+        ),
         format=MESSAGES,
         turn=turn,
     )

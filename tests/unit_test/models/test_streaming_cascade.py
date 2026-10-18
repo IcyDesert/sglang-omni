@@ -16,8 +16,10 @@ import yaml
 from sglang_omni.audio.segmentation import UtteranceSegmenter
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.models.streaming_cascade.base import (
+    ChatMessage,
     Replies,
     audio_chunk,
+    messages_chunk,
     messages_of,
     sentences,
     text_chunk,
@@ -29,6 +31,7 @@ from sglang_omni.models.streaming_cascade.config import (
     StreamingCascadePipelineConfig,
 )
 from sglang_omni.models.streaming_cascade.dialog import heard_prefix
+from sglang_omni.models.streaming_cascade.generators import ChatDelta
 from sglang_omni.models.streaming_cascade.recognizers import probe_realtime_service
 from sglang_omni.models.streaming_cascade.running_transcript import (
     RunningTranscript,
@@ -889,6 +892,33 @@ async def test_the_forced_method_keeps_the_sentence_end_when_the_worker_fails(fa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["Chinese", None])
+async def test_the_forced_method_sends_the_language_of_the_reply_deltas(language):
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return worker_reply(request)
+
+    await drain(
+        await forced_aligner(handler),
+        [
+            text_chunk("One two three four.", 1),
+            text_chunk(" Five six.", 1, language),
+            *(speech() for _ in range(4)),
+            control_chunk(REPLY_PROGRESS, turn=1, text_end=19, audio_ms=2000),
+            *(speech() for _ in range(2)),
+            control_chunk(REPLY_PROGRESS, turn=1, text_end=29, audio_ms=3000),
+        ],
+    )
+    assert [body["text"] for body in bodies] == ["One two three four.", "Five six."]
+    if language is None:
+        assert all("language" not in body for body in bodies)
+    else:
+        assert [body["language"] for body in bodies] == [language, language]
+
+
+@pytest.mark.asyncio
 async def test_a_truncate_cuts_at_the_word_the_aligner_reports(backends):
     settings, _, spoken, _ = backends
     tts = settings.component_graph().node("tts").component.model_dump()
@@ -920,3 +950,138 @@ async def test_a_truncate_cuts_at_the_word_the_aligner_reports(backends):
     await drain(dialog, [control_chunk(TRUNCATE, t_ms=heard_ms)])
     assert dialog.messages[-1].content == "Hello world. Second"
     assert not dialog.messages[-1].uncertain
+
+
+@pytest.mark.asyncio
+async def test_openai_transcription_carries_the_language_the_service_reports():
+    forms = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        forms.append(request.content)
+        return httpx.Response(
+            200, json={"text": " 一二三 ", "language": "Chinese", "duration": 0.1}
+        )
+
+    asr = build({"kind": "openai_transcription", **HTTP_SERVICE})
+    asr.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    audio = TimedChunk(AUDIO, 0, 100, 0, QUIET, format=PCM16)
+    outputs = await drain(asr, [audio, control_chunk(COMMIT)])
+    assert [o.payload for o in outputs] == [
+        {"text": "一二三", "is_final": True, "language": "Chinese"}
+    ]
+    assert b"verbose_json" in forms[0]
+
+
+@pytest.mark.asyncio
+async def test_openai_transcription_leaves_the_language_out_when_the_service_names_none():
+    def answer(request: httpx.Request) -> httpx.Response:
+        assert b'name="response_format"\r\n\r\njson\r\n' in request.content
+        return httpx.Response(200, json={"text": "hello"})
+
+    asr = build(
+        {"kind": "openai_transcription", **HTTP_SERVICE, "response_format": "json"}
+    )
+    asr.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    audio = TimedChunk(AUDIO, 0, 100, 0, QUIET, format=PCM16)
+    outputs = await drain(asr, [audio, control_chunk(COMMIT)])
+    assert [o.payload for o in outputs] == [{"text": "hello", "is_final": True}]
+
+
+@pytest.mark.asyncio
+async def test_the_dialog_keeps_the_language_of_the_last_answered_turn():
+    dialog = build({"kind": "dialog"})
+    outputs = await drain(
+        dialog,
+        [
+            transcript_chunk("数到三。", True, "Chinese"),
+            text_chunk("1,2,3.", 1),
+            control_chunk(TURN_DONE, turn=1),
+            control_chunk(COMMIT),
+            transcript_chunk("Again.", True),
+            text_chunk("1,2,3.", 2),
+            control_chunk(TURN_DONE, turn=2),
+            control_chunk(COMMIT),
+            transcript_chunk("Now in English.", True, "English"),
+        ],
+    )
+    languages = [o.payload.get("language") for o in outputs if o.format == MESSAGES]
+    assert languages == ["Chinese", "Chinese", "English"]
+    replacement = build({"kind": "dialog"})
+    replacement.adopt(dialog)
+    assert replacement.language == "English"
+
+
+@pytest.mark.asyncio
+async def test_chat_deltas_carry_the_language_of_their_messages():
+    generator = build({"kind": "openai_chat", **HTTP_SERVICE})
+
+    async def complete(messages):
+        for content in ("1, ", "2."):
+            yield ChatDelta(content=content)
+
+    generator.complete = complete
+    outputs = await drain(
+        generator,
+        [
+            messages_chunk([ChatMessage(role="user", content="数")], 1, "Chinese"),
+            messages_chunk([ChatMessage(role="user", content="count")], 2),
+        ],
+    )
+    deltas = [(o.turn, o.payload) for o in outputs if o.format == TEXT_DELTA]
+    assert deltas == [
+        (1, {"text": "1, ", "language": "Chinese"}),
+        (1, {"text": "2.", "language": "Chinese"}),
+        (2, {"text": "1, "}),
+        (2, {"text": "2."}),
+    ]
+
+
+async def spoken_languages(spec: dict, deltas: list[TimedChunk]) -> list[str]:
+    """The language tag of each sentence the synthesizer speaks for the deltas of turn 1."""
+    bodies = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200, content=b"\x00\x00" * 4, headers={"X-Sample-Rate": "24000"}
+        )
+
+    tts = build({"kind": "openai_speech", **HTTP_SERVICE, **spec})
+    tts.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    await drain(tts, [*deltas, control_chunk(TURN_DONE, turn=1)])
+    return [body["language"] for body in bodies]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "language, user_language, tags",
+    [
+        ("auto", "Chinese", ["Chinese", "Chinese"]),
+        ("auto", "Japanese", ["Japanese", "Japanese"]),
+        ("auto", None, ["English", "Chinese"]),
+        ("English", "Chinese", ["English", "Chinese"]),
+    ],
+)
+async def test_openai_speech_auto_language_follows_the_user(
+    language, user_language, tags
+):
+    deltas = [
+        text_chunk("1, 2, 3. ", 1, user_language),
+        text_chunk("你好。", 1, user_language),
+    ]
+    assert await spoken_languages({"language": language}, deltas) == tags
+
+
+def test_openai_speech_keeps_the_user_language_across_a_replacement():
+    spec = {"kind": "openai_speech", **HTTP_SERVICE, "language": "auto"}
+    first = build(spec)
+    first.session_language = "Chinese"
+    replacement = build({**spec, "voice": "b"})
+    replacement.adopt(first)
+    assert replacement.sentence_language("1, 2, 3.") == "Chinese"
+
+
+@pytest.mark.parametrize("profile", PROFILE_NAMES)
+def test_profiles_speak_the_user_language(profile):
+    config = profile_config(profile)
+    assert config.component_graph().node("tts").component.language == "auto"

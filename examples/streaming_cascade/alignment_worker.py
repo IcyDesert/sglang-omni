@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A forced-alignment worker for the `forced` method of the cascade's alignment node: word ends of known text in its audio."""
+"""A forced-alignment worker for the `forced` method of the cascade's alignment node: word ends of known text in its audio.
+
+Each request is aligned in its `language`, a language name such as `English`
+or `Chinese`, or in the worker's `--language` when it names none.
+"""
 
 import argparse
 import base64
@@ -84,9 +88,10 @@ class AlignmentRequest(BaseModel):
     audio: str = Field(max_length=MAX_ALIGNMENT_AUDIO_BYTES * 4 // 3 + 4)
     sample_rate_hz: int = Field(gt=0, le=192000)
     audio_format: str
+    language: str | None = Field(default=None, min_length=1, max_length=64)
 
 
-def create_app(model: str, device: str, language: str) -> FastAPI:
+def create_app(model: str, device: str, default_language: str) -> FastAPI:
     torch.set_num_threads(4)
     aligner = Qwen3ForcedAligner.from_pretrained(
         model, device_map=device, dtype=torch.bfloat16, attn_implementation="eager"
@@ -122,6 +127,10 @@ def create_app(model: str, device: str, language: str) -> FastAPI:
         else:
             pass
         samples = np.frombuffer(pcm16, dtype="<i2").astype(np.float32) / 32768
+        if request.language is None:
+            language = default_language
+        else:
+            language = request.language
         text, origin = spoken_text(request.text, language)
         with inference_lock:
             result = aligner.align(
@@ -172,7 +181,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--language", default="Chinese")
+    parser.add_argument(
+        "--language",
+        default="Chinese",
+        help="the language of a request that names none",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     arguments = parser.parse_args()

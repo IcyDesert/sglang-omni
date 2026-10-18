@@ -14,6 +14,7 @@ from sglang_omni.models.streaming_cascade.base import (
     ComponentConfig,
     Replier,
     Replies,
+    StreamComponent,
     audio_chunk,
     bearer_headers,
     control_chunk,
@@ -26,13 +27,20 @@ from sglang_omni.proto.streams import (
     REPLY_PROGRESS,
     TEXT_DELTA,
     TURN_DONE,
+    chunk_language,
     control_type,
 )
 from sglang_omni.scheduling.session import ChunkEmitter
 
 
 class OpenAISpeechSynthesizerConfig(ComponentConfig):
-    """Sentence-chunked `/v1/audio/speech` streaming PCM, one request per sentence."""
+    """Sentence-chunked `/v1/audio/speech` streaming PCM, one request per sentence.
+
+    `language` is the service's language tag: empty leaves it to the
+    service, `auto` follows the language the recognizer heard from the
+    user, and any other name tags every sentence without Chinese characters.
+    Without a known user language `auto` tags by script like `English`.
+    """
 
     kind: Literal["openai_speech"] = "openai_speech"
     base_url: str = Field(pattern=r"^https?://[^/]+")
@@ -113,6 +121,37 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
         self.client = httpx.AsyncClient(
             timeout=config.timeout_s, headers=bearer_headers(config.api_key_env)
         )
+        self.session_language: str | None = None
+
+    def adopt(self, previous: StreamComponent) -> None:
+        if isinstance(previous, OpenAISpeechSynthesizer):
+            self.session_language = previous.session_language
+        else:
+            pass
+
+    def sentence_language(self, sentence: str) -> str:
+        """The language tag of one sentence."""
+        if self.config.language == "auto" and self.session_language is not None:
+            return self.session_language
+        elif any("\u4e00" <= char <= "\u9fff" for char in sentence):
+            # Note (Junnan Li): A sentence with CJK characters is spoken as Chinese whatever the configured language, so a reply in the user's language keeps the right tag.
+            return "Chinese"
+        elif self.config.language == "auto":
+            return "English"
+        else:
+            return self.config.language
+
+    async def follow_language(
+        self, deltas: AsyncIterator[TimedChunk]
+    ) -> AsyncIterator[TimedChunk]:
+        """The reply's deltas, recording the user language they carry."""
+        async for chunk in deltas:
+            language = chunk_language(chunk)
+            if language is not None:
+                self.session_language = language
+            else:
+                pass
+            yield chunk
 
     async def speak(self, sentence: str) -> AsyncIterator[np.ndarray]:
         body: dict[str, object] = {
@@ -123,12 +162,7 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
             "stream": True,
         }
         if self.config.language:
-            # Note (Junnan Li): A sentence with CJK characters is spoken as Chinese whatever the configured language, so a reply in the user's language keeps the right tag.
-            body["language"] = (
-                "Chinese"
-                if any("\u4e00" <= char <= "\u9fff" for char in sentence)
-                else self.config.language
-            )
+            body["language"] = self.sentence_language(sentence)
         else:
             pass
         if self.config.reference_audio_path:
@@ -176,7 +210,9 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
     ) -> None:
         text_end = 0
         audio_ms = 0.0
-        async for span in sentences(deltas, self.config.max_sentence_words):
+        async for span in sentences(
+            self.follow_language(deltas), self.config.max_sentence_words
+        ):
             sentence = " ".join(span.split())
             if sentence:
                 async for samples in self.speak(sentence):

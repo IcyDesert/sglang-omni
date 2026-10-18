@@ -20,7 +20,7 @@ from sglang_omni.models.streaming_cascade.base import (
     text_chunk,
 )
 from sglang_omni.proto.session import TimedChunk
-from sglang_omni.proto.streams import MESSAGES, TURN_DONE
+from sglang_omni.proto.streams import MESSAGES, TURN_DONE, chunk_language
 from sglang_omni.scheduling.session import ChunkEmitter
 
 # The request fields this kind sets itself; `extra_body` adds others.
@@ -63,7 +63,7 @@ class ChatEvent(BaseModel):
 
 
 class OpenAIChatGenerator(Replier):
-    """One streamed completion per messages chunk, closed by turn.done."""
+    """One streamed completion per messages chunk, closed by turn.done; the deltas carry the messages chunk's language."""
 
     def __init__(self, config: OpenAIChatGeneratorConfig) -> None:
         super().__init__()
@@ -80,7 +80,10 @@ class OpenAIChatGenerator(Replier):
             if chunk.format == MESSAGES:
                 await replies.finish()
                 replies.start(
-                    chunk.turn, self.reply(messages_of(chunk), chunk.turn, emit)
+                    chunk.turn,
+                    self.reply(
+                        messages_of(chunk), chunk.turn, chunk_language(chunk), emit
+                    ),
                 )
             else:
                 pass
@@ -88,11 +91,16 @@ class OpenAIChatGenerator(Replier):
         await replying(inputs, handle, self.replies)
 
     async def reply(
-        self, messages: list[ChatMessage], turn: int, emit: ChunkEmitter
+        self,
+        messages: list[ChatMessage],
+        turn: int,
+        language: str | None,
+        emit: ChunkEmitter,
     ) -> None:
+        """Stream the reply's text deltas, each carrying the user's language for the synthesizer."""
         async for delta in self.complete(messages):
             if delta.content:
-                emit(text_chunk(delta.content, turn))
+                emit(text_chunk(delta.content, turn, language))
             else:
                 pass
         emit(control_chunk(TURN_DONE, turn=turn))

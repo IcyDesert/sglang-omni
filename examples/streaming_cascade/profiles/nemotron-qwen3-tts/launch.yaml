@@ -53,7 +53,7 @@ session_nodes:
     voice: default
     reference_audio_path: reference.wav
     reference_text: The transcript of reference.wav.
-    language: English
+    language: auto
   aligner:
     kind: alignment
     method: forced

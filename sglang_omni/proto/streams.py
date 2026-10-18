@@ -23,11 +23,14 @@ PCM16_BYTES_PER_SAMPLE = 2
 SESSION_INPUT_SAMPLE_RATE_HZ = 16000
 SESSION_UNIT_MS = 200
 MAX_HISTORY_CHARS = 64 * 1024
-TEXT_DELTA = "text_delta"  # {"text": str}, one increment of a reply
-MESSAGES = "messages"  # {"messages": [{"role", "content"}, ...]}
+# {"text": str, "language"?: str}, one increment of a reply
+TEXT_DELTA = "text_delta"
+# {"messages": [{"role", "content"}, ...], "language"?: str}
+MESSAGES = "messages"
 # {"text": str, "full_text": str, "is_first_output": bool}; an ASR stage's one running text
 RUNNING_TEXT = "text"
-TRANSCRIPT_FORMAT = "transcript"  # {"text": str, "is_final": bool}
+# {"text": str, "is_final": bool, "language"?: str}
+TRANSCRIPT_FORMAT = "transcript"
 # {"calls": [{"id": str, "name": str, "arguments": object}, ...]}
 TOOL_CALL = "tool_call"
 # {"responses": [{"id": str, "name": str, "response": object}, ...]}
@@ -53,6 +56,11 @@ REPLY_PROGRESS = "reply.progress"
 REPLY_DELIVERED = "reply.delivered"
 # Controls between nodes; a graph delivers them to readers and control edges, never to the client.
 NODE_CONTROLS = frozenset({REPLY_PROGRESS, REPLY_DELIVERED})
+
+
+def chunk_language(chunk: TimedChunk) -> str | None:
+    """The language of the user's speech that a transcript, messages or text delta chunk carries; None while unknown."""
+    return chunk.payload.get("language")
 
 
 def control_type(chunk: TimedChunk | OutputChunk) -> str | None:

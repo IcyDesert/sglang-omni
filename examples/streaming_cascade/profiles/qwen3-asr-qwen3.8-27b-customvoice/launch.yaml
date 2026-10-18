@@ -57,7 +57,7 @@ session_nodes:
     base_url: "http://127.0.0.1:8005/v1"
     model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
     voice: Vivian
-    language: English
+    language: auto
   aligner:
     kind: alignment
     method: forced

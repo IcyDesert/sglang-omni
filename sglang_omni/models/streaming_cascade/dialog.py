@@ -31,6 +31,7 @@ from sglang_omni.proto.streams import (
     TURN_INTERRUPTED,
     TURN_QUEUED,
     TURN_STARTED,
+    chunk_language,
     control_type,
 )
 from sglang_omni.scheduling.session import ChunkEmitter
@@ -74,8 +75,10 @@ class Dialog(StreamComponent):
     the synthesizer tell it how much of the reply was spoken. The interrupted
     reply stays in the history only up to the last sentence whose audio the
     graph delivered (`reply.delivered`), and a client `truncate` moves the
-    cut back to what the listener heard. A replacement
-    adopts the history, the open reply and the waiting utterances, so new
+    cut back to what the listener heard. The language the recognizer last
+    heard in an answered turn is the Session's language, and every messages
+    chunk carries it. A replacement adopts the history, the open reply and
+    the waiting utterances, so new
     settings apply at once and reach the next prompt.
     """
 
@@ -83,7 +86,8 @@ class Dialog(StreamComponent):
         self.config = config
         self.emit: ChunkEmitter | None = None
         self.messages = [ChatMessage(role="system", content=config.system_prompt)]
-        self.waiting: deque[tuple[int, str]] = deque()
+        # Waiting utterances as (turn, transcript, language the recognizer heard).
+        self.waiting: deque[tuple[int, str, str | None]] = deque()
         self.reply: list[str] | None = None
         self.reply_turn = 0
         self.turns = 0
@@ -95,6 +99,7 @@ class Dialog(StreamComponent):
         self.truncatable_text = ""
         self.delivered_ms: float | None = math.inf
         self.heard_ms: float | None = None
+        self.language: str | None = None
 
     def adopt(self, previous: StreamComponent) -> None:
         if isinstance(previous, Dialog):
@@ -109,12 +114,13 @@ class Dialog(StreamComponent):
             self.truncatable_text = previous.truncatable_text
             self.delivered_ms = previous.delivered_ms
             self.heard_ms = previous.heard_ms
+            self.language = previous.language
         else:
             pass
 
     def state_bytes(self) -> int:
         chars = sum(len(message.content) for message in self.messages)
-        chars += sum(len(text) for _, text in self.waiting)
+        chars += sum(len(text) for _, text, _ in self.waiting)
         chars += sum(len(part) for part in self.reply or ())
         return chars * 4
 
@@ -148,7 +154,13 @@ class Dialog(StreamComponent):
         assert self.emit is not None
         if chunk.format == TRANSCRIPT_FORMAT and chunk.payload["is_final"]:
             self.turns += 1
-            self.waiting.append((self.turns, str(chunk.payload["text"]).strip()))
+            self.waiting.append(
+                (
+                    self.turns,
+                    str(chunk.payload["text"]).strip(),
+                    chunk_language(chunk),
+                )
+            )
             self.emit(control_chunk(TURN_QUEUED, turn=self.turns))
         elif chunk.format == TEXT_DELTA and self.is_reply(chunk):
             self.reply.append(str(chunk.payload["text"]))
@@ -227,7 +239,7 @@ class Dialog(StreamComponent):
                 uncertain=uncertain,
             )
 
-    def respond(self, turn: int, text: str) -> list[TimedChunk]:
+    def respond(self, turn: int, text: str, language: str | None) -> list[TimedChunk]:
         history_chars = sum(len(message.content) for message in self.messages)
         if not text:
             return [control_chunk(TURN_EMPTY, turn=turn)]
@@ -242,6 +254,10 @@ class Dialog(StreamComponent):
             )
         else:
             self.messages.append(ChatMessage(role="user", content=text))
+            if language is not None:
+                self.language = language
+            else:
+                pass
             self.reply = []
             self.reply_turn = turn
             self.progress = []
@@ -249,5 +265,5 @@ class Dialog(StreamComponent):
             self.heard_ms = None
             return [
                 control_chunk(TURN_STARTED, turn=turn),
-                messages_chunk(self.messages, turn),
+                messages_chunk(self.messages, turn, self.language),
             ]

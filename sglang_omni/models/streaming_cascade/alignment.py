@@ -20,12 +20,14 @@ from sglang_omni.models.streaming_cascade.base import (
     iterate,
     probe_models,
     stop_running,
+    with_language,
 )
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.proto.streams import (
     PCM_F32,
     REPLY_PROGRESS,
     TEXT_DELTA,
+    chunk_language,
     control_type,
 )
 from sglang_omni.scheduling.session import ChunkEmitter
@@ -82,10 +84,11 @@ async def probe_alignment_worker(config: AlignmentConfig) -> None:
 
 @dataclass
 class SpokenReply:
-    """One reply's text and audio; `start` and `start_ms` open the sentence being spoken."""
+    """One reply's text, language and audio; `start` and `start_ms` open the sentence being spoken."""
 
     turn: int
     text: str = ""
+    language: str | None = None
     start: int = 0
     start_ms: float = 0.0
     samples: list[np.ndarray] = field(default_factory=list)
@@ -93,13 +96,14 @@ class SpokenReply:
 
 @dataclass(frozen=True)
 class SentenceAudio:
-    """A spoken sentence of `turn` for the forced aligner: `text` begins at character `start` of the reply and its audio at `start_ms`."""
+    """A spoken sentence of `turn` for the forced aligner: `text` begins at character `start` of the reply and its audio at `start_ms`; `language` is the reply's, None while unknown."""
 
     turn: int
     text: str
     start: int
     start_ms: float
     samples: np.ndarray
+    language: str | None = None
 
 
 class Alignment(StreamComponent):
@@ -163,7 +167,13 @@ class Alignment(StreamComponent):
     ) -> None:
         event = control_type(chunk)
         if chunk.format == TEXT_DELTA:
-            self.reply_of(chunk.turn).text += str(chunk.payload["text"])
+            reply = self.reply_of(chunk.turn)
+            reply.text += str(chunk.payload["text"])
+            language = chunk_language(chunk)
+            if language is not None:
+                reply.language = language
+            else:
+                pass
         elif chunk.format == PCM_F32 and self.config.method == "forced":
             self.reply_of(chunk.turn).samples.append(
                 np.frombuffer(chunk.payload, dtype="<f4")
@@ -198,6 +208,7 @@ class Alignment(StreamComponent):
                     reply.start + len(span) - len(span.lstrip()),
                     reply.start_ms,
                     np.concatenate(reply.samples),
+                    reply.language,
                 )
             )
         else:
@@ -220,12 +231,15 @@ class Alignment(StreamComponent):
             return []
         else:
             pass
-        body = {
-            "text": sentence.text,
-            "audio": base64.b64encode(pcm16).decode(),
-            "sample_rate_hz": SPEECH_SAMPLE_RATE_HZ,
-            "audio_format": "pcm16",
-        }
+        body = with_language(
+            {
+                "text": sentence.text,
+                "audio": base64.b64encode(pcm16).decode(),
+                "sample_rate_hz": SPEECH_SAMPLE_RATE_HZ,
+                "audio_format": "pcm16",
+            },
+            sentence.language,
+        )
         try:
             response = await self.client.post(
                 f"{self.config.alignment_url.rstrip('/')}/align", json=body
