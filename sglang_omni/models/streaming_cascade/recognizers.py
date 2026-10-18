@@ -31,6 +31,7 @@ from sglang_omni.models.streaming_cascade.base import (
     probe_models,
     stop_running,
     transcript_chunk,
+    with_language,
 )
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.proto.streams import SESSION_INPUT_SAMPLE_RATE_HZ
@@ -149,6 +150,26 @@ class TranscriptionResult(BaseModel):
     language: str | None = None
 
 
+async def request_transcription(
+    client: httpx.AsyncClient,
+    base_url: str,
+    model: str,
+    pcm16: bytes,
+    sample_rate_hz: int,
+    *,
+    language: str | None,
+    response_format: Literal["json", "verbose_json"],
+) -> httpx.Response:
+    """POST signed 16-bit PCM as a WAV file to the `/audio/transcriptions` endpoint of the OpenAI-compatible service at `base_url`."""
+    return await client.post(
+        f"{base_url.rstrip('/')}/audio/transcriptions",
+        data=with_language(
+            {"model": model, "response_format": response_format}, language
+        ),
+        files={"file": ("audio.wav", pcm16_wav(pcm16, sample_rate_hz), "audio/wav")},
+    )
+
+
 class RealtimeTranscriptionRecognizerConfig(ComponentConfig):
     """Streaming transcription over an sglang-omni native `/v1/realtime` deployment."""
 
@@ -184,24 +205,14 @@ class OpenAITranscriptionRecognizer(UtteranceRecognizer):
             return
         else:
             pass
-        data = {
-            "model": self.config.model,
-            "response_format": self.config.response_format,
-        }
-        if self.config.language:
-            data["language"] = self.config.language
-        else:
-            pass
-        response = await self.client.post(
-            f"{self.config.base_url.rstrip('/')}/audio/transcriptions",
-            data=data,
-            files={
-                "file": (
-                    "utterance.wav",
-                    pcm16_wav(bytes(pcm), SESSION_INPUT_SAMPLE_RATE_HZ),
-                    "audio/wav",
-                )
-            },
+        response = await request_transcription(
+            self.client,
+            self.config.base_url,
+            self.config.model,
+            bytes(pcm),
+            SESSION_INPUT_SAMPLE_RATE_HZ,
+            language=self.config.language or None,
+            response_format=self.config.response_format,
         )
         response.raise_for_status()
         result = TranscriptionResult.model_validate(response.json())

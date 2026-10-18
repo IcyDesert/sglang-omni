@@ -38,11 +38,13 @@ from sglang_omni.proto.streams import (
     MESSAGES,
     PCM16,
     PCM_F32,
+    REPLY_DELIVERED,
     REPLY_PROGRESS,
     RUNNING_TEXT,
     SESSION_CONTROL,
     TEXT_DELTA,
     TRANSCRIPT_FORMAT,
+    TRUNCATE,
 )
 from sglang_omni.utils.imports import import_string
 
@@ -197,5 +199,5 @@ COMPONENTS.register(
     consumes=frozenset({TEXT_DELTA, PCM_F32, SESSION_CONTROL}),
     produces=frozenset({SESSION_CONTROL}),
     probe=probe_alignment_worker,
-    reads_events=frozenset({REPLY_PROGRESS}),
+    reads_events=frozenset({REPLY_PROGRESS, REPLY_DELIVERED, TRUNCATE}),
 )

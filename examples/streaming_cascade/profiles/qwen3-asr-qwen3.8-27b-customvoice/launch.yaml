@@ -62,7 +62,9 @@ session_nodes:
     kind: alignment
     method: forced
     alignment_url: "http://127.0.0.1:8010"
-    inputs: ["llm:text_delta", "tts:pcm_f32le", "tts:session", "dialog:session"]
+    heard_asr_url: "http://127.0.0.1:8002/v1"
+    heard_asr_model: Qwen/Qwen3-ASR-1.7B
+    inputs: ["llm:text_delta", "tts:pcm_f32le", "tts:session", "dialog:session", "input:session"]
 
 session_publish:
   vad: [session]

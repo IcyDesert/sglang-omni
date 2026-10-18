@@ -3,8 +3,10 @@
 
 import asyncio
 import base64
+import io
 import json
 import re
+import wave
 from dataclasses import replace
 from pathlib import Path
 
@@ -789,6 +791,20 @@ def test_the_reference_profile_routes_reply_progress_through_the_aligner():
         COMPONENTS.parse({"kind": "alignment", "method": "forced"})
     with pytest.raises(ValueError, match="belongs to the forced method"):
         COMPONENTS.parse({"kind": "alignment", "alignment_url": "http://127.0.0.1:1"})
+    with pytest.raises(ValueError, match="the asr method needs heard_asr_url"):
+        COMPONENTS.parse({"kind": "alignment", "method": "asr"})
+    with pytest.raises(ValueError, match="go together"):
+        COMPONENTS.parse(
+            {"kind": "alignment", "method": "asr", "heard_asr_url": HEARD_ASR_URL}
+        )
+    with pytest.raises(ValueError, match="belongs to the asr and forced methods"):
+        COMPONENTS.parse(
+            {
+                "kind": "alignment",
+                "heard_asr_url": HEARD_ASR_URL,
+                "heard_asr_model": "asr",
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -916,6 +932,178 @@ async def test_the_forced_method_sends_the_language_of_the_reply_deltas(language
         assert all("language" not in body for body in bodies)
     else:
         assert [body["language"] for body in bodies] == [language, language]
+
+
+HEARD_ASR_URL = "http://asr:8002/v1"
+
+
+def heard_frames(request: httpx.Request) -> int:
+    """The number of samples in the WAV file of a transcription request."""
+    with wave.open(
+        io.BytesIO(request.content[request.content.index(b"RIFF") :])
+    ) as wav:
+        return wav.getnframes()
+
+
+async def hearing_aligner(method: str, handler, **options) -> object:
+    node = aligner(
+        method, heard_asr_url=HEARD_ASR_URL, heard_asr_model="asr", **options
+    )
+    await node.client.aclose()
+    node.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return node
+
+
+def transcribing(transcript: str, requests: list[httpx.Request]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == f"{HEARD_ASR_URL}/audio/transcriptions":
+            requests.append(request)
+            return httpx.Response(200, json={"text": transcript})
+        else:
+            return worker_reply(request)
+
+    return handler
+
+
+def interrupted_speech(*after: object, language: str | None = None) -> list[object]:
+    """SPOKEN with its first sentence ended at 2000 ms and 1000 ms of " Five six." spoken when the reply is interrupted, with `after` fed next."""
+    return [
+        text_chunk(SPOKEN, 1, language),
+        *(speech() for _ in range(4)),
+        control_chunk(REPLY_PROGRESS, turn=1, text_end=19, audio_ms=2000),
+        speech(),
+        speech(),
+        control_chunk(TURN_INTERRUPTED, turn=1),
+        *after,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["English", None])
+async def test_the_asr_method_keeps_the_prefix_of_the_interrupted_sentence_its_delivered_audio_says(
+    language,
+):
+    requests = []
+    outputs = await drain(
+        await hearing_aligner("asr", transcribing("five", requests)),
+        interrupted_speech(
+            control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2600), language=language
+        ),
+    )
+    # Note (Junnan Li): "Five" ends at character 24 of SPOKEN; the cut is 600 ms into " Five six.".
+    assert spoken_progress(outputs) == [(19, 2000), (24, 2600)]
+    assert [heard_frames(request) for request in requests] == [600 * 24]
+    assert b'name="model"\r\n\r\nasr' in requests[0].content
+    assert (b'name="language"' in requests[0].content) == (language is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_client_truncate_before_the_delivered_audio_moves_the_heard_cut_back():
+    requests = []
+    outputs = await drain(
+        await hearing_aligner("asr", transcribing("five", requests)),
+        interrupted_speech(
+            control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2800),
+            control_chunk(TRUNCATE, t_ms=2300),
+            control_chunk(TRUNCATE, t_ms=2500),
+        ),
+    )
+    assert [heard_frames(request) for request in requests] == [800 * 24, 300 * 24]
+    assert spoken_progress(outputs) == [(19, 2000), (24, 2800), (24, 2300)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ReadTimeout("slow"),
+        httpx.Response(500),
+        httpx.Response(200, content=b"not json"),
+        httpx.Response(200, json={"text": "seven eight"}),
+    ],
+)
+async def test_the_interrupted_sentence_stays_unheard_when_its_transcription_fails_or_differs(
+    failure,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(failure, Exception):
+            raise failure
+        else:
+            return failure
+
+    outputs = await drain(
+        await hearing_aligner("asr", handler),
+        interrupted_speech(control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2600)),
+    )
+    assert spoken_progress(outputs) == [(19, 2000)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cut_ms, heard", [(1200, False), (2600, True)])
+async def test_the_forced_method_recognizes_only_a_cut_its_word_ends_do_not_cover(
+    cut_ms, heard
+):
+    requests = []
+    outputs = await drain(
+        await hearing_aligner(
+            "forced",
+            transcribing("five", requests),
+            alignment_url="http://aligner:9000",
+        ),
+        interrupted_speech(control_chunk(REPLY_DELIVERED, turn=1, audio_ms=cut_ms)),
+    )
+    progress = spoken_progress(outputs)
+    assert sorted(progress[1:5]) == [(3, 500), (7, 1000), (13, 1500), (19, 2000)]
+    if heard:
+        assert progress[5:] == [(24, 2600)]
+        assert len(requests) == 1
+    else:
+        assert progress[5:] == []
+        assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_the_dialog_keeps_the_heard_sentences_and_the_heard_prefix_of_the_cut_one():
+    outputs = await drain(
+        await hearing_aligner("asr", transcribing("five", [])),
+        interrupted_speech(control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2600)),
+    )
+    sentence_end, heard = [o for o in outputs if control_type(o) == REPLY_PROGRESS]
+    dialog = build({"kind": "dialog"})
+    await drain(
+        dialog,
+        [
+            transcript_chunk("count", True),
+            text_chunk(SPOKEN, 1),
+            lambda: dialog.control(sentence_end),
+            control_chunk(SPEECH_STARTED),
+            control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2600),
+        ],
+    )
+    assert dialog.messages[2].content == "One two three four."
+    await dialog.control(heard)
+    assert dialog.messages[2].content == "One two three four. Five"
+    assert not dialog.messages[2].uncertain
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "qwen3-asr-qwen3-tts-customvoice",
+        "qwen3-asr-qwen3.8-27b-customvoice",
+        "qwen3-asr-qwen3-tts-base-clone",
+    ],
+)
+def test_the_qwen3_asr_profiles_hear_cut_sentences_with_their_own_recognizer(profile):
+    settings = profile_config(profile).component_graph()
+    recognizer = settings.node("asr").component
+    aligner_config = settings.node("aligner").component
+    assert (aligner_config.heard_asr_url, aligner_config.heard_asr_model) == (
+        recognizer.base_url,
+        recognizer.model,
+    )
+    # Note (Junnan Li): Without the client's truncate the aligner hears up to the delivered audio, past what the dialog keeps, and its prefix is dropped.
+    assert "input" in profile_config(profile).session_nodes["aligner"].sources
 
 
 @pytest.mark.asyncio

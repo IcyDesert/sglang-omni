@@ -26,7 +26,6 @@ from sglang_omni.models.streaming_cascade.alignment import (
     AlignmentResult,
 )
 
-
 logger = logging.getLogger("alignment_worker")
 
 DIGITS = re.compile(r"\d+")
