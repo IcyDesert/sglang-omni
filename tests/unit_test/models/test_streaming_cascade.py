@@ -2,9 +2,13 @@
 """Cascade component protocols, configuration and launch profiles."""
 
 import asyncio
+import base64
+import json
+import re
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
 import numpy as np
 import pytest
 import yaml
@@ -13,6 +17,9 @@ from sglang_omni.audio.segmentation import UtteranceSegmenter
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.models.streaming_cascade.base import (
     Replies,
+    audio_chunk,
+    messages_of,
+    sentences,
     text_chunk,
     transcript_chunk,
 )
@@ -21,6 +28,7 @@ from sglang_omni.models.streaming_cascade.config import (
     ComponentGraphConfig,
     StreamingCascadePipelineConfig,
 )
+from sglang_omni.models.streaming_cascade.dialog import heard_prefix
 from sglang_omni.models.streaming_cascade.recognizers import probe_realtime_service
 from sglang_omni.models.streaming_cascade.running_transcript import (
     RunningTranscript,
@@ -35,6 +43,7 @@ from sglang_omni.proto.streams import (
     MESSAGES,
     PCM16,
     PCM_F32,
+    REPLY_DELIVERED,
     REPLY_PROGRESS,
     SESSION_CONTROL,
     SPEECH_STARTED,
@@ -104,10 +113,10 @@ async def test_a_truncate_after_turn_done_cuts_the_reply_that_was_still_playing(
             transcript_chunk("question", True),
             text_chunk("Hello world. Second sentence.", 1),
             lambda: dialog.control(
-                control_chunk(REPLY_PROGRESS, turn=1, words=2, audio_ms=1000)
+                control_chunk(REPLY_PROGRESS, turn=1, text_end=12, audio_ms=1000)
             ),
             lambda: dialog.control(
-                control_chunk(REPLY_PROGRESS, turn=1, words=4, audio_ms=2000)
+                control_chunk(REPLY_PROGRESS, turn=1, text_end=29, audio_ms=2000)
             ),
             control_chunk(TURN_DONE, turn=1),
             control_chunk(TRUNCATE, t_ms=1500),
@@ -117,6 +126,255 @@ async def test_a_truncate_after_turn_done_cuts_the_reply_that_was_still_playing(
     await drain(dialog, [transcript_chunk("next", True)])
     await drain(dialog, [control_chunk(TRUNCATE, t_ms=0)])
     assert dialog.messages[-2].content == "Hello world."
+
+
+REPLY = "One two.\nThree four. 五六。七八。"
+# Note (Junnan Li): Sentence ends at characters 8, 20 and 24 (and the reply's end, 28), with their audio ending at 1000, 2000 and 2500 ms.
+REPLY_PROGRESS_POINTS = [(8, 1000.0), (20, 2000.0), (24, 2500.0)]
+
+
+@pytest.mark.parametrize(
+    "heard_ms, text_end, uncertain",
+    [
+        (0, 0, False),
+        (400, 0, True),
+        (1000, 8, False),
+        (1500, 8, True),
+        (2000, 20, False),
+        (2400, 20, True),
+        (2500, 24, False),
+        (2900, 24, True),
+    ],
+)
+def test_heard_prefix_cuts_at_the_last_sentence_heard_to_its_end(
+    heard_ms, text_end, uncertain
+):
+    assert heard_prefix(REPLY_PROGRESS_POINTS, heard_ms, REPLY) == (
+        text_end,
+        uncertain,
+    )
+
+
+def test_heard_prefix_is_certain_once_the_whole_reply_was_heard():
+    assert heard_prefix([*REPLY_PROGRESS_POINTS, (28, 3000.0)], 3600, REPLY) == (
+        28,
+        False,
+    )
+    assert heard_prefix([(8, 1000.0)], 1500, "One two.  ") == (8, False)
+
+
+@pytest.mark.asyncio
+async def test_sentences_keep_the_reply_spacing_and_split_cjk_without_spaces():
+    deltas = [
+        text_chunk(part, 1) for part in ("One two.\nThr", "ee four. 五六。", "七八。")
+    ]
+
+    async def stream():
+        for delta in deltas:
+            yield delta
+
+    spans = [span async for span in sentences(stream(), max_words=24)]
+    assert spans == ["One two.", "\nThree four.", " 五六。", "七八。"]
+    assert "".join(spans) == REPLY
+
+
+async def spans_of(*parts: str, max_words: int = 24) -> list[str]:
+    async def stream():
+        for part in parts:
+            yield text_chunk(part, 1)
+
+    return [span async for span in sentences(stream(), max_words)]
+
+
+@pytest.mark.asyncio
+async def test_sentences_stream_a_cjk_reply_sentence_by_sentence():
+    spans = await spans_of("你好。今天天", "气很好！我们走吧；", "好…再见。")
+    assert spans == ["你好。", "今天天气很好！", "我们走吧；", "好…", "再见。"]
+
+
+@pytest.mark.asyncio
+async def test_sentences_end_each_line_of_a_list():
+    reply = "Steps:\n- open the door\n- walk in; sit down\n"
+    spans = await spans_of(reply)
+    assert spans == ["Steps:", "\n- open the door", "\n- walk in;", " sit down", "\n"]
+    assert "".join(spans) == reply
+
+
+@pytest.mark.asyncio
+async def test_sentences_split_after_an_abbreviation():
+    # Note (Junnan Li): Abbreviations are not recognised; "Dr." ends a sentence of its own, which costs one more speech request but keeps the text.
+    assert await spans_of("Dr. Smith is here. ", "Welcome!") == [
+        "Dr.",
+        " Smith is here.",
+        " Welcome!",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sentences_keep_the_word_cap():
+    assert await spans_of("one two three four five", max_words=2) == [
+        "one two",
+        " three four",
+        " five",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_truncate_after_speech_over_a_reply_keeps_the_heard_sentences_and_marks_the_cut():
+    dialog = build({"kind": "dialog"})
+    progress = [
+        lambda text_end=text_end, audio_ms=audio_ms: dialog.control(
+            control_chunk(REPLY_PROGRESS, turn=1, text_end=text_end, audio_ms=audio_ms)
+        )
+        for text_end, audio_ms in REPLY_PROGRESS_POINTS[:2]
+    ]
+    outputs = await drain(
+        dialog,
+        [
+            transcript_chunk("question", True),
+            text_chunk(REPLY, 1),
+            *progress,
+            control_chunk(SPEECH_STARTED),
+            control_chunk(TRUNCATE, t_ms=2300),
+            transcript_chunk("what did you say", True),
+        ],
+    )
+    assert [control_type(o) for o in outputs][3:5] == [INTERRUPT, TURN_INTERRUPTED]
+    assert dialog.messages[2].content == "One two.\nThree four."
+    assert dialog.messages[2].uncertain
+    prompt = [o for o in outputs if o.format == MESSAGES][-1]
+    assert prompt.payload["messages"][2] == {
+        "role": "assistant",
+        "content": "One two.\nThree four.",
+    }
+    assert messages_of(prompt)[-1].content == "what did you say"
+
+
+@pytest.mark.asyncio
+async def test_progress_of_the_interrupted_reply_still_counts_after_the_interrupt():
+    dialog = build({"kind": "dialog"})
+    await drain(
+        dialog,
+        [
+            transcript_chunk("question", True),
+            text_chunk(REPLY, 1),
+            control_chunk(SPEECH_STARTED),
+            lambda: dialog.control(
+                control_chunk(REPLY_PROGRESS, turn=1, text_end=8, audio_ms=1000)
+            ),
+            control_chunk(TRUNCATE, t_ms=1000),
+        ],
+    )
+    assert dialog.messages[2].content == "One two."
+    assert not dialog.messages[2].uncertain
+
+
+@pytest.mark.asyncio
+async def test_progress_that_arrives_after_the_truncate_re_cuts_the_interrupted_reply():
+    dialog = build({"kind": "dialog"})
+    await drain(
+        dialog,
+        [
+            transcript_chunk("A question?", True),
+            text_chunk(REPLY, 1),
+            control_chunk(SPEECH_STARTED, t_ms=900),
+            control_chunk(TRUNCATE, t_ms=1000),
+            lambda: dialog.control(
+                control_chunk(REPLY_PROGRESS, turn=1, text_end=8, audio_ms=1000)
+            ),
+        ],
+    )
+    assert dialog.messages[2].content == "One two."
+    assert not dialog.messages[2].uncertain
+
+
+def interrupted_dialog(*after: object) -> tuple[object, list[object]]:
+    """A dialog whose reply REPLY was interrupted after its first two sentence ends arrived, with `after` fed next."""
+    dialog = build({"kind": "dialog"})
+    progress = [
+        lambda text_end=text_end, audio_ms=audio_ms: dialog.control(
+            control_chunk(REPLY_PROGRESS, turn=1, text_end=text_end, audio_ms=audio_ms)
+        )
+        for text_end, audio_ms in REPLY_PROGRESS_POINTS[:2]
+    ]
+    return dialog, [
+        transcript_chunk("question", True),
+        text_chunk(REPLY, 1),
+        *progress,
+        control_chunk(SPEECH_STARTED),
+        *after,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_reply_keeps_nothing_until_its_delivered_audio_is_known():
+    dialog, inputs = interrupted_dialog()
+    await drain(dialog, inputs)
+    assert (dialog.messages[2].role, dialog.messages[2].content) == ("assistant", "")
+
+
+@pytest.mark.asyncio
+async def test_without_a_truncate_the_interrupted_reply_keeps_the_sentences_delivered_to_their_end():
+    dialog, inputs = interrupted_dialog(
+        control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2300)
+    )
+    await drain(dialog, inputs)
+    assert dialog.messages[2].content == "One two.\nThree four."
+    assert dialog.messages[2].uncertain
+
+
+@pytest.mark.asyncio
+async def test_a_later_truncate_moves_the_cut_back_but_never_past_the_delivered_audio():
+    dialog, inputs = interrupted_dialog(
+        control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2300),
+        control_chunk(TRUNCATE, t_ms=1200),
+    )
+    await drain(dialog, inputs)
+    assert dialog.messages[2].content == "One two."
+    await drain(dialog, [control_chunk(TRUNCATE, t_ms=2900)])
+    assert dialog.messages[2].content == "One two.\nThree four."
+
+
+@pytest.mark.asyncio
+async def test_a_reply_interrupted_in_its_first_sentence_leaves_an_empty_answer_between_the_questions():
+    dialog, inputs = interrupted_dialog(
+        control_chunk(REPLY_DELIVERED, turn=1, audio_ms=600),
+        transcript_chunk("wait, what?", True),
+    )
+    outputs = await drain(dialog, inputs)
+    prompt = messages_of([o for o in outputs if o.format == MESSAGES][-1])
+    assert [(m.role, m.content) for m in prompt] == [
+        ("system", dialog.config.system_prompt),
+        ("user", "question"),
+        ("assistant", ""),
+        ("user", "wait, what?"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delivered_audio_of_another_turn_does_not_cut_the_reply():
+    dialog, inputs = interrupted_dialog(
+        control_chunk(REPLY_DELIVERED, turn=7, audio_ms=2300)
+    )
+    await drain(dialog, inputs)
+    assert dialog.messages[2].content == ""
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_finished_stays_whole_without_a_truncate():
+    dialog = build({"kind": "dialog"})
+    await drain(
+        dialog,
+        [
+            transcript_chunk("question", True),
+            text_chunk(REPLY, 1),
+            control_chunk(TURN_DONE, turn=1),
+            lambda: dialog.control(
+                control_chunk(REPLY_PROGRESS, turn=1, text_end=8, audio_ms=1000)
+            ),
+        ],
+    )
+    assert dialog.messages[2].content == REPLY
 
 
 @pytest.mark.asyncio
@@ -317,6 +575,30 @@ async def test_openai_speech_flushes_each_reply_before_turn_done(backends):
 
 
 @pytest.mark.asyncio
+async def test_openai_speech_reports_each_sentence_end_as_a_character_offset(backends):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    deltas = ["Hello wor", "ld.\n  Second  sentence", " here. 你好。再见。"]
+    outputs = await drain(
+        build({**tts, "max_sentence_words": 24}),
+        [*(text_chunk(delta, 1) for delta in deltas), control_chunk(TURN_DONE, turn=1)],
+    )
+    progress = [o.payload for o in outputs if control_type(o) == REPLY_PROGRESS]
+    reply = "".join(deltas)
+    assert spoken == ["Hello world.", "Second sentence here.", "你好。", "再见。"]
+    assert [reply[: point["text_end"]] for point in progress] == [
+        "Hello world.",
+        "Hello world.\n  Second  sentence here.",
+        "Hello world.\n  Second  sentence here. 你好。",
+        reply,
+    ]
+    sentence_ms = 3 * 1000 / 24000
+    assert [point["audio_ms"] for point in progress] == [
+        sentence_ms * count for count in (1, 2, 3, 4)
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backends", ["english_tts"], indirect=True)
 async def test_openai_speech_tags_each_sentence_with_its_language(backends):
     settings, _, spoken, _ = backends
@@ -431,3 +713,210 @@ def test_profiles_expand_components_into_independent_session_nodes(profile):
             assert graph.nodes[name].stages == tuple(node.stages)
     assert graph.nodes["dialog"].bound("llm").feedback
     assert graph.nodes["dialog"].bound("tts").feedback
+
+
+ALIGNED_PROFILE = PROFILES / "qwen3-asr-qwen3-tts-customvoice" / "launch.yaml"
+CHUNK_MS = 500
+SPOKEN = "One two three four. Five six."
+
+
+def speech(turn: int = 1) -> TimedChunk:
+    return audio_chunk(np.zeros(24000 * CHUNK_MS // 1000), 24000, turn)
+
+
+def spoken_progress(outputs: list[TimedChunk]) -> list[tuple[int, float]]:
+    return [
+        (o.payload["text_end"], o.payload["audio_ms"])
+        for o in outputs
+        if control_type(o) == REPLY_PROGRESS
+    ]
+
+
+def aligner(method: str, **options) -> object:
+    return build({"kind": "alignment", "method": method, **options})
+
+
+def aligned_profile(**dialog_controls) -> StreamingCascadePipelineConfig:
+    data = yaml.safe_load(ALIGNED_PROFILE.read_text())
+    for source in dialog_controls.get("progress_from", ()):
+        data["session_nodes"]["dialog"]["inputs"].append(
+            {"kind": "control", "source": source, "event": REPLY_PROGRESS}
+        )
+    return StreamingCascadePipelineConfig(
+        model_path="m",
+        session_nodes=data["session_nodes"],
+        session_publish=data["session_publish"],
+    )
+
+
+@pytest.mark.parametrize("profile", PROFILE_NAMES)
+def test_every_profile_takes_reply_progress_from_a_forced_aligner(profile):
+    settings = profile_config(profile).component_graph()
+    assert settings.node("aligner").component.method == "forced"
+    assert [
+        edge.source
+        for edge in settings.node("dialog").controls
+        if edge.event == REPLY_PROGRESS
+    ] == ["aligner"]
+
+
+def test_the_reference_profile_routes_reply_progress_through_the_aligner():
+    settings = aligned_profile().component_graph()
+    aligner_node = settings.node("aligner")
+    assert aligner_node.component.method == "forced"
+    assert aligner_node.component.alignment_url == "http://127.0.0.1:8010"
+    assert aligner_node.produces == {SESSION_CONTROL}
+    assert [
+        edge.source
+        for edge in settings.node("dialog").controls
+        if edge.event == REPLY_PROGRESS
+    ] == ["aligner"]
+    with pytest.raises(ValueError, match="one source reports it"):
+        aligned_profile(progress_from=["tts"])
+    with pytest.raises(ValueError, match=r"reads \['aligner:reply.progress'\] as data"):
+        declared(
+            nodes={
+                "realigner": {
+                    "kind": "alignment",
+                    "inputs": ["llm:text_delta", "tts:pcm_f32le", "aligner:session"],
+                }
+            }
+        )
+    with pytest.raises(ValueError, match="needs alignment_url"):
+        COMPONENTS.parse({"kind": "alignment", "method": "forced"})
+    with pytest.raises(ValueError, match="belongs to the forced method"):
+        COMPONENTS.parse({"kind": "alignment", "alignment_url": "http://127.0.0.1:1"})
+
+
+@pytest.mark.asyncio
+async def test_the_sentence_method_passes_the_synthesizer_sentence_ends_through():
+    outputs = await drain(
+        aligner("sentence"),
+        [
+            text_chunk(SPOKEN, 1),
+            *(speech() for _ in range(4)),
+            control_chunk(REPLY_PROGRESS, turn=1, text_end=19, audio_ms=2000),
+            speech(),
+            control_chunk(REPLY_PROGRESS, turn=1, text_end=29, audio_ms=2500),
+            control_chunk(TURN_DONE, turn=1),
+        ],
+    )
+    assert spoken_progress(outputs) == [(19, 2000), (29, 2500)]
+    assert all(o.turn == 1 for o in outputs)
+
+
+def worker_reply(request: httpx.Request) -> httpx.Response:
+    body = json.loads(request.content)
+    assert (body["sample_rate_hz"], body["audio_format"]) == (24000, "pcm16")
+    samples = len(base64.b64decode(body["audio"])) // 2
+    words = [word.end() for word in re.finditer(r"\S+", body["text"])]
+    # Note (Junnan Li): The fake worker ends each word at an equal share of the sentence's audio.
+    return httpx.Response(
+        200,
+        json={
+            "boundaries": [
+                {
+                    "text_end_chars": end,
+                    "audio_end_samples": samples * (index + 1) // len(words),
+                }
+                for index, end in enumerate(words)
+            ]
+        },
+    )
+
+
+async def forced_aligner(handler, **options) -> object:
+    node = aligner("forced", alignment_url="http://aligner:9000", **options)
+    await node.client.aclose()
+    node.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return node
+
+
+@pytest.mark.asyncio
+async def test_the_forced_method_reports_the_worker_word_ends_and_nothing_of_an_interrupted_sentence():
+    texts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "http://aligner:9000/align"
+        texts.append(json.loads(request.content)["text"])
+        return worker_reply(request)
+
+    outputs = await drain(
+        await forced_aligner(handler),
+        [
+            text_chunk(SPOKEN, 1),
+            *(speech() for _ in range(4)),
+            control_chunk(REPLY_PROGRESS, turn=1, text_end=19, audio_ms=2000),
+            speech(),
+            speech(),
+            control_chunk(TURN_INTERRUPTED, turn=1),
+        ],
+    )
+    assert texts == ["One two three four."]
+    progress = spoken_progress(outputs)
+    assert progress[0] == (19, 2000)
+    # Note (Junnan Li): "Five six." never ends, so the worker never sees it.
+    assert sorted(progress[1:]) == [(3, 500), (7, 1000), (13, 1500), (19, 2000)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ReadTimeout("slow"),
+        httpx.Response(500),
+        httpx.Response(
+            200, json={"boundaries": [{"text_end_chars": 99, "audio_end_samples": 0}]}
+        ),
+    ],
+)
+async def test_the_forced_method_keeps_the_sentence_end_when_the_worker_fails(failure):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(failure, Exception):
+            raise failure
+        else:
+            return failure
+
+    outputs = await drain(
+        await forced_aligner(handler),
+        [
+            text_chunk(SPOKEN, 1),
+            *(speech() for _ in range(4)),
+            control_chunk(REPLY_PROGRESS, turn=1, text_end=19, audio_ms=2000),
+        ],
+    )
+    assert spoken_progress(outputs) == [(19, 2000)]
+
+
+@pytest.mark.asyncio
+async def test_a_truncate_cuts_at_the_word_the_aligner_reports(backends):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    deltas = [text_chunk("Hello world. Second sentence here.", 1)]
+    speech_outputs = await drain(
+        build({**tts, "max_sentence_words": 24}),
+        [*deltas, control_chunk(TURN_DONE, turn=1)],
+    )
+    assert spoken == ["Hello world.", "Second sentence here."]
+    node = await forced_aligner(worker_reply)
+    progress = [
+        o
+        for o in await drain(node, [*deltas, *speech_outputs])
+        if control_type(o) == REPLY_PROGRESS
+    ]
+    dialog = build({"kind": "dialog"})
+    await drain(
+        dialog,
+        [
+            transcript_chunk("question", True),
+            *deltas,
+            *(lambda point=point: dialog.control(point) for point in progress),
+            control_chunk(TURN_DONE, turn=1),
+        ],
+    )
+    sentence_ms = 3 * 1000 / 24000
+    # Note (Junnan Li): The fake worker ends "Second" one third of the way into the second sentence's audio.
+    heard_ms = sentence_ms + sentence_ms / 3
+    await drain(dialog, [control_chunk(TRUNCATE, t_ms=heard_ms)])
+    assert dialog.messages[-1].content == "Hello world. Second"
+    assert not dialog.messages[-1].uncertain

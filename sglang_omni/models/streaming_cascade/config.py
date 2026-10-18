@@ -40,6 +40,7 @@ from sglang_omni.proto.streams import (
     CONFIGURE,
     INTERRUPT,
     PCM16,
+    REPLY_PROGRESS,
     SESSION_CONTROL,
     SESSION_INPUT_SAMPLE_RATE_HZ,
     TRUNCATE,
@@ -224,6 +225,7 @@ class ComponentGraphConfig(BaseModel):
         self.check_publish(produced)
         self.check_published_audio()
         self.check_turn_roles()
+        self.check_progress()
         return self
 
     def check_names(self) -> None:
@@ -328,6 +330,33 @@ class ComponentGraphConfig(BaseModel):
             )
         else:
             pass
+
+    def check_progress(self) -> None:
+        """One source reports a node's reply progress, and a control edge does not divert an event a node reads as data, since an event a control edge takes skips its source's data readers."""
+        diverted = {
+            (edge.source, edge.event) for node in self.nodes for edge in node.controls
+        }
+        for node in self.nodes:
+            reporters = sorted(
+                {edge.source for edge in node.controls if edge.event == REPLY_PROGRESS}
+            )
+            lost = sorted(
+                f"{source}:{event}"
+                for source, formats in node.edges().items()
+                if SESSION_CONTROL in formats
+                for event in COMPONENTS.kind(node.component.kind).reads_events
+                if (source, event) in diverted
+            )
+            if len(reporters) > 1:
+                raise ValueError(
+                    f"node {node.name!r} takes {REPLY_PROGRESS} from {reporters}; one source reports it"
+                )
+            elif lost:
+                raise ValueError(
+                    f"node {node.name!r} reads {lost} as data, but a control edge takes them"
+                )
+            else:
+                pass
 
     def node(self, name: str) -> NodeSettings:
         return next(node for node in self.nodes if node.name == name)

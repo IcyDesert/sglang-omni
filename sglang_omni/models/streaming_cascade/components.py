@@ -4,6 +4,11 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from sglang_omni.models.streaming_cascade.alignment import (
+    Alignment,
+    AlignmentConfig,
+    probe_alignment_worker,
+)
 from sglang_omni.models.streaming_cascade.base import (
     SPEECH_SAMPLE_RATE_HZ,
     ComponentConfig,
@@ -33,6 +38,7 @@ from sglang_omni.proto.streams import (
     MESSAGES,
     PCM16,
     PCM_F32,
+    REPLY_PROGRESS,
     RUNNING_TEXT,
     SESSION_CONTROL,
     TEXT_DELTA,
@@ -55,7 +61,9 @@ class ComponentKind:
     `ends_turns` one whose turn.done ends a reply. `optional` names consumed
     formats a node runs without, as a set or as a function of the node's
     config. `probe` checks at startup that the service a configured node uses
-    answers.
+    answers. `reads_events` names the control events the kind reads among
+    its data inputs, which a control edge taking them from the same source
+    would divert.
     """
 
     config_cls: type[ComponentConfig]
@@ -67,6 +75,7 @@ class ComponentKind:
     ends_turns: bool = False
     optional: OptionalFormats = frozenset()
     probe: Callable[[ComponentConfig], Awaitable[None]] | None = None
+    reads_events: frozenset[str] = frozenset()
 
     def required_of(self, config: ComponentConfig) -> frozenset[str]:
         if callable(self.optional):
@@ -91,6 +100,7 @@ class ComponentRegistry:
         ends_turns: bool = False,
         optional: OptionalFormats = frozenset(),
         probe: Callable[[ComponentConfig], Awaitable[None]] | None = None,
+        reads_events: frozenset[str] = frozenset(),
     ) -> None:
         kind = config_cls.model_fields["kind"].default
         if not isinstance(kind, str) or not kind:
@@ -108,6 +118,7 @@ class ComponentRegistry:
                 ends_turns,
                 optional,
                 probe,
+                reads_events,
             )
 
     def kind(self, name: str) -> ComponentKind:
@@ -179,4 +190,12 @@ COMPONENTS.register(
     sample_rate_hz=SPEECH_SAMPLE_RATE_HZ,
     ends_turns=True,
     probe=probe_openai_service,
+)
+COMPONENTS.register(
+    AlignmentConfig,
+    Alignment,
+    consumes=frozenset({TEXT_DELTA, PCM_F32, SESSION_CONTROL}),
+    produces=frozenset({SESSION_CONTROL}),
+    probe=probe_alignment_worker,
+    reads_events=frozenset({REPLY_PROGRESS}),
 )

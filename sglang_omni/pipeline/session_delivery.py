@@ -72,6 +72,9 @@ class DeliveryPacer:
         # Note (Junnan Li): Before the first turn.started nothing waits; the horizon is infinite.
         self.reply_started_at = -math.inf
         self.is_input_ended = False
+        # Note (Junnan Li): The audio of the latest turn handed to the client, so an interrupt can say how much of its reply left the server.
+        self.sent_turn: int | None = None
+        self.sent_ms = 0.0
 
     def offer(self, output: OutputChunk, size: int) -> int:
         """Queue an output; returns the budgeted bytes a turn.interrupted dropped from its turn."""
@@ -102,6 +105,24 @@ class DeliveryPacer:
                 queue.extend(kept)
             self.wake.set()
             return dropped
+
+    def sent(self, output: OutputChunk) -> None:
+        """Count an output handed to the client toward its turn's delivered audio."""
+        if output.kind == "data" and output.format in AUDIO_FORMATS:
+            if output.turn != self.sent_turn:
+                self.sent_turn, self.sent_ms = output.turn, 0.0
+            else:
+                pass
+            self.sent_ms += output.duration_ms
+        else:
+            pass
+
+    def delivered_ms(self, turn: int) -> float:
+        """The audio of the turn handed to the client, from the reply's first sample."""
+        if turn == self.sent_turn:
+            return self.sent_ms
+        else:
+            return 0.0
 
     def end_input(self) -> None:
         self.is_input_ended = True

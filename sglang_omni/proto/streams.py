@@ -47,10 +47,12 @@ TURN_DONE = "turn.done"  # the reply and its audio are complete
 TURN_EMPTY = "turn.empty"  # the utterance carried no words; no reply
 TURN_INTERRUPTED = "turn.interrupted"  # the reply stopped before its end
 CONFIGURED = "configured"  # {"nodes": {name: kind}}
-# {"words": int, "audio_ms": float}; reply audio produced so far
+# {"text_end": int, "audio_ms": float}; the reply text's first text_end characters have audio, ending audio_ms after the reply's first sample
 REPLY_PROGRESS = "reply.progress"
+# {"audio_ms": float}; an interrupt stopped the reply after audio_ms of its audio reached the client
+REPLY_DELIVERED = "reply.delivered"
 # Controls between nodes; a graph delivers them to readers and control edges, never to the client.
-NODE_CONTROLS = frozenset({REPLY_PROGRESS})
+NODE_CONTROLS = frozenset({REPLY_PROGRESS, REPLY_DELIVERED})
 
 
 def control_type(chunk: TimedChunk | OutputChunk) -> str | None:

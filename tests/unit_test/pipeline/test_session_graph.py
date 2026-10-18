@@ -27,7 +27,7 @@ from sglang_omni.proto.session import (
     TimedChunk,
     wire_size,
 )
-from sglang_omni.proto.streams import AUDIO, IMAGE, IMAGE_FRAME, PCM16
+from sglang_omni.proto.streams import AUDIO, IMAGE, IMAGE_FRAME, PCM16, REPLY_DELIVERED
 from tests.unit_test.fixtures.session_outputs import control_chunk
 from tests.unit_test.fixtures.session_pipeline import (
     VAD_FACTORY,
@@ -1026,3 +1026,56 @@ async def test_an_interrupt_drops_released_audio_still_waiting_for_the_client():
     assert delivered.payload == {"type": "turn.interrupted"}
     assert graph.outputs.empty()
     assert graph.output_bytes == 10
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_tells_the_paced_node_readers_the_audio_it_delivered():
+    identity = SessionIdentity("graph", 1)
+    graph = SessionGraphRuntime(
+        session_identity=identity,
+        graph=SessionGraph(
+            nodes={
+                "speaker": SessionNode(stages=("speaker",), inputs=("input",)),
+                "listener": SessionNode(
+                    stages=("listener",), inputs=("speaker:session",)
+                ),
+            },
+            publish={"speaker": ("pcm16",)},
+        ),
+        nodes={
+            "speaker": SessionIdentity("graph:speaker", 1),
+            "listener": SessionIdentity("graph:listener", 1),
+        },
+        limits=SessionLimits(),
+        inboxes={"speaker": NodeInbox(), "listener": NodeInbox()},
+        outputs=asyncio.Queue(),
+    )
+    pacer = DeliveryPacer(250, asyncio.Event())
+    graph.pacers["speaker"] = pacer
+    for turn, t_start_ms in ((1, 0), (2, 0), (2, 100)):
+        pacer.offer(
+            OutputChunk(
+                identity,
+                0,
+                0,
+                "audio",
+                t_start_ms,
+                100,
+                bytes(3200),
+                "pcm16",
+                turn=turn,
+            ),
+            0,
+        )
+    runner = SessionGraphRunner()
+    delivery = asyncio.create_task(runner.deliver_paced_outputs(graph, "speaker"))
+    await wait_until(lambda: graph.outputs.qsize() == 2)
+    delivery.cancel()
+    await asyncio.gather(delivery, return_exceptions=True)
+    # Note (Junnan Li): The pacer joins turn 2's two chunks into one; only the latest turn keeps its count.
+    assert (pacer.delivered_ms(1), pacer.delivered_ms(2)) == (0, 200)
+    await runner.report_delivered(graph, "speaker", 2)
+    await runner.report_delivered(graph, "speaker", None)
+    [(source, delivered, _)] = graph.inboxes["listener"].queued
+    assert source == "speaker" and delivered.turn == 2
+    assert delivered.payload == {"type": REPLY_DELIVERED, "audio_ms": 200}

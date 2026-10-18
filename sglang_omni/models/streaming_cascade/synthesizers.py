@@ -58,10 +58,14 @@ class TurnSpeaker(Replier):
         raise NotImplementedError
 
     def progress(
-        self, emit: ChunkEmitter, turn: int, words: int, audio_ms: float
+        self, emit: ChunkEmitter, turn: int, text_end: int, audio_ms: float
     ) -> None:
-        """Tell the dialog how much of the reply has audio, so a truncate can cut the history where the listener stopped."""
-        emit(control_chunk(REPLY_PROGRESS, turn=turn, words=words, audio_ms=audio_ms))
+        """Tell the dialog that the reply's first text_end characters have audio ending at audio_ms, so a truncate can cut the history where the listener stopped."""
+        emit(
+            control_chunk(
+                REPLY_PROGRESS, turn=turn, text_end=text_end, audio_ms=audio_ms
+            )
+        )
 
     async def process(
         self, inputs: AsyncIterator[TimedChunk], emit: ChunkEmitter
@@ -170,14 +174,18 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
     async def speak_reply(
         self, deltas: AsyncIterator[TimedChunk], turn: int, emit: ChunkEmitter
     ) -> None:
-        words_spoken = 0
+        text_end = 0
         audio_ms = 0.0
-        async for sentence in sentences(deltas, self.config.max_sentence_words):
-            async for samples in self.speak(sentence):
-                audio_ms += len(samples) * 1000 / self.sample_rate_hz
-                emit(audio_chunk(samples, self.sample_rate_hz, turn))
-            words_spoken += len(sentence.split())
-            self.progress(emit, turn, words_spoken, audio_ms)
+        async for span in sentences(deltas, self.config.max_sentence_words):
+            sentence = " ".join(span.split())
+            if sentence:
+                async for samples in self.speak(sentence):
+                    audio_ms += len(samples) * 1000 / self.sample_rate_hz
+                    emit(audio_chunk(samples, self.sample_rate_hz, turn))
+            else:
+                pass
+            text_end += len(span)
+            self.progress(emit, turn, text_end, audio_ms)
 
     async def close(self) -> None:
         await self.client.aclose()

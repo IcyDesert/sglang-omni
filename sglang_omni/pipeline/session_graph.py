@@ -35,8 +35,11 @@ from sglang_omni.proto.session import (
 from sglang_omni.proto.streams import (
     AUDIO,
     AUDIO_FORMATS,
+    CONTROL,
     INTERRUPT,
     NODE_CONTROLS,
+    REPLY_DELIVERED,
+    SESSION_CONTROL,
     SPEECH_STARTED,
     SPEECH_STOPPED,
     TURN_DONE,
@@ -95,8 +98,9 @@ class SessionGraphRunner(CoordinatorSessions):
 
         The target's inbox and its node session's unsent appends lose the
         turn's chunks from other nodes, and a later chunk of the turn no
-        longer enters the inbox; the target's pacer drops the turn's output.
-        The client's own input stays.
+        longer enters the inbox; the target's pacer drops the turn's output
+        and tells the target's readers how much of the turn's audio it had
+        handed to the client. The client's own input stays.
         """
         if control_type(event) == INTERRUPT and event.turn is not None:
             graph.interrupted_turns.setdefault(target, set()).add(event.turn)
@@ -124,6 +128,7 @@ class SessionGraphRunner(CoordinatorSessions):
             pass
         if control_type(event) == INTERRUPT and target in graph.pacers:
             graph.output_bytes -= graph.pacers[target].purge(event.turn)
+            await self.report_delivered(graph, target, event.turn)
         elif control_type(event) is None and self.is_interrupted(graph, target, event):
             return
         else:
@@ -134,6 +139,28 @@ class SessionGraphRunner(CoordinatorSessions):
             should_preempt=edge.should_preempt or should_preempt,
             is_ordered=edge.source == GRAPH_INPUT,
         )
+
+    async def report_delivered(
+        self, graph: SessionGraphRuntime, name: str, turn: int | None
+    ) -> None:
+        """Send the readers of a paced node's controls the audio of an interrupted turn the pacer handed to the client."""
+        if turn is None:
+            pass
+        else:
+            delivered = TimedChunk(
+                CONTROL,
+                0,
+                0,
+                0,
+                {
+                    "type": REPLY_DELIVERED,
+                    "audio_ms": graph.pacers[name].delivered_ms(turn),
+                },
+                format=SESSION_CONTROL,
+                turn=turn,
+            )
+            for reader in graph.graph.reading_nodes(name, SESSION_CONTROL):
+                await self.put_graph_inbox(graph, reader, name, delivered)
 
     async def open_graph(
         self,
@@ -546,6 +573,7 @@ class SessionGraphRunner(CoordinatorSessions):
                     continue
                 else:
                     pass
+                pacer.sent(output)
                 await self.publish_graph_output(graph, output, size)
                 if control_type(output) == TURN_DONE:
                     for reader in graph.graph.reading_nodes(name, output.format):

@@ -62,7 +62,7 @@ Send 16 kHz mono PCM16 audio at real-time pace as `{"type": "input_audio_buffer.
 | `response.done` | The reply is complete; `response.status_details.reason` is `stop`, `empty_turn` when the utterance had no words, or `interrupted` when you spoke over it. |
 | `error` | The request or the session failed. |
 
-`response.cancel` interrupts the reply from the client side. `conversation.item.truncate` with `audio_end_ms` tells the server how much of an interrupted reply was heard; the history keeps only those words.
+`response.cancel` interrupts the reply from the client side. An interrupted reply stays in the history only up to the last sentence whose audio the server had sent in full before the interruption; a reply interrupted in its first sentence leaves an empty answer. `conversation.item.truncate` with `audio_end_ms` tells the server how much of the reply was heard; the history then keeps the reply up to the last sentence whose audio ended by then, never past what the server sent, and marks the entry uncertain when the listener heard part of the next sentence.
 
 To end turns yourself instead of by silence, set `"turn_detection": null`; the server then grants `client_commit` and `input_audio_buffer.commit` ends the utterance after the audio sent before it.
 
@@ -90,8 +90,15 @@ A profile is one `launch.yaml`. `services` lists the model services to start, ea
 | `openai_chat` | Language model over `/v1/chat/completions` | `base_url`, `model`, `max_tokens`, `temperature`, `extra_body` (request fields the service takes beyond these, such as `chat_template_kwargs`), `api_key_env`, `timeout_s` |
 | `openai_speech` | Speech synthesis over `/v1/audio/speech` | `base_url`, `model`, `voice`, `reference_audio_path`, `reference_text`, `language` (the speech service's language tag for the reply; a sentence with Chinese characters is tagged Chinese), `max_sentence_words`, `api_key_env`, `timeout_s` |
 | `running_transcript` | Cuts utterances from an ASR stage running inside the server | `tail_ms` |
+| `alignment` | Reports how far into the reply text the reply audio has reached, so a truncated reply keeps what the listener heard | `method` (`sentence` or `forced`), `alignment_url`, `timeout_s` (default 2) |
 
 `base_url` and `model` have no defaults. `api_key_env` names an environment variable whose value is sent as a bearer token. The `vad` node is declared with `stages: [vad]`; its `silence_duration_ms` (default 500) sets how long a pause ends an utterance.
+
+The dialog cuts an interrupted reply at the points `reply.progress` reports, up to the audio the graph sent to the client before the interruption, which the graph reports to the readers of the `tts` node's `session` output as `reply.delivered`. Without an `alignment` node the dialog takes `reply.progress` from the `tts` node, which reports the end of each sentence. With one, as in `qwen3-asr-qwen3-tts-customvoice`, the `aligner` node reads `["llm:text_delta", "tts:pcm_f32le", "tts:session", "dialog:session"]` and the dialog's `{kind: control, source: aligner, event: reply.progress}` input replaces the one from `tts`; a profile names exactly one source of `reply.progress`.
+
+`method: sentence` keeps the sentence ends, so a truncated reply keeps the sentences whose audio was played to the end and drops the sentence the listener was hearing. `method: forced` also sends each finished sentence and its audio to the worker at `alignment_url` and reports the word ends it returns, so the cut can fall inside a sentence that finished; when the worker fails or exceeds `timeout_s`, that sentence keeps its sentence end. A sentence that an interruption cuts off before its audio is complete gets no word ends and counts as unheard in both methods.
+
+The profiles declare an `aligner` node with `method: forced` and `alignment_url: "http://127.0.0.1:8010"`, so start the forced-alignment worker before `sgl-omni serve`: `python examples/streaming_cascade/alignment_worker.py --model Qwen/Qwen3-ForcedAligner-0.6B --device cuda:0 --language English --port 8010`. It needs the `qwen-asr` package, which pins a `transformers` release of its own, so run it from a separate virtual environment; the server checks at startup that the worker answers. To run without it, set the aligner's `method: sentence` and remove `alignment_url`.
 
 At the top of the profile, `timeout_s` (default 120) bounds the wait for the last replies after the input ends, and `max_pending_output_chunks` with `max_pending_output_bytes` bound the reply output held for a client that has stopped reading.
 

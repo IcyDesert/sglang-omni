@@ -31,7 +31,7 @@ session_nodes:
       - "vad:session"
       - "input:session"
       - {kind: control, source: input, event: interrupt}
-      - {kind: control, source: tts, event: reply.progress}
+      - {kind: control, source: aligner, event: reply.progress}
     system_prompt: You are a helpful voice assistant. Answer in one spoken sentence of at most 25 words, in the language the user speaks. Do not use markdown.
   llm:
     kind: openai_chat
@@ -52,6 +52,11 @@ session_nodes:
     model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
     voice: Vivian
     language: English
+  aligner:
+    kind: alignment
+    method: forced
+    alignment_url: "http://127.0.0.1:8010"
+    inputs: ["llm:text_delta", "tts:pcm_f32le", "tts:session", "dialog:session"]
 
 session_publish:
   vad: [session]

@@ -31,7 +31,10 @@ from sglang_omni.scheduling.session import ChunkEmitter
 
 SPEECH_SAMPLE_RATE_HZ = 24000
 PROBE_TIMEOUT_S = 10.0
-SENTENCE_END = re.compile(r"[.!?。！？]+[\"')\]]*$")
+# Note (Junnan Li): A word ending in a period ends a sentence even after an abbreviation such as "Dr.", which then becomes its own short sentence.
+SENTENCE_END = re.compile(r"[.!?;。！？；…]+[\"')\]”’」』）]*$")
+# Note (Junnan Li): CJK text has no spaces between sentences, so a sentence also ends inside a word once its punctuation run is followed by more text.
+CJK_SENTENCE_END = re.compile(r"[。！？；…]+[\"')\]”’」』）]*(?=\S)")
 
 
 class StreamComponent:
@@ -63,8 +66,11 @@ class StreamComponent:
 
 
 class ChatMessage(BaseModel):
+    """One history entry; `uncertain` marks an assistant reply cut where the listener may have heard part of the next sentence, and stays out of the model's prompt."""
+
     role: Literal["system", "user", "assistant"]
     content: str = ""
+    uncertain: bool = False
 
 
 def control_chunk(
@@ -109,7 +115,7 @@ def messages_chunk(messages: list[ChatMessage], turn: int) -> TimedChunk:
 
 
 def message_dict(message: ChatMessage) -> dict[str, object]:
-    return message.model_dump(exclude_none=True)
+    return message.model_dump(exclude_none=True, exclude={"uncertain"})
 
 
 def audio_chunk(samples: np.ndarray, sample_rate_hz: int, turn: int) -> TimedChunk:
@@ -305,38 +311,40 @@ async def texts(inputs: AsyncIterator[TimedChunk]) -> AsyncIterator[str]:
             yield str(chunk.payload["text"])
 
 
-async def words(inputs: AsyncIterator[TimedChunk]) -> AsyncIterator[str]:
-    """Whole whitespace-delimited words; a partial word waits for its end."""
-    pending = ""
-    async for text in texts(inputs):
-        pending += text
-        split = pending.split()
-        if pending and not pending[-1].isspace():
-            pending = split.pop() if split else pending
+def sentence_end(text: str, max_words: int) -> int | None:
+    """Where the first sentence of `text` ends: after a whole word with terminal punctuation or the max_words-th whole word, after a run of CJK terminal punctuation that something follows, or at the end of a line; None while it may still grow."""
+    ends = []
+    for count, word in enumerate(re.finditer(r"\S+(?=\s)", text), start=1):
+        if SENTENCE_END.search(word.group()) or count >= max_words:
+            ends.append(word.end())
+            break
         else:
-            pending = ""
-        for word in split:
-            yield word
-    if pending:
-        yield pending
+            pass
+    cjk = CJK_SENTENCE_END.search(text)
+    if cjk is not None:
+        ends.append(cjk.end())
     else:
         pass
+    line = re.search(r"\S[ \t]*\n", text)
+    if line is not None:
+        ends.append(line.start() + 1)
+    else:
+        pass
+    return min(ends, default=None)
 
 
 async def sentences(
     inputs: AsyncIterator[TimedChunk], max_words: int
 ) -> AsyncIterator[str]:
-    """Sentences by terminal punctuation, capped at max_words."""
-    pending: list[str] = []
-    async for word in words(inputs):
-        pending.append(word)
-        if SENTENCE_END.search(word) or len(pending) >= max_words:
-            yield " ".join(pending)
-            pending = []
-        else:
-            pass
+    """The reply text cut into sentences, each span with its own spacing, so the spans join back to the text."""
+    pending = ""
+    async for text in texts(inputs):
+        pending += text
+        while (end := sentence_end(pending, max_words)) is not None:
+            yield pending[:end]
+            pending = pending[end:]
     if pending:
-        yield " ".join(pending)
+        yield pending
     else:
         pass
 
