@@ -20,6 +20,7 @@ from sglang_omni.proto.streams import (
     INTERRUPT,
     PCM16,
     PCM_F32,
+    REPLY_PROGRESS,
     SESSION_CONTROL,
     SPEECH_STARTED,
     SPEECH_STOPPED,
@@ -42,6 +43,7 @@ from sglang_omni.serve.realtime.output import (
     AudioFinished,
     InputTranscription,
     ResponseFinished,
+    ResponseProgress,
     ResponseStarted,
     SpeechStarted,
     SpeechStopped,
@@ -184,6 +186,23 @@ async def test_every_vocabulary_item_projects_through_the_table():
     await settle()
     assert isinstance(h.published[-1], TurnFailure)
     assert "unsupported session output" in h.published[-1].message
+    await h.bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_progress_maps_to_the_open_response_of_its_turn():
+    h = Harness()
+    await h.open()
+    h.client.control(TURN_STARTED, turn=3)
+    h.client.emit(TEXT, TEXT_DELTA, {"text": "One, two."}, turn=3)
+    h.client.control(REPLY_PROGRESS, turn=3, text_end=4, audio_ms=500.0)
+    h.client.control(REPLY_PROGRESS, turn=2, text_end=9, audio_ms=900.0)
+    h.client.control(TURN_DONE, turn=3)
+    h.client.control(REPLY_PROGRESS, turn=3, text_end=9, audio_ms=1000.0)
+    await settle()
+    assert [event for event in h.published if isinstance(event, ResponseProgress)] == [
+        ResponseProgress("resp_0", "item_0", 4, 500.0)
+    ]
     await h.bridge.close()
 
 

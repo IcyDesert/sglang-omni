@@ -227,6 +227,7 @@ function renderTranscript() {
   if (!paragraphs.length) {
     ui.transcript.innerHTML = '<p class="empty">What the model says will appear here.</p>';
     ui.caption.textContent = "";
+    delete ui.caption.dataset.key;
     return;
   }
   ui.transcript.replaceChildren(...paragraphs.map((line) => {
@@ -235,8 +236,25 @@ function renderTranscript() {
     return paragraph;
   }));
   ui.transcript.scrollTop = ui.transcript.scrollHeight;
-  // The caption follows the answer being spoken, or the last one once it ends.
-  ui.caption.textContent = paragraphs.at(-1);
+  renderHeard();
+}
+
+// The caption shows the latest reply, the part already heard set apart from the rest; a cut reply keeps only the heard part.
+function renderHeard() {
+  const id = session && session.lastReplyId;
+  const reply = id && session.reply(id);
+  if (!reply || !reply.text) return;
+  const parts = session.captionParts(id);
+  const key = `${id}:${parts.heard.length}:${parts.pending.length}`;
+  if (ui.caption.dataset.key === key) return;
+  ui.caption.dataset.key = key;
+  const heard = document.createElement("span");
+  heard.className = "heard";
+  heard.textContent = parts.heard;
+  const pending = document.createElement("span");
+  pending.className = "pending";
+  pending.textContent = parts.pending;
+  ui.caption.replaceChildren(heard, pending);
 }
 
 function setSheet(open) {
@@ -257,6 +275,9 @@ async function ensurePlayback(rate) {
     outputChannelCount: [1],
     processorOptions: { initialSamples: Math.max(1, Math.round(playbackContext.sampleRate * JITTER_MS / 1000)) },
   });
+  playbackNode.port.onmessage = ({ data }) => {
+    if (data.type === "played" && session) session.played(data.responseId, (data.samples * 1000) / playbackContext.sampleRate, data.cut);
+  };
   playbackNode.connect(playbackContext.destination);
   // A side tap for the orb; it measures exactly what reaches the speaker.
   playbackAnalyser = playbackContext.createAnalyser();
@@ -324,6 +345,8 @@ function sessionListeners() {
       renderTranscript();
     },
     text: renderTranscript,
+    progress: renderHeard,
+    played: renderHeard,
     drained: () => {},
     warning: (message) => warn(message),
   };

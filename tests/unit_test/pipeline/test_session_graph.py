@@ -869,6 +869,65 @@ async def test_an_interrupted_node_publishes_only_the_end_of_the_interrupted_tur
     ]
 
 
+def report_runtime(sessions: SessionGraphRunner) -> SessionGraphRuntime:
+    """A `tts` node whose session output the `aligner` reads, and a `dialog` that takes the aligner's progress on a control edge; both publish `session`."""
+    nodes = {
+        "tts": SessionNode(("tts",), ("input",)),
+        "aligner": SessionNode(("aligner",), ("tts:session",)),
+        "dialog": SessionNode(
+            ("dialog",),
+            ("input",),
+            controls=(ControlEdge("aligner", "reply.progress"),),
+        ),
+    }
+    identities = {name: SessionIdentity(f"graph:{name}") for name in nodes}
+    for name, identity in identities.items():
+        sessions.sessions[identity.id] = Session(
+            session_identity=identity,
+            request=OmniRequest(None),
+            stages=(name,),
+            bindings={},
+            limits=SessionLimits(),
+            is_node=True,
+        )
+    return SessionGraphRuntime(
+        session_identity=SessionIdentity("graph"),
+        graph=SessionGraph(
+            nodes=nodes, publish={"tts": ("session",), "aligner": ("session",)}
+        ),
+        nodes=identities,
+        limits=SessionLimits(),
+        inboxes={name: NodeInbox() for name in nodes},
+        outputs=asyncio.Queue(),
+        client_sequences={name: {} for name in nodes},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_report_reaches_the_client_only_from_a_node_no_node_reads():
+    progress = {"type": "reply.progress", "text_end": 4, "audio_ms": 500.0}
+    sessions = NodeOutputsRunner(
+        [
+            reply_output("session", progress, 1),
+            reply_output("session", {"type": "turn.started"}, 1),
+        ]
+    )
+    graph = report_runtime(sessions)
+    await sessions.route_graph_outputs(graph, "tts")
+    assert graph.outputs.get_nowait()[0].payload == {"type": "turn.started"}
+    assert graph.outputs.empty()
+    assert [chunk.payload for _, chunk, _ in graph.inboxes["aligner"].queued] == [
+        progress,
+        {"type": "turn.started"},
+    ]
+    sessions.node_outputs = [reply_output("session", progress, 1)]
+    await sessions.route_graph_outputs(graph, "aligner")
+    assert [event.payload for event in sessions.controls] == [progress]
+    published = graph.outputs.get_nowait()[0]
+    assert (published.payload, published.turn) == (progress, 1)
+    assert graph.outputs.empty()
+
+
 def input_runtime(
     nodes: dict[str, SessionNode], limits: SessionLimits
 ) -> SessionGraphRuntime:

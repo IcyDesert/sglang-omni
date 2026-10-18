@@ -5,6 +5,7 @@
 export const DEFAULT_INPUT_RATE = 16000;
 export const PACKET_MS = 80;
 const MAX_UNITS_SHOWN = 200;
+const MAX_REPLIES_KEPT = 20;
 
 export function bytesToBase64(bytes) {
   let binary = "";
@@ -20,6 +21,15 @@ export function base64ToBytes(encoded) {
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
+}
+
+// How much of a reply's text the listener has heard: the largest text_end whose audio ends by playedMs.
+export function heardTextEnd(progress, playedMs) {
+  let textEnd = 0;
+  for (const point of progress) {
+    if (point.audioMs <= playedMs) textEnd = Math.max(textEnd, point.textEnd);
+  }
+  return textEnd;
 }
 
 export class DuplexSession {
@@ -51,6 +61,45 @@ export class DuplexSession {
     this.errors = [];
     this.drained = null;
     this.closeReason = null;
+    // Per response: its text, item, the server's sglang.response.progress points and how much of its audio has played.
+    this.replies = new Map();
+    this.lastReplyId = null;
+  }
+
+  reply(responseId) {
+    return this.replies.get(responseId) || null;
+  }
+
+  // Characters of a reply's text the listener has heard; fixed once the reply stops playing.
+  heardEnd(responseId) {
+    const reply = this.reply(responseId);
+    return reply ? Math.min(heardTextEnd(reply.progress, reply.playedMs), reply.text.length) : 0;
+  }
+
+  // What the caption shows of a reply: the heard part and the part still to play. A reply that ended
+  // other than completed keeps only what was heard, nothing when none of its audio played; without
+  // progress from the server a reply is shown whole unless none of it played.
+  captionParts(responseId) {
+    const reply = this.reply(responseId);
+    if (!reply) return { heard: "", pending: "" };
+    const cut = reply.status !== null && reply.status !== "completed";
+    if (cut && reply.playedMs <= 0) return { heard: "", pending: "" };
+    const end = reply.progress.length ? this.heardEnd(responseId) : reply.text.length;
+    return { heard: reply.text.slice(0, end), pending: cut ? "" : reply.text.slice(end) };
+  }
+
+  // The player's count of a reply's audio; a cut reply tells the server how much was heard.
+  played(responseId, playedMs, cut) {
+    const reply = this.reply(responseId);
+    if (!reply || reply.stopped) return;
+    reply.playedMs = Math.max(reply.playedMs, playedMs);
+    if (cut) {
+      reply.stopped = true;
+      if (this.state === "ready" && this.granted.supports_truncate && reply.itemId) {
+        this.send("conversation.item.truncate", { item_id: reply.itemId, content_index: 0, audio_end_ms: reply.playedMs });
+      }
+    }
+    this.emit("played", responseId);
   }
 
   get turnBased() {
@@ -205,26 +254,41 @@ export class DuplexSession {
       case "response.created":
         this.responseOpen = true;
         this.responseId = (event.response && event.response.id) || null;
+        this.replies.set(this.responseId, { text: "", itemId: null, progress: [], playedMs: 0, stopped: false, status: null });
+        this.lastReplyId = this.responseId;
+        if (this.replies.size > MAX_REPLIES_KEPT) this.replies.delete(this.replies.keys().next().value);
         this.emit("response", { open: true, id: this.responseId });
         break;
       case "response.output_audio.delta": {
         const bytes = base64ToBytes(event.delta || "");
         const unitId = extension.unit_id || "unknown";
         this.unitAudio.set(unitId, (this.unitAudio.get(unitId) || 0) + bytes.byteLength / 2);
+        const reply = this.reply(event.response_id);
+        if (reply) reply.itemId = event.item_id;
         this.emit("audio", { bytes, responseId: event.response_id || this.responseId });
         break;
       }
       case "response.output_text.delta":
       case "response.output_audio_transcript.delta":
         this.transcript += event.delta || "";
+        if (this.reply(event.response_id)) this.reply(event.response_id).text += event.delta || "";
         this.emit("text", event.delta || "");
         break;
-      case "response.done":
+      case "sglang.response.progress": {
+        const reply = this.reply(event.response_id);
+        if (reply) reply.progress.push({ textEnd: event.text_end, audioMs: event.audio_ms });
+        this.emit("progress", event.response_id);
+        break;
+      }
+      case "response.done": {
+        const reply = this.reply(event.response && event.response.id);
+        if (reply) reply.status = event.response.status || null;
         this.responseOpen = false;
         this.responseId = null;
         if (this.transcript && !this.transcript.endsWith("\n")) this.transcript += "\n";
         this.emit("response", { open: false, id: event.response && event.response.id, status: event.response && event.response.status });
         break;
+      }
       case "sglang.unit.done":
         this.completeUnit(event);
         break;

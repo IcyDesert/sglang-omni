@@ -55,7 +55,9 @@ REPLY_PROGRESS = "reply.progress"
 # {"audio_ms": float}; an interrupt stopped the reply after audio_ms of its audio reached the client
 REPLY_DELIVERED = "reply.delivered"
 # Controls between nodes; a graph delivers them to readers and control edges, never to the client.
-NODE_CONTROLS = frozenset({REPLY_PROGRESS, REPLY_DELIVERED})
+NODE_CONTROLS = frozenset({REPLY_DELIVERED})
+# Reports a node makes on its own output; the client hears a report only from a node whose output no node reads as data, the end of the route that builds it.
+REPORT_CONTROLS = frozenset({REPLY_PROGRESS})
 
 
 def chunk_language(chunk: TimedChunk) -> str | None:

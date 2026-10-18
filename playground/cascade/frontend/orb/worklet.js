@@ -57,6 +57,11 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.lastSample = 0;
     this.fadeRemaining = 0;
     this.fadeLength = Math.max(1, Math.round(sampleRate * 0.01));
+    // Samples played of the response now playing, reported about ten times a second.
+    this.playingId = null;
+    this.playingSamples = 0;
+    this.reportEvery = Math.round(sampleRate / 10);
+    this.sinceReport = 0;
     this.port.onmessage = ({ data }) => {
       if (data.type === "push" && data.samples) {
         // Each chunk remembers its response so a cancel drops only that reply.
@@ -68,8 +73,12 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         if (this.queuedSamples > 0) this.started = true;
       } else if (data.type === "cancel") {
         this.cancel(data.responseId);
-      } else if (data.type === "clear" || data.type === "reset") {
+      } else if (data.type === "clear") {
+        if (this.queuedSamples > 0) this.report(true);
         this.drop();
+      } else if (data.type === "reset") {
+        this.drop();
+        this.playingId = null;
       }
     };
   }
@@ -82,8 +91,15 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.fadeRemaining = this.fadeLength;
   }
 
+  report(cut) {
+    if (this.playingId !== null) this.port.postMessage({ type: "played", responseId: this.playingId, samples: this.playingSamples, cut });
+    this.sinceReport = 0;
+  }
+
   // Drops every queued sample of one response; audio of a later response keeps its place.
   cancel(responseId) {
+    const samples = this.playingId === responseId ? this.playingSamples : 0;
+    this.port.postMessage({ type: "played", responseId, samples, cut: true });
     if (this.queue.length && this.queue[0].responseId === responseId) {
       this.headOffset = 0;
       this.fadeRemaining = this.fadeLength;
@@ -96,6 +112,11 @@ class PlaybackProcessor extends AudioWorkletProcessor {
   takeSample() {
     if (this.queuedSamples === 0) return null;
     const chunk = this.queue[0];
+    if (chunk.responseId !== this.playingId) {
+      this.playingId = chunk.responseId;
+      this.playingSamples = 0;
+    }
+    this.playingSamples += 1;
     const value = chunk[this.headOffset];
     this.headOffset += 1;
     this.queuedSamples -= 1;
@@ -116,12 +137,16 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.fadeRemaining -= 1;
       } else if (this.started) {
         const next = this.takeSample();
-        if (next === null) this.started = false;
-        else value = next;
+        if (next === null) {
+          this.started = false;
+          this.report(false);
+        } else value = next;
       }
       output[index] = value;
       this.lastSample = value;
     }
+    this.sinceReport += output.length;
+    if (this.started && this.sinceReport >= this.reportEvery) this.report(false);
     return true;
   }
 }

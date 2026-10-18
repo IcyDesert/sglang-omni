@@ -24,6 +24,7 @@ from sglang_omni.serve.realtime.output import (
     InputTranscription,
     OutputEvent,
     ResponseFinished,
+    ResponseProgress,
     ResponseStarted,
     ResponseStatus,
     SpeechStarted,
@@ -129,6 +130,8 @@ class ServerEvent(TypedDict, total=False):
     consumed_ms: float
     padding_ms: float
     tail_policy: TailPolicy
+    text_end: int
+    audio_ms: float
 
 
 def project_output(
@@ -203,6 +206,16 @@ def project_output(
         else:
             pass
         return server_event
+    elif isinstance(event, ResponseProgress):
+        return dict(
+            type="sglang.response.progress",
+            response_id=event.response_id,
+            item_id=event.item_id,
+            output_index=0,
+            content_index=0,
+            text_end=event.text_end,
+            audio_ms=event.audio_ms,
+        )
     elif isinstance(event, TurnFailure):
         return dict(
             type="error",

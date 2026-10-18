@@ -39,6 +39,7 @@ from sglang_omni.proto.streams import (
     INTERRUPT,
     NODE_CONTROLS,
     REPLY_DELIVERED,
+    REPORT_CONTROLS,
     SESSION_CONTROL,
     SPEECH_STARTED,
     SPEECH_STOPPED,
@@ -487,17 +488,16 @@ class SessionGraphRunner(CoordinatorSessions):
                 continue
             else:
                 pass
+            is_published = self.is_client_output(graph, name, chunk)
             control_targets = graph.graph.control_targets(name, edge_event(chunk))
-            if control_targets:
-                for target, edge in control_targets:
-                    await self.control_edge(graph, target, edge, chunk)
+            for target, edge in control_targets:
+                await self.control_edge(graph, target, edge, chunk)
+            if control_targets and not (
+                is_published and control_type(chunk) in REPORT_CONTROLS
+            ):
                 continue
             else:
                 pass
-            is_published = (
-                graph.graph.is_published(name, output.format)
-                and control_type(chunk) not in NODE_CONTROLS
-            )
             if is_published and graph.graph.shared_timeline:
                 output = self.time_graph_output(graph, output)
                 chunk = output_chunk(output)
@@ -525,6 +525,18 @@ class SessionGraphRunner(CoordinatorSessions):
                 self.return_turn_end(graph.nodes[name], output)
             else:
                 pass
+
+    def is_client_output(
+        self, graph: SessionGraphRuntime, name: str, chunk: TimedChunk
+    ) -> bool:
+        """Whether a node output reaches the client: its format is published, it is no node control, and a report comes from a node no other node reads it from."""
+        event = control_type(chunk)
+        if not graph.graph.is_published(name, chunk.format) or event in NODE_CONTROLS:
+            return False
+        elif event in REPORT_CONTROLS:
+            return not graph.graph.reading_nodes(name, chunk.format)
+        else:
+            return True
 
     def time_graph_output(
         self, graph: SessionGraphRuntime, output: OutputChunk

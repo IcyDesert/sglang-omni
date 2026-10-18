@@ -14,6 +14,7 @@ from sglang_omni.serve.realtime.output import (
     OutputEvent,
     ResponseEvent,
     ResponseFinished,
+    ResponseProgress,
     ResponseStarted,
     ResponseStatus,
     TextDelta,
@@ -105,7 +106,10 @@ class OutputBuffer:
         modalities = (
             response_state.output_modalities if response_state is not None else None
         ) or output_modalities
-        if isinstance(event, (AudioDelta, AudioFinished)) and "audio" not in modalities:
+        if (
+            isinstance(event, (AudioDelta, ResponseProgress, AudioFinished))
+            and "audio" not in modalities
+        ):
             return
         elif isinstance(event, ResponseFinished) and "audio" not in modalities:
             event = replace(event, has_audio=False)
@@ -115,7 +119,14 @@ class OutputBuffer:
             self.start_response(event.response_id, modalities)
         elif isinstance(
             event,
-            (TextDelta, TextFinished, AudioDelta, AudioFinished, ResponseFinished),
+            (
+                TextDelta,
+                TextFinished,
+                AudioDelta,
+                ResponseProgress,
+                AudioFinished,
+                ResponseFinished,
+            ),
         ):
             response_state = self.responses.get(event.response_id)
             if response_state is None:

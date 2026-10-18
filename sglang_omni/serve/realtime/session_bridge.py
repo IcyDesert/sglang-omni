@@ -30,6 +30,7 @@ from sglang_omni.proto.streams import (
     INTERRUPT,
     PCM16,
     PCM_F32,
+    REPLY_PROGRESS,
     SESSION_CONTROL,
     SPEECH_STARTED,
     SPEECH_STOPPED,
@@ -52,6 +53,7 @@ from sglang_omni.serve.realtime.output import (
     InputTranscription,
     OutputEvent,
     ResponseFinished,
+    ResponseProgress,
     ResponseStarted,
     SpeechStarted,
     SpeechStopped,
@@ -185,6 +187,7 @@ class SessionBridge(InteractionAdapter):
             TURN_EMPTY: self.on_turn_empty,
             TURN_INTERRUPTED: partial(self.finish_response, "cancelled", "interrupted"),
             CONFIGURED: self.on_configured,
+            REPLY_PROGRESS: self.on_progress,
         }
         self.session_identity: SessionIdentity | None = None
         self.output_sink: OutputSink | None = None
@@ -203,6 +206,7 @@ class SessionBridge(InteractionAdapter):
         self.turn_count = 0
         self.response_id: str | None = None
         self.response_item_id = ""
+        self.response_turn: int | None = None
         self.response_text = ""
         self.has_audio = False
 
@@ -385,11 +389,12 @@ class SessionBridge(InteractionAdapter):
         self.is_user_item_open = True
         return self.user_item_id
 
-    def start_response(self) -> list[OutputEvent]:
+    def start_response(self, turn: int | None) -> list[OutputEvent]:
         if self.response_id is not None:
             return []
         else:
             self.response_id = f"resp_{self.turn_count}"
+            self.response_turn = turn
             self.response_item_id = f"item_{self.turn_count}"
             self.turn_count += 1
             self.response_text = ""
@@ -407,14 +412,14 @@ class SessionBridge(InteractionAdapter):
         return [InputTranscription(item_id, payload["text"], payload["is_final"])]
 
     def on_text_delta(self, output: OutputChunk) -> list[OutputEvent]:
-        events = self.start_response()
+        events = self.start_response(output.turn)
         text = output.payload["text"]
         self.response_text += text
         events.append(TextDelta(self.response_id, self.response_item_id, text))
         return events
 
     def on_audio(self, output: OutputChunk) -> list[OutputEvent]:
-        events = self.start_response()
+        events = self.start_response(output.turn)
         self.has_audio = True
         events.append(
             AudioDelta(
@@ -424,6 +429,19 @@ class SessionBridge(InteractionAdapter):
             )
         )
         return events
+
+    def on_progress(self, output: OutputChunk) -> list[OutputEvent]:
+        if self.response_id is not None and output.turn == self.response_turn:
+            return [
+                ResponseProgress(
+                    self.response_id,
+                    self.response_item_id,
+                    output.payload["text_end"],
+                    output.payload["audio_ms"],
+                )
+            ]
+        else:
+            return []
 
     def on_speech_started(self, output: OutputChunk) -> list[OutputEvent]:
         return [SpeechStarted(self.new_user_item(), output.payload["t_ms"])]
@@ -438,12 +456,12 @@ class SessionBridge(InteractionAdapter):
         return []
 
     def on_turn_started(self, output: OutputChunk) -> list[OutputEvent]:
-        return self.start_response()
+        return self.start_response(output.turn)
 
     def finish_response(
         self, status: str, reason: str, output: OutputChunk
     ) -> list[OutputEvent]:
-        events = self.start_response()
+        events = self.start_response(output.turn)
         ids = (self.response_id, self.response_item_id)
         events.append(TextFinished(*ids, self.response_text))
         if self.has_audio:
@@ -457,7 +475,7 @@ class SessionBridge(InteractionAdapter):
         return events
 
     def on_turn_empty(self, output: OutputChunk) -> list[OutputEvent]:
-        events = self.start_response()
+        events = self.start_response(output.turn)
         events.append(
             ResponseFinished(
                 self.response_id,

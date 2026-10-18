@@ -35,6 +35,15 @@ class AudioDelta(ResponseEvent):
 
 
 @dataclass(frozen=True)
+class ResponseProgress(ResponseEvent):
+    """The reply text's first text_end characters have audio, ending audio_ms after the reply's first sample."""
+
+    item_id: str
+    text_end: int
+    audio_ms: float
+
+
+@dataclass(frozen=True)
 class AudioFinished(ResponseEvent):
     item_id: str
 
@@ -84,6 +93,7 @@ OutputEvent = (
     | TextDelta
     | TextFinished
     | AudioDelta
+    | ResponseProgress
     | AudioFinished
     | ResponseFinished
     | TurnFailure

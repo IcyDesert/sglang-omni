@@ -11,6 +11,7 @@ import pytest
 from sglang_omni.serve.realtime.negotiation import SessionNegotiation
 from sglang_omni.serve.realtime.output import (
     InputTranscription,
+    ResponseProgress,
     SpeechStarted,
     SpeechStopped,
 )
@@ -129,6 +130,18 @@ def test_speech_and_transcription_events_project_to_openai_names():
         "item_id": "item_user_0",
         "content_index": 0,
         "transcript": "hi there",
+    }
+
+
+def test_reply_progress_projects_to_a_response_event():
+    assert project_output(ResponseProgress("resp_0", "item_0", 4, 500.0)) == {
+        "type": "sglang.response.progress",
+        "response_id": "resp_0",
+        "item_id": "item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "text_end": 4,
+        "audio_ms": 500.0,
     }
 
 
