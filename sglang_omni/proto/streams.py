@@ -49,6 +49,8 @@ TURN_INTERRUPTED = "turn.interrupted"  # the reply stopped before its end
 CONFIGURED = "configured"  # {"nodes": {name: kind}}
 # {"words": int, "audio_ms": float}; reply audio produced so far
 REPLY_PROGRESS = "reply.progress"
+# Controls between nodes; a graph delivers them to readers and control edges, never to the client.
+NODE_CONTROLS = frozenset({REPLY_PROGRESS})
 
 
 def control_type(chunk: TimedChunk | OutputChunk) -> str | None:

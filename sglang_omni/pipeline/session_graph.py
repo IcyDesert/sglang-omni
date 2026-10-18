@@ -36,6 +36,7 @@ from sglang_omni.proto.streams import (
     AUDIO,
     AUDIO_FORMATS,
     INTERRUPT,
+    NODE_CONTROLS,
     SPEECH_STARTED,
     SPEECH_STOPPED,
     TURN_DONE,
@@ -466,7 +467,10 @@ class SessionGraphRunner(CoordinatorSessions):
                 continue
             else:
                 pass
-            is_published = graph.graph.is_published(name, output.format)
+            is_published = (
+                graph.graph.is_published(name, output.format)
+                and control_type(chunk) not in NODE_CONTROLS
+            )
             if is_published and graph.graph.shared_timeline:
                 output = self.time_graph_output(graph, output)
                 chunk = output_chunk(output)

@@ -751,6 +751,30 @@ async def test_a_node_merges_the_clocks_of_its_sources(tmp_path):
         await coordinator.close_session(identity)
 
 
+@pytest.mark.asyncio
+async def test_a_node_control_reaches_its_readers_but_never_the_client(tmp_path):
+    async with pipeline(tmp_path, names=NODES) as (coordinator, events, _):
+        coordinator.session_graph = SessionGraph(
+            nodes={
+                "left": SessionNode(stages=("left",), inputs=("input",)),
+                "right": SessionNode(stages=("right",), inputs=("left:session",)),
+            },
+            publish={"left": ("session",)},
+        )
+        identity = await coordinator.open_session(
+            OmniRequest(None, {"emit_control": "reply.progress"})
+        )
+        outputs = coordinator.session_outputs(identity)
+        await coordinator.append_session(identity, chunk(0))
+        received = await collect(outputs, 1)
+        assert [item.kind for item in received] == ["input_done"]
+        await wait_until(
+            lambda: ("append", "right", f"{identity.id}:right", 0) in event_log(events)
+        )
+        await coordinator.close_session(identity)
+        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
+
+
 class NodeOutputsRunner(SessionGraphRunner):
     """Graph routing over one node whose outputs are given; node controls are recorded."""
 
