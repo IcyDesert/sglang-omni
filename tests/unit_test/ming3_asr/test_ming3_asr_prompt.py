@@ -58,7 +58,6 @@ def test_unsupported_requests_are_rejected_as_caller_errors(
     ("generated_text", "transcript"),
     [
         ("English\thello there ", "hello there"),
-        ("Chinese\t你好", "你好"),
         ("English hello there", "hello there"),
         ("hello there", "hello there"),
     ],

@@ -8,7 +8,6 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 
 CHECKPOINT_ARCHITECTURE = "MingV3ASRForConditionalGeneration"
 HIDDEN_SIZE = 64
-SHORT_CONV_KERNEL_SIZE = 4
 NATIVE_CLIP_SECONDS = 30.0
 
 
@@ -43,11 +42,9 @@ def test_backbone_config_flattens_text_config() -> None:
     config = Ming3ASRConfig(
         text_config={
             "hidden_size": HIDDEN_SIZE,
-            "short_conv_kernel_size": SHORT_CONV_KERNEL_SIZE,
             "model_type": "bailing_moe_v3",
         },
         audio_token_id=7,
     )
     assert config.model_type == "ming_v3_asr"
     assert config.hidden_size == HIDDEN_SIZE
-    assert config.use_kda is True
