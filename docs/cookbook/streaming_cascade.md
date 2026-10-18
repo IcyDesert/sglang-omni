@@ -30,6 +30,7 @@ One command starts everything: the profile's `services` are started in order and
 | --- | --- |
 | `qwen3-asr-qwen3.8-27b-customvoice` | Qwen3-ASR, Qwen3.8-27B with thinking off and Qwen3-TTS CustomVoice with the built-in speaker `Vivian`, on two GPUs |
 | `qwen3-asr-qwen3-tts-customvoice` | The same with Qwen3-4B as the language model, on one GPU |
+| `qwen3-asr-qwen3-tts-base-clone` | The same with Qwen3-TTS Base speaking in a voice cloned from `reference_zh.wav`, a Chinese recording in the profile's directory; `reference_audio_path` and `reference_text` of the `tts` node select another recording |
 | `nemotron-qwen3-tts` | Nemotron 3.5 streaming ASR as a service on port 8001, Qwen3-4B and Qwen3-TTS Base with a cloned voice on port 8004 |
 | `nemotron-stage-qwen3-tts` | The same, with Nemotron 3.5 ASR running inside this server instead of as a service |
 
