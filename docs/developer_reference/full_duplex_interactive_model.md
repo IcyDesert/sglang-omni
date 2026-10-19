@@ -431,6 +431,8 @@ Streams one chat completion from `<base_url>/chat/completions` per turn.
 
 Cuts the reply text into sentences and sends one streaming request per sentence to `<base_url>/audio/speech` with `model`, `voice`, `input`, `response_format: pcm`, `stream: true`, `language` when `language` is set, and `references: [{audio_path, text}]` when `reference_audio_path` is set. A sentence ends after a word ending in `.`, `!`, `?`, `;` or `…` (closing quotes and brackets included), after `max_sentence_words` words, after Chinese end punctuation followed by more text, or at a line end.
 
+`openai_speech` sends each sentence without its emoji, asterisks and backticks, and a markdown link as its text alone, because a speech service reads them as stray sounds or a spelled-out URL. A sentence with no word left, such as one of only emoji or punctuation, is not sent because the speech service answers it with an error, and its end still counts in `reply.progress`. The reply text and the `reply.progress` offsets keep everything the model wrote. The profiles' system prompts also tell the language model to use neither markdown nor emoji.
+
 | Option | Type | Default | Effect |
 | --- | --- | --- | --- |
 | `base_url` | string, `http://` or `https://` | required | The service, including `/v1`. |

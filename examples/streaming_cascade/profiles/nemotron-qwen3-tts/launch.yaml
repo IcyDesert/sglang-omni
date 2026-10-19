@@ -32,7 +32,7 @@ session_nodes:
       - "input:session"
       - {kind: control, source: input, event: interrupt}
       - {kind: control, source: aligner, event: reply.progress}
-    system_prompt: You are a helpful voice assistant. Answer in one spoken sentence of at most 25 words, in the language the user speaks. Do not use markdown.
+    system_prompt: You are a helpful voice assistant. Answer in one spoken sentence of at most 25 words, in the language the user speaks. Do not use markdown or emoji.
   llm:
     kind: openai_chat
     inputs:

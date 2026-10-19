@@ -2,6 +2,7 @@
 """Synthesizer kinds: reply audio from the reply text."""
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from typing import Literal
 
@@ -31,6 +32,12 @@ from sglang_omni.proto.streams import (
     control_type,
 )
 from sglang_omni.scheduling.session import ChunkEmitter
+
+# Note (ruoyu): Qwen3-TTS reads an emoji as stray syllables or runs on for minutes and spells out a link target.
+MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+UNSPOKEN_SYMBOLS = re.compile(
+    "[\U0001f000-\U0001faff\u2600-\u27bf\u2b50\u2b55\ufe0e\ufe0f\u200d\u20e3*`]"
+)
 
 
 class OpenAISpeechSynthesizerConfig(ComponentConfig):
@@ -213,8 +220,11 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
         async for span in sentences(
             self.follow_language(deltas), self.config.max_sentence_words
         ):
-            sentence = " ".join(span.split())
-            if sentence:
+            sentence = " ".join(
+                UNSPOKEN_SYMBOLS.sub("", MARKDOWN_LINK.sub(r"\1", span)).split()
+            )
+            # Note (ruoyu): Qwen3-TTS answers 500 to a sentence with no word in it, which would close the session.
+            if re.search(r"\w", sentence):
                 async for samples in self.speak(sentence):
                     audio_ms += len(samples) * 1000 / self.sample_rate_hz
                     emit(audio_chunk(samples, self.sample_rate_hz, turn))
