@@ -47,22 +47,33 @@ FetchContent_Declare(
 set(BUILD_SHARED_LIBS OFF)
 FetchContent_MakeAvailable(nlohmann_json pcre2 civetweb)
 
-add_library(qwen3_asr STATIC
+add_library(common STATIC
   src/common/audio.cpp
+  src/common/form.cpp
   src/common/layers.cpp
+  src/common/npz.cpp
+  src/common/tokenizer.cpp)
+target_include_directories(common PUBLIC src)
+target_link_libraries(common PUBLIC mlx nlohmann_json::nlohmann_json pcre2-8-static
+  "-framework CoreFoundation")
+target_compile_options(common PUBLIC ${MLX_CXX_FLAGS} PRIVATE -Wall -Wextra)
+# Note (Jiaxin Deng): npz keeps the no-fused-multiply-add rounding it was built
+# with as part of whisper_asr.
+set_source_files_properties(src/common/npz.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+
+add_library(qwen3_asr STATIC
   src/qwen3_asr/qwen3_asr_model.cpp
   src/qwen3_asr/qwen3_decoder.cpp
-  src/common/tokenizer.cpp
   src/qwen3_asr/qwen3_asr_transcriber.cpp
   src/qwen3_asr/worker.cpp
-  src/qwen3_asr/realtime.cpp
-  src/common/form.cpp)
-target_include_directories(qwen3_asr PUBLIC src)
-target_link_libraries(qwen3_asr PUBLIC mlx nlohmann_json::nlohmann_json pcre2-8-static
-  "-framework CoreFoundation")
-target_compile_options(qwen3_asr PUBLIC ${MLX_CXX_FLAGS} PRIVATE -Wall -Wextra)
+  src/qwen3_asr/realtime.cpp)
+target_link_libraries(qwen3_asr PUBLIC common)
+target_compile_options(qwen3_asr PRIVATE -Wall -Wextra)
 
-add_library(silero_vad STATIC src/silero_vad/silero_vad.cpp)
+add_library(silero_vad STATIC src/silero_vad/silero_vad.cpp src/silero_vad/speech_segments.cpp)
+# Note (Jiaxin Deng): speech_segments keeps the no-fused-multiply-add rounding
+# it was built with as part of cohere_asr.
+set_source_files_properties(src/silero_vad/speech_segments.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 target_include_directories(silero_vad PUBLIC src)
 target_link_libraries(silero_vad PUBLIC qwen3_asr)
 target_compile_options(silero_vad PUBLIC ${MLX_CXX_FLAGS} PRIVATE -Wall -Wextra)
@@ -113,10 +124,9 @@ endforeach()
 # its parity tool. Both reuse the WAV decoder, form parser and byte-level
 # tokenizer above.
 add_library(swift_port STATIC src/common/swift_port.cpp)
-target_include_directories(swift_port PRIVATE src)
+target_include_directories(swift_port PUBLIC src)
 target_link_libraries(swift_port PUBLIC mlx)
-add_library(whisper_asr STATIC src/whisper/whisper_model.cpp src/whisper/whisper_transcriber.cpp
-  src/whisper/npz.cpp)
+add_library(whisper_asr STATIC src/whisper/whisper_model.cpp src/whisper/whisper_transcriber.cpp)
 target_link_libraries(whisper_asr PUBLIC qwen3_asr swift_port)
 # Note (khazic): CPU float math rounds each operation, as Swift does: no fused multiply-add.
 target_compile_options(swift_port PRIVATE -Wall -Wextra -ffp-contract=off)
@@ -132,8 +142,7 @@ install(TARGETS whisper_server whisper_transcribe RUNTIME DESTINATION bin)
 
 # Note (khazic): Cohere Transcribe: cohere_transcribe_server, with qwen3_asr_server's API
 # without realtime, and its parity tool; Silero VAD cuts long audio at speech.
-add_library(cohere_asr STATIC src/cohere/cohere_model.cpp src/cohere/cohere_transcriber.cpp
-  src/silero_vad/speech_segments.cpp)
+add_library(cohere_asr STATIC src/cohere/cohere_model.cpp src/cohere/cohere_transcriber.cpp)
 target_link_libraries(cohere_asr PUBLIC qwen3_asr swift_port silero_vad)
 # Note (khazic): CPU float math rounds each operation, as Swift does: no fused multiply-add.
 target_compile_options(cohere_asr PRIVATE -Wall -Wextra -ffp-contract=off)

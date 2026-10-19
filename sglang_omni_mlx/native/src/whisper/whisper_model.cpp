@@ -6,9 +6,9 @@
 #include <fstream>
 #include <stdexcept>
 
+#include "common/npz.h"
 #include "common/swift_port.h"
 #include "nlohmann/json.hpp"
-#include "whisper/npz.h"
 
 namespace whisper {
 

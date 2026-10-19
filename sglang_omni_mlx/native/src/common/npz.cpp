@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "whisper/npz.h"
+#include "common/npz.h"
 
 #include <fcntl.h>
 #include <unistd.h>
