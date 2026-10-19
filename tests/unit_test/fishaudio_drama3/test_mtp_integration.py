@@ -648,9 +648,7 @@ def test_streamed_and_result_frames_stay_on_cpu_under_another_default_device() -
     assert isinstance(result, Drama3GenerationResult)
     for frames in (message.data.T, result.frames):
         assert (frames.device.type, frames.dtype) == ("cpu", torch.int64)
-        assert frames.tolist() == [
-            sampled_row(frame_index) for frame_index in range(4)
-        ]
+        assert frames.tolist() == [sampled_row(frame_index) for frame_index in range(4)]
 
 
 def admitted_for_prefill(data: Drama3RequestData, start: int, end: int) -> None:
