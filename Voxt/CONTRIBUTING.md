@@ -13,11 +13,11 @@ Please read this guide before opening an issue or pull request. For security vul
 
 ## Development environment
 
-Voxt is a Swift macOS menu bar app. The project currently targets macOS 26.2 or later and uses the shared `Voxt` Xcode scheme.
+Voxt is a Swift macOS menu bar app. The project currently targets macOS 15.0 or later and uses the shared `Voxt` Xcode scheme.
 
 You will need:
 
-- A Mac running macOS 26.2 or later.
+- A Mac running macOS 15.0 or later.
 - Xcode with Swift and macOS development support. CI currently runs with Xcode 26.5.
 - Git and network access for Swift package dependencies.
 
