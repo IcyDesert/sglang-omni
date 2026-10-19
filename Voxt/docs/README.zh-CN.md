@@ -8,10 +8,9 @@ MacOS 语音输入与翻译工具，支持不同应用和网址文本增强。�
 
 [English](../README.md) · **简体中文** · [反馈问题][github-issues-link]
 
-[![][github-release-shield]][github-release-link]
-[![][macos-version-shield]][macos-version-link]
+![macOS 支持版本][macos-version-shield]
 [![][license-shield]][license-link]
-[![][release-date-shield]][release-date-link]
+[Voxt v1.16.0 Release][github-release-link]
 
 <img width="2594" height="1676" alt="Xnip2026-07-15_21-43-50" src="https://github.com/user-attachments/assets/cbb3499f-3dd2-4393-b0e5-d5688e129d19" />
 
@@ -47,7 +46,7 @@ MacOS 语音输入与翻译工具，支持不同应用和网址文本增强。�
 
 - [官网](https://voxt.actnow.dev)
 - [官网下载](https://voxt.actnow.dev/api/app/download)
-- [安装包](https://github.com/hehehai/voxt/releases/latest)
+- [Voxt v1.16.0 Release](https://github.com/sgl-project/sglang-omni/releases/tag/voxt-v1.16.0)
 
 - 使用 Homebrew:
 
@@ -66,12 +65,8 @@ Apache 2.0. See [LICENSE](../LICENSE).
 
 
 [back-to-top]: https://img.shields.io/badge/-BACK_TO_TOP-151515?style=flat-square
-[github-issues-link]: https://github.com/hehehai/voxt/issues/new/choose
-[github-release-link]: https://github.com/hehehai/voxt/releases/latest
-[macos-version-link]: https://github.com/hehehai/voxt/releases/latest
+[github-issues-link]: https://github.com/sgl-project/sglang-omni/issues/new/choose
+[github-release-link]: https://github.com/sgl-project/sglang-omni/releases/tag/voxt-v1.16.0
 [license-link]: ../LICENSE
-[release-date-link]: https://github.com/hehehai/voxt/releases/latest
-[github-release-shield]: https://img.shields.io/github/v/release/hehehai/voxt?label=release&labelColor=000000&color=3fb950&style=flat-square&logo=github&logoColor=white
 [macos-version-shield]: https://img.shields.io/badge/macOS-15.0%2B-58a6ff?style=flat-square&labelColor=000000&logo=apple&logoColor=white
 [license-shield]: https://img.shields.io/badge/License-Apache%202.0-58a6ff.svg?style=flat-square&labelColor=000000&logo=apache&logoColor=white
-[release-date-shield]: https://img.shields.io/github/release-date/hehehai/voxt?style=flat-square&labelColor=000000&color=58a6ff&logo=github&logoColor=white
