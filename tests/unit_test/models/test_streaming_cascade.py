@@ -604,6 +604,70 @@ async def test_openai_speech_reports_each_sentence_end_as_a_character_offset(bac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "expected_spoken"),
+    [
+        pytest.param("太好了😄，祝你开心！🎉", ["太好了，祝你开心！"], id="emoji"),
+        pytest.param(
+            "哈哈😂😂，好！👍🏽✨", ["哈哈，好！"], id="skin_tone_and_symbols"
+        ),
+        pytest.param("加油\u2764\ufe0f！", ["加油！"], id="variation_selector"),
+        pytest.param(
+            "Great job! 🎉👨\u200d👩\u200d👧 See you.",
+            ["Great job!", "See you."],
+            id="joined_emoji",
+        ),
+        pytest.param("**重点**是多喝水。", ["重点是多喝水。"], id="emphasis"),
+        pytest.param(
+            "Run `pip install` and read [the docs](https://example.com).",
+            ["Run pip install and read the docs."],
+            id="code_and_link",
+        ),
+        pytest.param(
+            "今天最高25℃，体感20°。", ["今天最高25℃，体感20°。"], id="unit_symbols_stay"
+        ),
+    ],
+)
+async def test_openai_speech_sends_only_the_spoken_words_to_the_speech_service(
+    backends, reply, expected_spoken
+):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    await drain(
+        build({**tts, "max_sentence_words": 24}),
+        [text_chunk(reply, 1), control_chunk(TURN_DONE, turn=1)],
+    )
+    assert spoken == expected_spoken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wordless_sentence",
+    [
+        pytest.param("😄😄", id="only_emoji"),
+        pytest.param("🎉！", id="emoji_and_punctuation"),
+        pytest.param("!?", id="only_punctuation"),
+    ],
+)
+async def test_openai_speech_skips_a_sentence_without_words_but_still_reports_its_end(
+    backends, wordless_sentence
+):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    outputs = await drain(
+        build({**tts, "max_sentence_words": 24}),
+        [
+            text_chunk("好的。", 1),
+            text_chunk(wordless_sentence, 1),
+            control_chunk(TURN_DONE, turn=1),
+        ],
+    )
+    sentence_ms = 3 * 1000 / 24000
+    assert spoken == ["好的。"]
+    assert spoken_progress(outputs) == [(3, sentence_ms), (5, sentence_ms)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backends", ["english_tts"], indirect=True)
 async def test_openai_speech_tags_each_sentence_with_its_language(backends):
     settings, _, spoken, _ = backends
