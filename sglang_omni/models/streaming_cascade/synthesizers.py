@@ -23,7 +23,6 @@ from sglang_omni.models.streaming_cascade.base import (
     replying,
     sentences,
 )
-from sglang_omni.models.streaming_cascade.speakable import speakable_text
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.proto.streams import (
     REPLY_PROGRESS,
@@ -33,6 +32,12 @@ from sglang_omni.proto.streams import (
     control_type,
 )
 from sglang_omni.scheduling.session import ChunkEmitter
+
+# Note (ruoyu): Qwen3-TTS reads an emoji as stray syllables or runs on for minutes and spells out a link target.
+MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+UNSPOKEN_SYMBOLS = re.compile(
+    "[\U0001f000-\U0001faff\u2600-\u27bf\u2b50\u2b55\ufe0e\ufe0f\u200d\u20e3*`]"
+)
 
 
 class OpenAISpeechSynthesizerConfig(ComponentConfig):
@@ -215,7 +220,9 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
         async for span in sentences(
             self.follow_language(deltas), self.config.max_sentence_words
         ):
-            sentence = " ".join(speakable_text(span)[0].split())
+            sentence = " ".join(
+                UNSPOKEN_SYMBOLS.sub("", MARKDOWN_LINK.sub(r"\1", span)).split()
+            )
             # Note (ruoyu): Qwen3-TTS answers 500 to a sentence with no word in it, which would close the session.
             if re.search(r"\w", sentence):
                 async for samples in self.speak(sentence):
