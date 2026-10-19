@@ -21,14 +21,12 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.utils.hf import try_resolve_ming3_dense_tts
 
 TINY_ARCHITECTURE = "LingV3TTSForConditionalGeneration"
-DENSE_SNAPSHOT = (
-    "/data/zhaochenyang20/home/hf-cache/hub/models--inclusionAI--Ming-3.0-tts-0.5B/"
-    "snapshots/e5bd8da31ecf1b9276cdbdda821fa891068f1368"
-)
-TINY_SNAPSHOT = (
-    "/data/zhaochenyang20/home/hf-cache/hub/models--inclusionAI--Ming-3.0-tts-tiny/"
-    "snapshots/fe39337f33061c39b8863eb101e6754df257892c"
-)
+MING_OMNI_ARCHITECTURE = "BailingMMNativeForConditionalGeneration"
+
+
+def _write_config(directory: Path, payload: dict[str, object]) -> str:
+    (directory / "config.json").write_text(json.dumps(payload))
+    return str(directory)
 
 
 class TokenTokenizer:
@@ -53,20 +51,33 @@ class TokenTokenizer:
         return token_ids
 
 
-def test_tiny_architecture_still_resolves_to_the_ming3_pipeline() -> None:
+def test_tiny_architecture_still_resolves_to_the_ming3_pipeline(tmp_path: Path) -> None:
+    checkpoint = _write_config(
+        tmp_path,
+        {"architectures": [TINY_ARCHITECTURE], "model_type": "lingv3_tts"},
+    )
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config(TINY_ARCHITECTURE) is Ming3TTSPipelineConfig
     )
-    assert resolve_config_cls_for_model_path(TINY_SNAPSHOT) is Ming3TTSPipelineConfig
+    assert resolve_config_cls_for_model_path(checkpoint) is Ming3TTSPipelineConfig
 
 
-def test_dense_checkpoint_resolves_to_the_same_pipeline() -> None:
-    assert try_resolve_ming3_dense_tts(DENSE_SNAPSHOT) == DENSE_ARCHITECTURE
+def test_dense_checkpoint_resolves_to_the_same_pipeline(tmp_path: Path) -> None:
+    checkpoint = _write_config(
+        tmp_path,
+        {
+            "architectures": [MING_OMNI_ARCHITECTURE],
+            "model_type": "dense",
+            "ditar_config": {},
+            "audio_tokenizer_config": {},
+        },
+    )
+    assert try_resolve_ming3_dense_tts(checkpoint) == DENSE_ARCHITECTURE
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config(DENSE_ARCHITECTURE)
         is Ming3TTSPipelineConfig
     )
-    assert resolve_config_cls_for_model_path(DENSE_SNAPSHOT) is Ming3TTSPipelineConfig
+    assert resolve_config_cls_for_model_path(checkpoint) is Ming3TTSPipelineConfig
 
 
 def test_ming_omni_layout_is_not_treated_as_dense_tts(tmp_path: Path) -> None:
@@ -74,7 +85,7 @@ def test_ming_omni_layout_is_not_treated_as_dense_tts(tmp_path: Path) -> None:
     config_path.write_text(
         json.dumps(
             {
-                "architectures": ["BailingMMNativeForConditionalGeneration"],
+                "architectures": [MING_OMNI_ARCHITECTURE],
                 "model_type": "bailingmm",
             }
         )
