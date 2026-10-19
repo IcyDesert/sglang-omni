@@ -158,11 +158,28 @@ def test_the_vad_stage_is_its_own_process():
     assert SESSION_PORTS.hot_settings == {"turn_detection"}
     declared = stage.model_dump()
     tuned = VADStageConfig.model_validate(
-        {**declared, "factory": {"silence_duration_ms": 800}}
+        {**declared, "factory": {"silence_duration_ms": 1200}}
     )
-    assert tuned.factory.silence_duration_ms == 800
+    assert tuned.factory.silence_duration_ms == 1200
     with pytest.raises(ValueError, match="threshold"):
         VADStageConfig.model_validate({**declared, "factory": {"threshold": 1.5}})
+
+
+@pytest.mark.parametrize(
+    "factory, silence_duration_ms",
+    [
+        ({}, 800),
+        ({"threshold": 0.6}, 800),
+        ({"silence_duration_ms": 500}, 500),
+    ],
+)
+def test_the_vad_stage_waits_800_ms_of_silence_unless_its_factory_sets_another(
+    factory, silence_duration_ms
+):
+    stage = VADStageConfig.model_validate(
+        {**vad_stage().model_dump(), "factory": factory}
+    )
+    assert stage.factory.silence_duration_ms == silence_duration_ms
 
 
 def test_a_null_turn_detection_turns_the_detector_off_until_a_later_configure():
