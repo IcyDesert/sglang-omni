@@ -121,3 +121,60 @@ response = requests.post(
 response.raise_for_status()
 open("cloned.wav", "wb").write(response.content)
 ```
+
+## Ming-3.0-tts-0.5B
+
+[Ming-3.0-tts-0.5B](https://huggingface.co/inclusionAI/Ming-3.0-tts-0.5B) uses the same speech endpoint and the same one-GPU launch. Its backbone is dense Qwen2.5-0.5B rather than the Ling V3 mixture-of-experts backbone above. Leaving out `ref_audio` follows the checkpoint's text-to-speech layout and inserts no speaker token. A reference recording supplies the CAM++ speaker embedding, and `ref_text` is the transcript of that recording. The server encodes the recording into prompt latents only when `ref_text` is present. The checkpoint temperature is 0.
+
+```bash
+sgl-omni serve --model-path inclusionAI/Ming-3.0-tts-0.5B
+```
+
+1. Use curl
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inclusionAI/Ming-3.0-tts-0.5B",
+    "input": "Get the trust fund to the bank early.",
+    "response_format": "wav",
+    "seed": 123
+  }' \
+  --output speech-0.5b.wav
+```
+
+2. Use Python
+
+```python
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:8000/v1/audio/speech",
+    json={
+        "model": "inclusionAI/Ming-3.0-tts-0.5B",
+        "input": "Get the trust fund to the bank early.",
+        "response_format": "wav",
+        "seed": 123,
+    },
+    timeout=180,
+)
+response.raise_for_status()
+open("speech-0.5b.wav", "wb").write(response.content)
+```
+
+Voice cloning passes the reference clip and its transcript. A second reference is rejected.
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inclusionAI/Ming-3.0-tts-0.5B",
+    "input": "Get the trust fund to the bank early.",
+    "ref_audio": "tests/data/query_to_cars.wav",
+    "ref_text": "how many cars are there in the picture",
+    "response_format": "wav",
+    "seed": 123
+  }' \
+  --output cloned-0.5b.wav
+```
