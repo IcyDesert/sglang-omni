@@ -24,7 +24,7 @@ TINY_ARCHITECTURE = "LingV3TTSForConditionalGeneration"
 MING_OMNI_ARCHITECTURE = "BailingMMNativeForConditionalGeneration"
 
 
-def _write_config(directory: Path, payload: dict[str, object]) -> str:
+def write_config(directory: Path, payload: dict[str, object]) -> str:
     (directory / "config.json").write_text(json.dumps(payload))
     return str(directory)
 
@@ -52,7 +52,7 @@ class TokenTokenizer:
 
 
 def test_tiny_architecture_still_resolves_to_the_ming3_pipeline(tmp_path: Path) -> None:
-    checkpoint = _write_config(
+    checkpoint = write_config(
         tmp_path,
         {"architectures": [TINY_ARCHITECTURE], "model_type": "lingv3_tts"},
     )
@@ -63,7 +63,7 @@ def test_tiny_architecture_still_resolves_to_the_ming3_pipeline(tmp_path: Path) 
 
 
 def test_dense_checkpoint_resolves_to_the_same_pipeline(tmp_path: Path) -> None:
-    checkpoint = _write_config(
+    checkpoint = write_config(
         tmp_path,
         {
             "architectures": [MING_OMNI_ARCHITECTURE],
