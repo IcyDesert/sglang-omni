@@ -110,9 +110,7 @@ def capabilities_of(ports: SessionPorts) -> Capabilities:
         ),
         output_modalities=output_modalities,
         max_granted_modalities=len(output_modalities),
-        turn_control=(
-            ("server_vad", None) if "turn_detection" in ports.hot_settings else (None,)
-        ),
+        turn_control=(*ports.turn_detection_types, None),
         native_unit_ms=ports.unit_ms,
         tail_policy="flush",
         input_modalities=ports.input_modalities,

@@ -101,7 +101,9 @@ class SessionGraphRunner(CoordinatorSessions):
         turn's chunks from other nodes, and a later chunk of the turn no
         longer enters the inbox; the target's pacer drops the turn's output
         and tells the target's readers how much of the turn's audio it had
-        handed to the client. The client's own input stays.
+        handed to the client. A preempting interrupt also names the turn's
+        appends already sent, and every owner of the target aborts them. The
+        client's own input stays.
         """
         if control_type(event) == INTERRUPT and event.turn is not None:
             graph.interrupted_turns.setdefault(target, set()).add(event.turn)
@@ -134,11 +136,31 @@ class SessionGraphRunner(CoordinatorSessions):
             return
         else:
             pass
+        should_preempt = edge.should_preempt or should_preempt
+        if (
+            should_preempt
+            and control_type(event) == INTERRUPT
+            and event.turn is not None
+        ):
+            node = self.sessions[graph.nodes[target].id]
+            # Note (Junnan Li): An append of the turn still being submitted is named once it is out, so no owner meets it after the control without its name.
+            while node.in_flight_append == "accepted" and not node.is_closing:
+                node.wake.clear()
+                await node.wake.wait()
+            preempted_request_ids = tuple(
+                request_id
+                for request_id, chunk in node.submitted_appends.items()
+                if chunk.turn == event.turn
+                and chunk.seq not in graph.client_sequences[target]
+            )
+        else:
+            preempted_request_ids = ()
         await self.control_session(
             graph.nodes[target],
             event,
-            should_preempt=edge.should_preempt or should_preempt,
+            should_preempt=should_preempt,
             is_ordered=edge.source == GRAPH_INPUT,
+            preempted_request_ids=preempted_request_ids,
         )
 
     async def report_delivered(
@@ -222,7 +244,6 @@ class SessionGraphRunner(CoordinatorSessions):
                     ),
                     session_id=f"{session_id}:{name}",
                     is_node=True,
-                    execution=node.execution,
                 )
         except BaseException:
             for identity in reversed(list(nodes.values())):

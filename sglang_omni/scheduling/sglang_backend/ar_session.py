@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
+import torch
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -21,7 +22,6 @@ from sglang_omni.admission import (
     REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV,
     QueueFullError,
 )
-from sglang_omni.profiler.event_recorder import get_active_stage
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     SessionIdentity,
@@ -132,11 +132,31 @@ class ARSessionAdapter:
         """Select a fresh model turn or relay a unit that needs no generation."""
         return ARSessionPreparation()
 
+    def complete_without_generation(
+        self,
+        session_identity: SessionIdentity,
+        chunk: TimedChunk,
+        payload: StagePayload,
+    ) -> StagePayload:
+        """The result of a unit its model cannot generate for."""
+        return payload
+
     def finish_input(
         self, session_identity: SessionIdentity, payload: StagePayload
     ) -> StagePayload | None:
         """Return a relayed EOS payload, or None to use normal generation."""
         return None
+
+    def bind_request(
+        self,
+        session_identity: SessionIdentity,
+        request_data: SGLangARRequestData,
+        unit: "SessionUnit",
+    ) -> None:
+        """Attach model-specific inputs to the native request once retained turns precede the unit's ids."""
+
+    def on_abort(self, session_identity: SessionIdentity, unit: "SessionUnit") -> None:
+        """Take what an aborted unit generated before its native request is dropped."""
 
     def build(
         self,
@@ -178,9 +198,13 @@ class SessionUnit:
     # SGLang Req. create_req builds it from token ids produced from the OmniRequest, joins tokens
     # from earlier turns, and binds it to the streaming session.
     session_request: Req | None = None
+    # Note (Junnan Li): A deferred payload passes through routing again; the unit is prepared once.
+    is_prepared: bool = False
     is_enqueued: bool = False
     # note (Junnan Li): Only completed units commit their spans to retained history.
     embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
+    native_offset: int = 0
+    prompt_length: int = 0
 
 
 @dataclass(kw_only=True)
@@ -287,6 +311,10 @@ class ARSessionBridge:
                 return session.unit
 
     def prepare_unit(self, unit: SessionUnit, payload: StagePayload) -> bool:
+        if unit.is_prepared:
+            return False
+        else:
+            unit.is_prepared = True
         preparation = self.adapter.prepare_unit(
             unit.session_identity, unit.chunk, payload
         )
@@ -336,15 +364,27 @@ class ARSessionBridge:
             adapter_request.rid == payload.request_id
         ), f"session adapter changed request ID: expected {payload.request_id}, got {adapter_request.rid}"
         if (
-            request_data.prefill_input_embeds is not None
-            or request_data.decode_input_embeds
-            or request_data.input_embeds_are_projected
-            or adapter_request.input_embeds is not None
+            adapter_request.input_embeds is not None
             or adapter_request.multimodal_inputs is not None
         ):
             raise ValueError(
-                "history-aware session embedding and multimodal inputs are not supported"
+                "a session unit carries its embeddings as spans, not as input_embeds or multimodal inputs"
             )
+        elif request_data.prefill_input_embeds is not None:
+            prompt = request_data.prefill_input_embeds
+            if request_data.unit_embedding_spans or int(prompt.shape[0]) != len(
+                adapter_request.origin_input_ids
+            ):
+                raise ValueError(
+                    "a projected prompt is the unit's one span and covers all of its ids"
+                )
+            else:
+                request_data.unit_embedding_spans = [
+                    EmbeddingSpan(
+                        start=0, end=int(prompt.shape[0]), input_embeds=prompt
+                    )
+                ]
+                request_data.prefill_input_embeds = None
         else:
             pass
         native_session = self.bridge_scheduler.session_controller.get(
@@ -392,6 +432,8 @@ class ARSessionBridge:
         offset = len(session_request.origin_input_ids) - len(
             adapter_request.origin_input_ids
         )
+        unit.native_offset = offset
+        unit.prompt_length = len(adapter_request.origin_input_ids)
         unit.embedding_spans = [
             EmbeddingSpan(
                 start=span.start + offset,
@@ -416,11 +458,17 @@ class ARSessionBridge:
             adapter_request, "_omni_prompt_cache_key", None
         )  # noqa: leading-underscore
         request_data.req = session_request
-        request_data.stage_payload = payload
+        if request_data.stage_payload is None:
+            request_data.stage_payload = payload
+        else:
+            # Note (Junnan Li): An adapter that rewrote the unit's request keeps its payload; the stream builder reads the params from it.
+            pass
+        self.adapter.bind_request(unit.session_identity, request_data, unit)
 
     def release_append_unit(self, request_id: str) -> None:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
+            self.adapter.on_abort(unit.session_identity, unit)
             streaming_session = self.bridge_scheduler.session_controller.get(
                 unit.session_identity.id
             )
@@ -572,32 +620,45 @@ class ARSessionBridge:
         should_flush: bool = False,
     ) -> Iterable[OutgoingMessage]:
         unit = self.units_by_request_id[request_id]
-        if get_active_stage() != unit.stages[-1]:
-            return
+        if should_flush:
+            chunks = self.adapter.flush(unit.session_identity, request_data)
         else:
-            if should_flush:
-                chunks = self.adapter.flush(unit.session_identity, request_data)
-            else:
-                assert (
-                    output is not None
-                ), f"session stream {request_id} requires request output"
-                chunks = self.adapter.stream(
-                    unit.session_identity, request_data, output
-                )
-            for chunk in chunks:
-                yield OutgoingMessage(
-                    request_id=request_id,
-                    type="stream",
-                    data=chunk.to_dict(),
-                    metadata={"modality": chunk.modality},
-                )
+            assert (
+                output is not None
+            ), f"session stream {request_id} requires request output"
+            chunks = self.adapter.stream(unit.session_identity, request_data, output)
+        for chunk in chunks:
+            yield OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                data=chunk.to_dict(),
+                metadata={"modality": chunk.modality},
+            )
 
-    def complete(self, request_id: str) -> None:
+    def complete(
+        self, request_id: str, request_data: SGLangARRequestData | None = None
+    ) -> None:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
             session = self.sessions[unit.session_identity.id]
             session.unit = None
             session.embedding_spans.extend(unit.embedding_spans)
+            if (
+                request_data is not None
+                and request_data.input_embeds_are_projected
+                and request_data.decode_input_embeds
+            ):
+                # Note (Junnan Li): A projected talker feeds each generated token back as a computed row, so a KV rebuild needs those rows, not the token embeddings.
+                start = unit.native_offset + unit.prompt_length
+                session.embedding_spans.append(
+                    EmbeddingSpan(
+                        start=start,
+                        end=start + len(request_data.decode_input_embeds),
+                        input_embeds=torch.stack(request_data.decode_input_embeds),
+                    )
+                )
+            else:
+                pass
         else:
             pass
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from multiprocessing.queues import Queue
 
 import pytest
 
@@ -12,10 +13,9 @@ from sglang_omni.admission import QueueFullError
 from sglang_omni.config.schema import SessionControlEdgeConfig
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.session_delivery import DeliveryPacer
-from sglang_omni.pipeline.session_execution import SessionEmitter, SessionWork
 from sglang_omni.pipeline.session_graph import SessionGraphRunner
 from sglang_omni.pipeline.sessions import NodeInbox, Session, SessionGraphRuntime
-from sglang_omni.proto import CompleteMessage, OmniRequest
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     ControlEdge,
     DataEdge,
@@ -27,10 +27,25 @@ from sglang_omni.proto.session import (
     TimedChunk,
     wire_size,
 )
-from sglang_omni.proto.streams import AUDIO, IMAGE, IMAGE_FRAME, PCM16, REPLY_DELIVERED
+from sglang_omni.proto.streams import (
+    AUDIO,
+    CONTROL,
+    IMAGE,
+    IMAGE_FRAME,
+    INTERRUPT,
+    PCM16,
+    REPLY_DELIVERED,
+)
+from sglang_omni.scheduling.session import (
+    ChunkEmitter,
+    SessionContext,
+    SessionHooks,
+    SessionScheduler,
+)
 from tests.unit_test.fixtures.session_outputs import control_chunk
 from tests.unit_test.fixtures.session_pipeline import (
     VAD_FACTORY,
+    StageEvent,
     chunk,
     event_log,
     pipeline,
@@ -363,261 +378,6 @@ async def test_open_without_a_route_follows_the_pipeline_route(tmp_path):
             await coordinator.open_session(OmniRequest(None))
 
 
-class EchoExecution:
-    """Runs one pipeline request per input through the node's stages and emits the terminal result."""
-
-    def __init__(
-        self,
-        work: SessionWork,
-        terminal_stages: set[str] | None = None,
-        params: dict[str, object] | None = None,
-    ) -> None:
-        self.work = work
-        self.terminal_stages = terminal_stages
-        self.params = params or {}
-        self.emitter: SessionEmitter | None = None
-        self.request_ids: list[str] = []
-
-    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
-        self.emitter = emitter
-
-    async def append(self, chunk: TimedChunk) -> None:
-        assert self.emitter is not None
-        request_id = f"echo-{self.work.session_id}-{chunk.seq}"
-        self.request_ids.append(request_id)
-        async for message in self.work.stream(
-            request_id,
-            OmniRequest(None, {**self.params, "seq": chunk.seq}),
-            self.terminal_stages,
-        ):
-            if isinstance(message, CompleteMessage):
-                await self.emitter.emit_output(
-                    TimedChunk(
-                        "text", chunk.t_start_ms, 0, chunk.seq, message.result, "text"
-                    )
-                )
-            else:
-                pass
-        assert request_id not in self.work.session.work_owners
-
-    async def close(self) -> None:
-        await self.work.release_all(5)
-
-
-ECHO_GRAPH = SessionGraph(
-    nodes={
-        "model": SessionNode(
-            stages=("source", "sink"), inputs=("input",), execution="echo"
-        )
-    },
-    publish={"model": ("text",)},
-)
-
-
-@pytest.mark.parametrize(
-    ("other_terminals", "terminal_stages"),
-    [((), None), (("other",), {"sink"})],
-    ids=["pipeline-terminal", "beside-other-terminals"],
-)
-@pytest.mark.asyncio
-async def test_execution_node_runs_its_requests_through_its_owners(
-    tmp_path, other_terminals, terminal_stages
-):
-    """A request ends at the pipeline's terminal, or at its node's last stage when the pipeline has other terminals."""
-    async with pipeline(
-        tmp_path,
-        session_request_owners=frozenset({"source", "sink"}),
-        other_terminals=other_terminals,
-    ) as (coordinator, events, _):
-        executions: list[EchoExecution] = []
-
-        def factory(work: SessionWork) -> EchoExecution:
-            executions.append(EchoExecution(work, terminal_stages))
-            return executions[-1]
-
-        coordinator.session_execution_factories["echo"] = factory
-        coordinator.session_route = None
-        coordinator.session_graph = ECHO_GRAPH
-        identity = await coordinator.open_session(OmniRequest(None))
-        outputs = coordinator.session_outputs(identity)
-        await coordinator.append_session(identity, chunk(0))
-        await coordinator.append_session(identity, chunk(1))
-        received = await collect(outputs, 4)
-        data = [item for item in received if item.kind == "data"]
-        assert [item.input_seq for item in received if item.kind == "input_done"] == [
-            0,
-            1,
-        ]
-        assert [item.payload["stage"] for item in data] == ["sink", "sink"]
-        assert [item.payload["echo"] for item in data] == [{"seq": 0}, {"seq": 1}]
-        node = coordinator.sessions[f"{identity.id}:model"]
-        assert not node.work_owners
-        await outputs.aclose()
-        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
-        log = event_log(events)
-        computed = [(event[1], event[2]) for event in log if event[0] == "compute"]
-        assert computed == [
-            (stage, request_id)
-            for request_id in executions[0].request_ids
-            for stage in ("source", "sink")
-        ]
-        assert [event[1] for event in log if event[0] == "append"] == []
-
-
-def text_ends_at_text_stage(request: OmniRequest) -> list[str]:
-    return ["text"] if request.params.get("text_only") else ["text", "audio"]
-
-
-@pytest.mark.asyncio
-async def test_execution_request_without_terminals_ends_where_the_pipeline_resolves(
-    tmp_path,
-):
-    graph = SessionGraph(
-        nodes={
-            "model": SessionNode(
-                stages=("text", "audio"), inputs=("input",), execution="echo"
-            )
-        },
-        publish={"model": ("text",)},
-    )
-    async with pipeline(
-        tmp_path,
-        names=["text", "audio"],
-        session_request_owners=frozenset({"text", "audio"}),
-        terminal_stages_resolver=text_ends_at_text_stage,
-    ) as (coordinator, events, _):
-
-        def factory(work: SessionWork) -> EchoExecution:
-            return EchoExecution(work, params={"text_only": True})
-
-        coordinator.session_execution_factories["echo"] = factory
-        coordinator.session_graph = graph
-        identity = await coordinator.open_session(OmniRequest(None))
-        outputs = coordinator.session_outputs(identity)
-        await coordinator.append_session(identity, chunk(0))
-        received = await collect(outputs, 2)
-        assert [(item.kind, item.input_seq) for item in received] == [
-            ("data", 0),
-            ("input_done", 0),
-        ]
-        assert received[0].payload["stage"] == "text"
-        assert not coordinator.sessions[f"{identity.id}:model"].work_owners
-        await outputs.aclose()
-        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
-        log = event_log(events)
-        assert [event[1] for event in log if event[0] == "compute"] == ["text"]
-
-
-class FailingRequestExecution:
-    """Runs its first input's request in the background, as a component does, and raises that request's failure when it closes."""
-
-    def __init__(self, work: SessionWork, fail_on: str | None) -> None:
-        self.work = work
-        self.fail_on = fail_on
-        self.emitter: SessionEmitter | None = None
-        self.task: asyncio.Task[None] | None = None
-
-    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
-        self.emitter = emitter
-
-    async def append(self, chunk: TimedChunk) -> None:
-        self.task = asyncio.create_task(self.run(chunk))
-
-    async def run(self, chunk: TimedChunk) -> None:
-        assert self.emitter is not None
-        params = {"seq": chunk.seq, "fail_on": self.fail_on}
-        async for message in self.work.stream(
-            f"request-{self.work.session_id}-{chunk.seq}", OmniRequest(None, params)
-        ):
-            if isinstance(message, CompleteMessage):
-                await self.emitter.emit_output(
-                    TimedChunk(
-                        "text", chunk.t_start_ms, 0, chunk.seq, message.result, "text"
-                    )
-                )
-            else:
-                pass
-
-    async def control(self, event: TimedChunk) -> None:
-        pass
-
-    async def close(self) -> None:
-        assert self.task is not None
-        await asyncio.wait({self.task})
-        await self.work.release_all(5)
-        if self.task.exception() is not None:
-            raise self.task.exception()
-        else:
-            pass
-
-
-@pytest.mark.asyncio
-async def test_a_failed_execution_request_fails_its_session_but_not_the_stages(
-    tmp_path,
-):
-    async with pipeline(
-        tmp_path, session_request_owners=frozenset({"source", "sink"})
-    ) as (coordinator, _, _):
-        executions: list[FailingRequestExecution] = []
-
-        def factory(work: SessionWork) -> FailingRequestExecution:
-            executions.append(
-                FailingRequestExecution(work, "sink" if not executions else None)
-            )
-            return executions[-1]
-
-        coordinator.session_execution_factories["echo"] = factory
-        coordinator.session_route = None
-        coordinator.session_graph = ECHO_GRAPH
-        failed = await coordinator.open_session(OmniRequest(None))
-        outputs = coordinator.session_outputs(failed)
-        await coordinator.append_session(failed, chunk(0))
-        assert (await asyncio.wait_for(anext(outputs), OUTPUT_TIMEOUT_S)).kind == (
-            "input_done"
-        )
-        await wait_until(lambda: executions[0].task.done())
-        await coordinator.close_session(failed)
-        with pytest.raises(RuntimeError, match="compute failed on sink"):
-            await asyncio.wait_for(anext(outputs), OUTPUT_TIMEOUT_S)
-        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
-        assert not coordinator.session_unavailable_stages
-        identity = await coordinator.open_session(OmniRequest(None))
-        outputs = coordinator.session_outputs(identity)
-        await coordinator.append_session(identity, chunk(0))
-        received = await collect(outputs, 2)
-        data = [item for item in received if item.kind == "data"]
-        assert [item.payload["echo"]["seq"] for item in data] == [0]
-        await outputs.aclose()
-        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
-
-
-@pytest.mark.asyncio
-async def test_an_execution_request_refused_admission_leaves_no_owner(tmp_path):
-    async with pipeline(
-        tmp_path, session_request_owners=frozenset({"source", "sink"})
-    ) as (coordinator, _, _):
-        executions: list[EchoExecution] = []
-
-        def factory(work: SessionWork) -> EchoExecution:
-            executions.append(EchoExecution(work))
-            return executions[-1]
-
-        coordinator.session_execution_factories["echo"] = factory
-        coordinator.session_route = None
-        coordinator.session_graph = ECHO_GRAPH
-        identity = await coordinator.open_session(OmniRequest(None))
-        coordinator.max_in_flight = 0
-        with pytest.raises(QueueFullError):
-            await asyncio.wait_for(
-                anext(executions[0].work.stream("refused", OmniRequest(None))),
-                OUTPUT_TIMEOUT_S,
-            )
-        assert not coordinator.sessions[f"{identity.id}:model"].work_owners
-        await coordinator.close_session(identity)
-        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
-        assert not coordinator.session_unavailable_stages
-
-
 def vad_graph() -> SessionGraph:
     return SessionGraph(
         nodes={
@@ -795,6 +555,7 @@ class NodeOutputsRunner(SessionGraphRunner):
         stages=None,
         should_preempt=False,
         is_ordered=True,
+        preempted_request_ids=(),
     ):
         self.controls.append(event)
 
@@ -1138,3 +899,124 @@ async def test_an_interrupt_tells_the_paced_node_readers_the_audio_it_delivered(
     [(source, delivered, _)] = graph.inboxes["listener"].queued
     assert source == "speaker" and delivered.turn == 2
     assert delivered.payload == {"type": REPLY_DELIVERED, "audio_ms": 200}
+
+
+class TurnFront(SessionHooks):
+    """Makes each client chunk the unit of a new turn and answers the client's interrupt with one naming the current turn."""
+
+    def __init__(self) -> None:
+        self.turns: dict[SessionIdentity, int] = {}
+        self.emitters: dict[SessionIdentity, ChunkEmitter] = {}
+
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        self.turns[session_identity] = 0
+
+    def attach_output_stream(
+        self, session_identity: SessionIdentity, emit: ChunkEmitter
+    ) -> None:
+        self.emitters[session_identity] = emit
+
+    def close(self, session_identity: SessionIdentity) -> None:
+        self.turns.pop(session_identity)
+        self.emitters.pop(session_identity)
+
+    def control(self, session_identity: SessionIdentity, event: TimedChunk) -> None:
+        turn = self.turns[session_identity]
+        self.emitters[session_identity](control_chunk(INTERRUPT, turn=turn))
+
+    def append(
+        self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
+    ) -> StagePayload:
+        self.turns[context.session_identity] += 1
+        turn = self.turns[context.session_identity]
+        unit = TimedChunk(CONTROL, 0, 0, chunk.seq, {}, format="unit", turn=turn)
+        self.emitters[context.session_identity](unit)
+        return payload
+
+
+class HeldRelay(SessionHooks):
+    """The source holds turn 1 until it is cancelled and then hands on what it has, a payload the sink cannot take."""
+
+    def __init__(self, name: str, events: Queue[StageEvent]) -> None:
+        self.name = name
+        self.events = events
+
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        pass
+
+    def close(self, session_identity: SessionIdentity) -> None:
+        pass
+
+    def append(
+        self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
+    ) -> StagePayload:
+        self.events.put(("append", self.name, context.session_identity.id, chunk.turn))
+        if self.name == "source" and chunk.turn == 1:
+            context.cancelled.wait(OUTPUT_TIMEOUT_S)
+            payload.data = {}
+        elif self.name == "source":
+            payload.data = {"turn": chunk.turn}
+        else:
+            reply = {"turn": payload.data["turn"]}
+            context.emit(TimedChunk("text", 0, 0, chunk.seq, reply, format="text"))
+        return payload
+
+
+def create_preempt_stage(name: str, events: Queue[StageEvent]) -> SessionScheduler:
+    if name == "front":
+        return SessionScheduler(TurnFront())
+    else:
+        return SessionScheduler(HeldRelay(name, events))
+
+
+def preempt_graph() -> SessionGraph:
+    return SessionGraph(
+        nodes={
+            "front": SessionNode(
+                ("front",), ("input",), controls=(ControlEdge("input", INTERRUPT),)
+            ),
+            "relay": SessionNode(
+                ("source", "sink"),
+                ("front:unit",),
+                controls=(ControlEdge("front", INTERRUPT, should_preempt=True),),
+            ),
+        },
+        publish={"relay": ("text",)},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_preempting_interrupt_drops_its_turn_at_every_owner_of_the_target(
+    tmp_path,
+):
+    """The source sends no completion for the turn it dropped, so turn 2 follows only because the interrupt completes it."""
+    factory = f"{__name__}.create_preempt_stage"
+    async with pipeline(
+        tmp_path,
+        other_terminals=("front",),
+        factories={"source": factory, "sink": factory, "front": factory},
+    ) as (coordinator, events, _):
+        coordinator.session_graph = preempt_graph()
+        identity = await coordinator.open_session(OmniRequest(None))
+        outputs = coordinator.session_outputs(identity)
+        log: list[StageEvent] = []
+
+        def has_appended(stage: str, turn: int) -> bool:
+            log.extend(event_log(events))
+            return any(
+                event[0:2] == ("append", stage) and event[3] == turn for event in log
+            )
+
+        await coordinator.append_session(identity, chunk(0))
+        await wait_until(lambda: has_appended("source", 1))
+        await coordinator.control_session(identity, control_chunk(INTERRUPT))
+        await coordinator.append_session(identity, chunk(1))
+        received = []
+        while not any(output.format == "text" for output in received):
+            received.append(await asyncio.wait_for(anext(outputs), OUTPUT_TIMEOUT_S))
+        assert [output.payload for output in received if output.format == "text"] == [
+            {"turn": 2}
+        ]
+        assert has_appended("sink", 2) and not has_appended("sink", 1)
+        await outputs.aclose()
+        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)

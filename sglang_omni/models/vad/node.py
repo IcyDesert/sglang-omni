@@ -10,6 +10,7 @@ from sglang_omni.proto.streams import (
     COMMIT,
     CONFIGURE,
     PCM16,
+    SERVER_VAD,
     SESSION_INPUT_SAMPLE_RATE_HZ,
     SESSION_UNIT_MS,
     AudioPort,
@@ -24,6 +25,7 @@ SESSION_PORTS = SessionPorts(
     unit_ms=SESSION_UNIT_MS,
     controls=frozenset({COMMIT, CONFIGURE}),
     hot_settings=frozenset({"turn_detection"}),
+    turn_detection_types=(SERVER_VAD,),
 )
 
 
@@ -32,7 +34,8 @@ class VADFactoryArgs(FactoryArgs):
 
     threshold: float | None = Field(default=None, ge=0, le=1)
     prefix_padding_ms: int | None = Field(default=None, ge=0)
-    silence_duration_ms: int | None = Field(default=None, ge=0)
+    # Note (ruoyu): A pause after a comma or a short "Sorry." often runs past 500 ms and split one utterance into two turns, which 800 ms avoided in our zh and en runs.
+    silence_duration_ms: int | None = Field(default=800, ge=0)
     max_open_sessions: int | None = Field(default=None, ge=1)
     max_concurrency: int | None = Field(default=None, ge=1)
 

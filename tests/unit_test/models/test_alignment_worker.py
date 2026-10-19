@@ -1,27 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The forced-alignment worker's text helpers; they run where the worker's `qwen-asr` package is installed."""
+"""The forced-alignment worker's request contract; it runs where the worker's `qwen-asr` package is installed."""
+
+from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
+
+processor_module = pytest.importorskip("qwen_asr.inference.qwen3_forced_aligner")
 
 worker = pytest.importorskip("examples.streaming_cascade.alignment_worker")
 
 
 @pytest.mark.parametrize(
-    "language, words",
-    [("English", "twenty one"), ("Chinese", "二十一"), ("Japanese", "21")],
+    "text, expected_ends",
+    [
+        ("Version 2.0.1.", [7, 11, 11, 11, 13]),
+        ("It takes 3-5 days.", [2, 8, 10, 11, 12, 17]),
+        ("Wait 3.5-5 hours.", [4, 8, 8, 8, 9, 10, 16]),
+    ],
 )
-def test_number_words_read_digits_in_the_request_language(language, words):
-    assert worker.number_words("21", language) == words
+def test_worker_maps_numbers_separated_by_punctuation(
+    text: str, expected_ends: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    processor = processor_module.Qwen3ForceAlignProcessor()
 
+    def align(*, audio, text: str, language: str):
+        return [
+            [
+                SimpleNamespace(text=word, end_time=0.5)
+                for word in processor.tokenize_space_lang(text)
+            ]
+        ]
 
-@pytest.mark.parametrize(
-    "language, spoken",
-    [("English", "我有 three 个"), ("Chinese", "我有 三 个")],
-)
-def test_spoken_text_reads_digits_in_the_request_language(language, spoken):
-    text, origin = worker.spoken_text("我有3个", language)
-    assert text == spoken
-    assert origin == [0, 1] + [2] * (len(spoken) - 3) + [3]
+    monkeypatch.setattr(
+        worker.Qwen3ForcedAligner,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(align=align),
+    )
+    with TestClient(worker.create_app("test-model", "cpu", "English")) as client:
+        response = client.post(
+            "/align",
+            json={
+                "text": text,
+                "audio": "AAA=",
+                "sample_rate_hz": 24000,
+                "audio_format": "pcm16",
+                "language": "English",
+            },
+        )
+    assert response.status_code == 200, response.text
+    ends = [boundary["text_end_chars"] for boundary in response.json()["boundaries"]]
+    assert ends == expected_ends
 
 
 @pytest.mark.parametrize("language", ["Chinese", None])

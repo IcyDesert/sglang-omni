@@ -3,8 +3,10 @@
 
 import asyncio
 import base64
+import io
 import json
 import re
+import wave
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,6 +17,7 @@ import yaml
 
 from sglang_omni.audio.segmentation import UtteranceSegmenter
 from sglang_omni.config.manager import ConfigManager
+from sglang_omni.models.streaming_cascade.alignment import AlignmentConfig
 from sglang_omni.models.streaming_cascade.base import (
     ChatMessage,
     Replies,
@@ -32,6 +35,7 @@ from sglang_omni.models.streaming_cascade.config import (
 )
 from sglang_omni.models.streaming_cascade.dialog import heard_prefix
 from sglang_omni.models.streaming_cascade.generators import ChatDelta
+from sglang_omni.models.streaming_cascade.numerals import spoken_text
 from sglang_omni.models.streaming_cascade.recognizers import probe_realtime_service
 from sglang_omni.models.streaming_cascade.running_transcript import (
     RunningTranscript,
@@ -62,6 +66,7 @@ from sglang_omni.proto.streams import (
     SessionPorts,
     control_type,
 )
+from tests.unit_test.fixtures.cascade_backends import CHAT_MODEL
 from tests.unit_test.fixtures.cascade_fakes import QUIET, build, drain
 from tests.unit_test.fixtures.session_outputs import control_chunk
 
@@ -80,6 +85,7 @@ CASCADE_PORTS = SessionPorts(
     controls=frozenset({COMMIT, CONFIGURE, INTERRUPT, TRUNCATE}),
     hot_settings=frozenset({"instructions", "sampling", "turn_detection"}),
     sampling_parameters=("temperature", "max_new_tokens_per_unit"),
+    turn_detection_types=("server_vad",),
 )
 
 
@@ -492,7 +498,9 @@ def test_profile_graph_turns_formats_and_ports():
     assert [n.name for n in settings.nodes if n.ends_turns] == ["llm", "tts"]
     assert settings.publish["llm"] == [TEXT_DELTA]
     hot_settings = frozenset({"instructions", "sampling"})
-    assert settings.ports(200) == replace(CASCADE_PORTS, hot_settings=hot_settings)
+    assert settings.ports(200) == replace(
+        CASCADE_PORTS, hot_settings=hot_settings, turn_detection_types=()
+    )
     assert declared(unit_ms=100).session_ports().unit_ms == 100
     text_only = ComponentGraphConfig.model_validate(yaml.safe_load(TEXT_ONLY)).ports(
         200
@@ -602,6 +610,70 @@ async def test_openai_speech_reports_each_sentence_end_as_a_character_offset(bac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "expected_spoken"),
+    [
+        pytest.param("太好了😄，祝你开心！🎉", ["太好了，祝你开心！"], id="emoji"),
+        pytest.param(
+            "哈哈😂😂，好！👍🏽✨", ["哈哈，好！"], id="skin_tone_and_symbols"
+        ),
+        pytest.param("加油\u2764\ufe0f！", ["加油！"], id="variation_selector"),
+        pytest.param(
+            "Great job! 🎉👨\u200d👩\u200d👧 See you.",
+            ["Great job!", "See you."],
+            id="joined_emoji",
+        ),
+        pytest.param("**重点**是多喝水。", ["重点是多喝水。"], id="emphasis"),
+        pytest.param(
+            "Run `pip install` and read [the docs](https://example.com).",
+            ["Run pip install and read the docs."],
+            id="code_and_link",
+        ),
+        pytest.param(
+            "今天最高25℃，体感20°。", ["今天最高25℃，体感20°。"], id="unit_symbols_stay"
+        ),
+    ],
+)
+async def test_openai_speech_sends_only_the_spoken_words_to_the_speech_service(
+    backends, reply, expected_spoken
+):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    await drain(
+        build({**tts, "max_sentence_words": 24}),
+        [text_chunk(reply, 1), control_chunk(TURN_DONE, turn=1)],
+    )
+    assert spoken == expected_spoken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wordless_sentence",
+    [
+        pytest.param("😄😄", id="only_emoji"),
+        pytest.param("🎉！", id="emoji_and_punctuation"),
+        pytest.param("!?", id="only_punctuation"),
+    ],
+)
+async def test_openai_speech_skips_a_sentence_without_words_but_still_reports_its_end(
+    backends, wordless_sentence
+):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    outputs = await drain(
+        build({**tts, "max_sentence_words": 24}),
+        [
+            text_chunk("好的。", 1),
+            text_chunk(wordless_sentence, 1),
+            control_chunk(TURN_DONE, turn=1),
+        ],
+    )
+    sentence_ms = 3 * 1000 / 24000
+    assert spoken == ["好的。"]
+    assert spoken_progress(outputs) == [(3, sentence_ms), (5, sentence_ms)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backends", ["english_tts"], indirect=True)
 async def test_openai_speech_tags_each_sentence_with_its_language(backends):
     settings, _, spoken, _ = backends
@@ -612,6 +684,156 @@ async def test_openai_speech_tags_each_sentence_with_its_language(backends):
     ]
     await drain(build({**tts, "language": "English"}), inputs)
     assert spoken[-1] == "你好世界。" and " ".join(spoken[:-1]) == "Hello world."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["english_tts"], indirect=True)
+async def test_openai_speech_reads_the_digits_of_an_english_sentence_as_words(
+    backends,
+):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    await drain(
+        build({**tts, "language": "auto", "max_sentence_words": 24}),
+        [
+            text_chunk("This year is 2024.", 1, "English"),
+            control_chunk(TURN_DONE, turn=1),
+            text_chunk("今年是2024年。", 2, "Chinese"),
+            control_chunk(TURN_DONE, turn=2),
+        ],
+    )
+    assert spoken == ["This year is twenty twenty four.", "今年是2024年。"]
+
+
+@pytest.mark.parametrize(
+    "text, language, spoken, origin",
+    [
+        ("我有3个", "English", "我有 three 个", [0, 1] + [2] * 7 + [3]),
+        ("我有3个", "Chinese", "我有 三 个", [0, 1, 2, 2, 2, 3]),
+        ("3.14", "Chinese", "三点一四", [3, 3, 3, 3]),
+        ("21", "Japanese", "21", [1, 1]),
+        ("In 2024.", "English", "In twenty twenty four.", [0, 1, 2] + [6] * 18 + [7]),
+    ],
+)
+def test_spoken_text_reads_numbers_in_the_sentence_language(
+    text, language, spoken, origin
+):
+    assert spoken_text(text, language) == (spoken, origin)
+
+
+@pytest.mark.parametrize(
+    ("text", "spoken"),
+    [
+        pytest.param(
+            "This year is 2024.", "This year is twenty twenty four.", id="year"
+        ),
+        pytest.param(
+            "Built in 1887, 1900, 1905, 2000 and 2005.",
+            "Built in eighteen eighty seven, nineteen hundred, nineteen oh five, two thousand and two thousand five.",
+            id="years_ending_in_00_to_09",
+        ),
+        pytest.param(
+            "The iPhone 17 costs 799 dollars, or 12,999 yuan.",
+            "The iPhone seventeen costs seven hundred ninety nine dollars, or twelve thousand nine hundred ninety nine yuan.",
+            id="cardinals_with_a_thousands_separator",
+        ),
+        pytest.param(
+            "Call 138 1234 5678, 13812345678 or 0199.",
+            "Call one three eight one two three four five six seven eight, one three eight one two three four five six seven eight or zero one nine nine.",
+            id="grouped_long_and_zero_led_digits_are_spelled",
+        ),
+        pytest.param(
+            "Over 21,000 people, about 3.5 million.",
+            "Over twenty one thousand people, about three point five million.",
+            id="thousands_and_decimals",
+        ),
+        pytest.param(
+            "Codes 007, 001, 00 and 0.",
+            "Codes zero zero seven, zero zero one, zero zero and zero.",
+            id="multiple_leading_zeros",
+        ),
+        pytest.param(
+            "Version 2.0.1.",
+            "Version two point zero . one.",
+            id="version_separators",
+        ),
+        pytest.param(
+            "It takes 3-5 days.",
+            "It takes three to five days.",
+            id="range_separator",
+        ),
+        pytest.param(
+            "The 21st century began on January 1st, 2001, in the 3rd millennium.",
+            "The twenty first century began on January first, two thousand one, in the third millennium.",
+            id="ordinals",
+        ),
+    ],
+)
+def test_spoken_text_reads_english_years_prices_and_phone_numbers(text, spoken):
+    spoken_words, origin = spoken_text(text, "English")
+    assert spoken_words == spoken
+    assert len(origin) == len(spoken) and origin[-1] == len(text) - 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "digits, words",
+    [("007", "zero zero seven"), ("001", "zero zero one"), ("00", "zero zero")],
+)
+async def test_openai_speech_preserves_multiple_leading_zeros(
+    digits: str, words: str
+) -> None:
+    assert await spoken_requests(
+        {"language": "English"}, [text_chunk(f"The code is {digits}.", 1, "English")]
+    ) == [("English", f"The code is {words}.")]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("It takes 3-5 days.", "It takes three to five days."),
+        ("Wait 3 - 5 DAYS.", "Wait three to five DAYS."),
+        ("Wait 3\u20135 minutes.", "Wait three to five minutes."),
+        ("Walk 3.5-5 kilometers.", "Walk three point five to five kilometers."),
+        ("Pay 1,000-2,000 dollars.", "Pay one thousand to two thousand dollars."),
+        ("In 2024-2025 years.", "In twenty twenty four to twenty twenty five years."),
+        ("Compute 3-5 = -2.", "Compute three - five = - two."),
+        ("Version 2.0.1.", "Version two point zero . one."),
+        (
+            "Call 138-1234-5678.",
+            "Call one hundred thirty eight - one thousand two hundred thirty four - five thousand six hundred seventy eight.",
+        ),
+        ("Model X3-5 days.", "Model X three - five days."),
+        ("Code 007-009 days.", "Code zero zero seven - zero zero nine days."),
+    ],
+)
+def test_spoken_text_recognizes_quantity_ranges(text: str, expected: str) -> None:
+    spoken, origin = spoken_text(text, "English")
+    assert spoken == expected
+    assert len(origin) == len(spoken) and origin == sorted(origin)
+    assert origin[-1] == len(text) - 1
+
+
+def test_spoken_range_maps_each_endpoint_and_to_back_to_source() -> None:
+    spoken, origin = spoken_text("3-5 days.", "English")
+    assert spoken == "three to five days."
+    assert origin == [0] * len("three") + [1] * len(" to ") + [2] * len("five") + list(
+        range(3, 9)
+    )
+
+
+@pytest.mark.parametrize("language", ["Chinese", "Japanese"])
+def test_quantity_range_words_are_only_inserted_for_english(language: str) -> None:
+    spoken, origin = spoken_text("3-5 days.", language)
+    assert "to" not in spoken
+    assert "-" in spoken and len(origin) == len(spoken)
+
+
+@pytest.mark.asyncio
+async def test_openai_speech_reads_a_quantity_range_as_to() -> None:
+    assert await spoken_requests(
+        {"language": "English"}, [text_chunk("It takes 3-5 days.", 1, "English")]
+    ) == [("English", "It takes three to five days.")]
 
 
 @pytest.mark.asyncio
@@ -626,7 +848,7 @@ async def test_openai_speech_refuses_audio_of_an_unnamed_rate(backends):
 
 @pytest.mark.asyncio
 async def test_realtime_probe_requests_models_over_http(backends):
-    """The loopback server answers only `/v1/models`, so a passing probe asked for it."""
+    """The loopback server answers no realtime endpoint, so a passing probe asked for `/v1/models` over HTTP."""
     base_url = backends[0].component_graph().node("asr").component.base_url
     ws_url = base_url.replace("http", "ws").removesuffix("/v1")
     await probe_realtime_service(
@@ -634,6 +856,87 @@ async def test_realtime_probe_requests_models_over_http(backends):
             {"kind": "realtime_transcription", "base_url": ws_url, "model": "test-asr"}
         )
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["length_chat"], indirect=True)
+async def test_the_chat_probe_streams_one_token_sampled_with_the_node_settings(
+    backends, backend_requests
+):
+    llm = backends[0].component_graph().node("llm").component.model_dump()
+    config = COMPONENTS.parse({**llm, "temperature": 0.7, "extra_body": {"top_p": 0.9}})
+    await COMPONENTS.kind("openai_chat").probe(config)
+    [request] = backend_requests
+    assert [message["role"] for message in request.pop("messages")] == ["user"]
+    assert request == {
+        "model": CHAT_MODEL,
+        "stream": True,
+        "max_tokens": 1,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minimum_tokens", [0, 1, 16])
+@pytest.mark.parametrize("backends", ["length_chat"], indirect=True)
+async def test_the_chat_probe_preserves_the_real_request_minimum_tokens(
+    backends, backend_requests, minimum_tokens: int
+) -> None:
+    llm = backends[0].component_graph().node("llm").component.model_dump()
+    config = COMPONENTS.parse(
+        {
+            **llm,
+            "max_tokens": 32,
+            "extra_body": {"min_tokens": minimum_tokens, "top_p": 0.9},
+        }
+    )
+    await COMPONENTS.kind("openai_chat").probe(config)
+    [request] = backend_requests
+    assert request["max_tokens"] == 1 and request["min_tokens"] == 0
+    assert request["top_p"] == 0.9
+    assert config.max_tokens == 32
+    assert config.extra_body == {"min_tokens": minimum_tokens, "top_p": 0.9}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["failed_chat"], indirect=True)
+async def test_the_chat_probe_fails_the_start_when_the_service_cannot_complete(
+    backends,
+):
+    llm = backends[0].component_graph().node("llm").component
+    with pytest.raises(RuntimeError, match="LLM stopped"):
+        await COMPONENTS.kind("openai_chat").probe(llm)
+
+
+def loopback_aligner(backends) -> AlignmentConfig:
+    """A forced alignment config whose worker is the loopback server."""
+    base_url = backends[0].component_graph().node("asr").component.base_url
+    return COMPONENTS.parse(
+        {
+            "kind": "alignment",
+            "method": "forced",
+            "alignment_url": base_url.removesuffix("/v1"),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_forced_alignment_probe_aligns_one_clip(backends, backend_requests):
+    await COMPONENTS.kind("alignment").probe(loopback_aligner(backends))
+    [request] = backend_requests
+    assert len(base64.b64decode(request.pop("audio"))) == 2 * 24000
+    assert request.pop("text")
+    assert request == {"sample_rate_hz": 24000, "audio_format": "pcm16"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["failed_align"], indirect=True)
+async def test_the_forced_alignment_probe_fails_the_start_when_the_worker_cannot_align(
+    backends,
+):
+    with pytest.raises(RuntimeError, match="answered 500"):
+        await COMPONENTS.kind("alignment").probe(loopback_aligner(backends))
 
 
 @pytest.mark.asyncio
@@ -789,6 +1092,20 @@ def test_the_reference_profile_routes_reply_progress_through_the_aligner():
         COMPONENTS.parse({"kind": "alignment", "method": "forced"})
     with pytest.raises(ValueError, match="belongs to the forced method"):
         COMPONENTS.parse({"kind": "alignment", "alignment_url": "http://127.0.0.1:1"})
+    with pytest.raises(ValueError, match="the asr method needs heard_asr_url"):
+        COMPONENTS.parse({"kind": "alignment", "method": "asr"})
+    with pytest.raises(ValueError, match="go together"):
+        COMPONENTS.parse(
+            {"kind": "alignment", "method": "asr", "heard_asr_url": HEARD_ASR_URL}
+        )
+    with pytest.raises(ValueError, match="belongs to the asr and forced methods"):
+        COMPONENTS.parse(
+            {
+                "kind": "alignment",
+                "heard_asr_url": HEARD_ASR_URL,
+                "heard_asr_model": "asr",
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -918,6 +1235,178 @@ async def test_the_forced_method_sends_the_language_of_the_reply_deltas(language
         assert [body["language"] for body in bodies] == [language, language]
 
 
+HEARD_ASR_URL = "http://asr:8002/v1"
+
+
+def heard_frames(request: httpx.Request) -> int:
+    """The number of samples in the WAV file of a transcription request."""
+    with wave.open(
+        io.BytesIO(request.content[request.content.index(b"RIFF") :])
+    ) as wav:
+        return wav.getnframes()
+
+
+async def hearing_aligner(method: str, handler, **options) -> object:
+    node = aligner(
+        method, heard_asr_url=HEARD_ASR_URL, heard_asr_model="asr", **options
+    )
+    await node.client.aclose()
+    node.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return node
+
+
+def transcribing(transcript: str, requests: list[httpx.Request]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == f"{HEARD_ASR_URL}/audio/transcriptions":
+            requests.append(request)
+            return httpx.Response(200, json={"text": transcript})
+        else:
+            return worker_reply(request)
+
+    return handler
+
+
+def interrupted_speech(*after: object, language: str | None = None) -> list[object]:
+    """SPOKEN with its first sentence ended at 2000 ms and 1000 ms of " Five six." spoken when the reply is interrupted, with `after` fed next."""
+    return [
+        text_chunk(SPOKEN, 1, language),
+        *(speech() for _ in range(4)),
+        control_chunk(REPLY_PROGRESS, turn=1, text_end=19, audio_ms=2000),
+        speech(),
+        speech(),
+        control_chunk(TURN_INTERRUPTED, turn=1),
+        *after,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["English", None])
+async def test_the_asr_method_keeps_the_prefix_of_the_interrupted_sentence_its_delivered_audio_says(
+    language,
+):
+    requests = []
+    outputs = await drain(
+        await hearing_aligner("asr", transcribing("five", requests)),
+        interrupted_speech(
+            control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2600), language=language
+        ),
+    )
+    # Note (Junnan Li): "Five" ends at character 24 of SPOKEN; the cut is 600 ms into " Five six.".
+    assert spoken_progress(outputs) == [(19, 2000), (24, 2600)]
+    assert [heard_frames(request) for request in requests] == [600 * 24]
+    assert b'name="model"\r\n\r\nasr' in requests[0].content
+    assert (b'name="language"' in requests[0].content) == (language is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_client_truncate_before_the_delivered_audio_moves_the_heard_cut_back():
+    requests = []
+    outputs = await drain(
+        await hearing_aligner("asr", transcribing("five", requests)),
+        interrupted_speech(
+            control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2800),
+            control_chunk(TRUNCATE, t_ms=2300),
+            control_chunk(TRUNCATE, t_ms=2500),
+        ),
+    )
+    assert [heard_frames(request) for request in requests] == [800 * 24, 300 * 24]
+    assert spoken_progress(outputs) == [(19, 2000), (24, 2800), (24, 2300)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ReadTimeout("slow"),
+        httpx.Response(500),
+        httpx.Response(200, content=b"not json"),
+        httpx.Response(200, json={"text": "seven eight"}),
+    ],
+)
+async def test_the_interrupted_sentence_stays_unheard_when_its_transcription_fails_or_differs(
+    failure,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(failure, Exception):
+            raise failure
+        else:
+            return failure
+
+    outputs = await drain(
+        await hearing_aligner("asr", handler),
+        interrupted_speech(control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2600)),
+    )
+    assert spoken_progress(outputs) == [(19, 2000)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cut_ms, heard", [(1200, False), (2600, True)])
+async def test_the_forced_method_recognizes_only_a_cut_its_word_ends_do_not_cover(
+    cut_ms, heard
+):
+    requests = []
+    outputs = await drain(
+        await hearing_aligner(
+            "forced",
+            transcribing("five", requests),
+            alignment_url="http://aligner:9000",
+        ),
+        interrupted_speech(control_chunk(REPLY_DELIVERED, turn=1, audio_ms=cut_ms)),
+    )
+    progress = spoken_progress(outputs)
+    assert sorted(progress[1:5]) == [(3, 500), (7, 1000), (13, 1500), (19, 2000)]
+    if heard:
+        assert progress[5:] == [(24, 2600)]
+        assert len(requests) == 1
+    else:
+        assert progress[5:] == []
+        assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_the_dialog_keeps_the_heard_sentences_and_the_heard_prefix_of_the_cut_one():
+    outputs = await drain(
+        await hearing_aligner("asr", transcribing("five", [])),
+        interrupted_speech(control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2600)),
+    )
+    sentence_end, heard = [o for o in outputs if control_type(o) == REPLY_PROGRESS]
+    dialog = build({"kind": "dialog"})
+    await drain(
+        dialog,
+        [
+            transcript_chunk("count", True),
+            text_chunk(SPOKEN, 1),
+            lambda: dialog.control(sentence_end),
+            control_chunk(SPEECH_STARTED),
+            control_chunk(REPLY_DELIVERED, turn=1, audio_ms=2600),
+        ],
+    )
+    assert dialog.messages[2].content == "One two three four."
+    await dialog.control(heard)
+    assert dialog.messages[2].content == "One two three four. Five"
+    assert not dialog.messages[2].uncertain
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "qwen3-asr-qwen3-tts-customvoice",
+        "qwen3-asr-qwen3.8-27b-customvoice",
+        "qwen3-asr-qwen3-tts-base-clone",
+    ],
+)
+def test_the_qwen3_asr_profiles_hear_cut_sentences_with_their_own_recognizer(profile):
+    settings = profile_config(profile).component_graph()
+    recognizer = settings.node("asr").component
+    aligner_config = settings.node("aligner").component
+    assert (aligner_config.heard_asr_url, aligner_config.heard_asr_model) == (
+        recognizer.base_url,
+        recognizer.model,
+    )
+    # Note (Junnan Li): Without the client's truncate the aligner hears up to the delivered audio, past what the dialog keeps, and its prefix is dropped.
+    assert "input" in profile_config(profile).session_nodes["aligner"].sources
+
+
 @pytest.mark.asyncio
 async def test_a_truncate_cuts_at_the_word_the_aligner_reports(backends):
     settings, _, spoken, _ = backends
@@ -1036,8 +1525,10 @@ async def test_chat_deltas_carry_the_language_of_their_messages():
     ]
 
 
-async def spoken_languages(spec: dict, deltas: list[TimedChunk]) -> list[str]:
-    """The language tag of each sentence the synthesizer speaks for the deltas of turn 1."""
+async def spoken_requests(
+    spec: dict, deltas: list[TimedChunk]
+) -> list[tuple[str, str]]:
+    """The language tag and the input of each sentence the synthesizer speaks for the deltas of turn 1."""
     bodies = []
 
     def answer(request: httpx.Request) -> httpx.Response:
@@ -1049,7 +1540,23 @@ async def spoken_languages(spec: dict, deltas: list[TimedChunk]) -> list[str]:
     tts = build({"kind": "openai_speech", **HTTP_SERVICE, **spec})
     tts.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
     await drain(tts, [*deltas, control_chunk(TURN_DONE, turn=1)])
-    return [body["language"] for body in bodies]
+    return [(body["language"], body["input"]) for body in bodies]
+
+
+async def spoken_languages(spec: dict, deltas: list[TimedChunk]) -> list[str]:
+    return [language for language, _ in await spoken_requests(spec, deltas)]
+
+
+@pytest.mark.asyncio
+async def test_openai_speech_keeps_the_digits_of_a_chinese_script_sentence_tagged_english():
+    deltas = [
+        text_chunk("This year is 2024. ", 1, "English"),
+        text_chunk("今年是2024年。", 1, "English"),
+    ]
+    assert await spoken_requests({"language": "auto"}, deltas) == [
+        ("English", "This year is twenty twenty four."),
+        ("English", "今年是2024年。"),
+    ]
 
 
 @pytest.mark.asyncio

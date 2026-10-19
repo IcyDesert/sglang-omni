@@ -31,6 +31,7 @@ PORTS = SessionPorts(
     unit_ms=200,
     hot_settings=frozenset({"instructions", "sampling", "turn_detection"}),
     sampling_parameters=("temperature", "max_new_tokens_per_unit"),
+    turn_detection_types=("server_vad",),
 )
 
 

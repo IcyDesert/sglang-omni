@@ -16,6 +16,7 @@ from sglang_omni.models.streaming_cascade.base import (
     control_chunk,
     message_dict,
     messages_of,
+    probe_openai_service,
     replying,
     text_chunk,
 )
@@ -27,6 +28,7 @@ from sglang_omni.scheduling.session import ChunkEmitter
 CHAT_REQUEST_FIELDS = frozenset(
     {"model", "messages", "stream", "max_tokens", "temperature"}
 )
+WARM_UP_MESSAGES = [ChatMessage(role="user", content="Hi")]
 
 
 class OpenAIChatGeneratorConfig(ComponentConfig):
@@ -155,3 +157,29 @@ class OpenAIChatGenerator(Replier):
 
     async def close(self) -> None:
         await self.client.aclose()
+
+
+async def probe_chat_service(config: OpenAIChatGeneratorConfig) -> None:
+    """Require the service to list its models and to stream one token sampled with the node's settings."""
+    await probe_openai_service(config)
+    # Note (ruoyu): The chat service warms itself up with a greedy prefill, so a fresh deployment compiled its sampling kernel on the first real request and answered it 72 s late; one sampled token here moves that into startup.
+    warm_up_body = dict(config.extra_body)
+    if "min_tokens" in warm_up_body:
+        warm_up_body["min_tokens"] = 0
+    else:
+        pass
+    generator = OpenAIChatGenerator(
+        config.model_copy(update={"max_tokens": 1, "extra_body": warm_up_body})
+    )
+    completions_url = f"{config.base_url.rstrip('/')}/chat/completions"
+    try:
+        async for _ in generator.complete(WARM_UP_MESSAGES):
+            pass
+    except httpx.HTTPStatusError as error:
+        raise RuntimeError(
+            f"{completions_url} answered {error.response.status_code}"
+        ) from error
+    except httpx.TransportError as error:
+        raise RuntimeError(f"cannot reach {completions_url}: {error!r}") from error
+    finally:
+        await generator.close()

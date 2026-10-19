@@ -45,7 +45,9 @@ def test_capabilities_are_derived_from_the_ports():
         sampling_parameters=("temperature", "max_new_tokens_per_unit"),
         supports_instruction_updates=True,
     )
-    streaming = capabilities_of(replace(PORTS, output=None, hot_settings=frozenset()))
+    streaming = capabilities_of(
+        replace(PORTS, output=None, hot_settings=frozenset(), turn_detection_types=())
+    )
     assert streaming.output_modalities == ("text",)
     assert (streaming.max_granted_modalities, streaming.turn_control) == (1, (None,))
     assert streaming.supports_instruction_updates is False

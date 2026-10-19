@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Session graph edges: bounds, order, interruption fencing and control delivery, over in-process execution nodes."""
+"""Session graph edges over spawned stage owners: bounds, order, interruption fencing and control delivery."""
 
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field
+from multiprocessing.queues import Queue
+from multiprocessing.synchronize import Event
 from pathlib import Path
 
 import pytest
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.pipeline.coordinator import Coordinator
-from sglang_omni.pipeline.session_execution import SessionEmitter
-from sglang_omni.proto import OmniRequest
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     ControlEdge,
     DataEdge,
@@ -32,103 +34,148 @@ from sglang_omni.proto.streams import (
     TOOL_RESPONSE,
     control_type,
 )
+from sglang_omni.scheduling.session import (
+    ChunkEmitter,
+    SessionContext,
+    SessionHooks,
+    SessionScheduler,
+)
 from tests.unit_test.fixtures.session_outputs import control_chunk
-from tests.unit_test.fixtures.session_pipeline import pipeline, wait_until
+from tests.unit_test.fixtures.session_pipeline import (
+    StageEvent,
+    event_log,
+    pipeline,
+    wait_until,
+)
 
 OUTPUT_TIMEOUT_S = 5
 APPEND_RETRY_S = 0.01
+GATE_POLL_S = 0.01
 # Every edge holds one chunk and every node session one pending append, so a held node backs its edges up at once.
 LIMITS = SessionLimits(max_pending_chunks=1)
 SPEECH_STARTED = {"text": "speech_started"}
-# The coordinator hands a chunk through an inbox, a node session and its pump; this outlasts those hops.
-SETTLE_S = 0.2
+# A chunk crosses an inbox, a node session, a stage process and its pump; this outlasts those hops.
+SETTLE_S = 0.3
+FACTORY = f"{__name__}.create_edge_stage"
 
 
-class RecordingNode:
-    """Emits name(text) for each input; push_gate and control_gate hold an append or a control open."""
+@dataclass
+class EdgeState:
+    fail: bool
+    interrupted: set[int | None] = field(default_factory=set)
 
-    def __init__(self, *, name: str, events: list[str]) -> None:
+
+class EdgeHooks(SessionHooks):
+    """Answers each text input with name(text) once the node's push gate is open; an interrupt silences the turn it names."""
+
+    def __init__(self, name: str, events: Queue[StageEvent], gates: dict[str, Event]):
         self.name = name
         self.events = events
-        self.push_gate = asyncio.Event()
-        self.push_gate.set()
-        self.control_gate = asyncio.Event()
-        self.control_gate.set()
-        self.pushed: list[str] = []
-        self.interrupt_count = 0
-        self.should_fail_push = False
-        self.emitter: SessionEmitter | None = None
+        self.push_gate = gates[f"{name}.push"]
+        self.control_gate = gates[f"{name}.control"]
+        self.states: dict[SessionIdentity, EdgeState] = {}
 
-    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
-        self.events.append(f"open {self.name}")
-        self.emitter = emitter
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        self.events.put(("open", self.name, session_identity.id))
+        self.states[session_identity] = EdgeState(
+            fail=request.params.get("fail") == self.name
+        )
 
-    async def append(self, chunk: TimedChunk) -> None:
-        assert self.emitter is not None and isinstance(chunk.payload, dict)
+    def close(self, session_identity: SessionIdentity) -> None:
+        self.events.put(("close", self.name, session_identity.id))
+        self.states.pop(session_identity)
+
+    def append(
+        self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
+    ) -> StagePayload:
+        state = self.states[context.session_identity]
         text = chunk.payload["text"]
-        self.pushed.append(f"{chunk.format}:{text}")
-        interrupt_count = self.interrupt_count
-        await self.push_gate.wait()
-        if self.should_fail_push:
+        self.events.put(
+            ("append", self.name, context.session_identity.id, f"{chunk.format}:{text}")
+        )
+        while not self.push_gate.wait(GATE_POLL_S):
+            if context.cancelled.is_set():
+                return payload
+            else:
+                pass
+        if state.fail:
             raise RuntimeError(f"{self.name} failed")
-        elif interrupt_count != self.interrupt_count:
+        elif chunk.turn in state.interrupted or context.cancelled.is_set():
             pass
         else:
-            await self.emitter.emit_output(
-                replace(chunk, payload={"text": f"{self.name}({text})"})
+            context.emit(
+                TimedChunk(
+                    chunk.modality,
+                    chunk.t_start_ms,
+                    chunk.duration_ms,
+                    chunk.seq,
+                    {"text": f"{self.name}({text})"},
+                    format=chunk.format,
+                    turn=chunk.turn,
+                )
             )
+        return payload
 
-    async def control(self, event: TimedChunk) -> None:
-        self.events.append(f"control {self.name}")
-        await self.control_gate.wait()
+    def control(self, session_identity: SessionIdentity, event: TimedChunk) -> None:
+        self.events.put(
+            (
+                "control",
+                self.name,
+                session_identity.id,
+                control_type(event) or event.format,
+            )
+        )
+        self.control_gate.wait()
         if control_type(event) == INTERRUPT:
-            self.interrupt_count += 1
+            self.states[session_identity].interrupted.add(event.turn)
         else:
             pass
 
-    async def close(self) -> None:
-        self.events.append(f"close {self.name}")
 
-
-class VadNode:
-    """Emits an interrupt of the chunk's turn when it hears SPEECH_STARTED."""
+class FrontHooks(SessionHooks):
+    """Emits an interrupt of the chunk's turn when it hears SPEECH_STARTED, as a dialog node does."""
 
     def __init__(self) -> None:
-        self.emitter: SessionEmitter | None = None
+        self.emitters: dict[SessionIdentity, ChunkEmitter] = {}
 
-    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
-        self.emitter = emitter
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        pass
 
-    async def append(self, chunk: TimedChunk) -> None:
-        assert self.emitter is not None
+    def attach_output_stream(
+        self, session_identity: SessionIdentity, emit: ChunkEmitter
+    ) -> None:
+        self.emitters[session_identity] = emit
+
+    def close(self, session_identity: SessionIdentity) -> None:
+        self.emitters.pop(session_identity)
+
+    def append(
+        self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
+    ) -> StagePayload:
         if chunk.payload == SPEECH_STARTED:
-            await self.emitter.emit_output(
+            context.emit(
                 control_chunk(
                     INTERRUPT, chunk.t_start_ms, seq=chunk.seq, turn=chunk.turn
                 )
             )
         else:
             pass
+        return payload
 
-    async def control(self, event: TimedChunk) -> None:
-        raise AssertionError(f"vad takes no control events, got {event!r}")
 
-    async def close(self) -> None:
+class ToolHooks(SessionHooks):
+    """Answers each tool call with an empty tool_response of the call's turn."""
+
+    def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
         pass
 
+    def close(self, session_identity: SessionIdentity) -> None:
+        pass
 
-class ToolNode:
-    """Answers each input with an empty tool_response of the input's turn."""
-
-    def __init__(self) -> None:
-        self.emitter: SessionEmitter | None = None
-
-    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
-        self.emitter = emitter
-
-    async def append(self, chunk: TimedChunk) -> None:
-        assert self.emitter is not None
-        await self.emitter.emit_output(
+    def append(
+        self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
+    ) -> StagePayload:
+        context.emit(
             TimedChunk(
                 TOOL,
                 chunk.t_start_ms,
@@ -139,12 +186,18 @@ class ToolNode:
                 turn=chunk.turn,
             )
         )
+        return payload
 
-    async def control(self, event: TimedChunk) -> None:
-        raise AssertionError(f"the tool takes no control events, got {event!r}")
 
-    async def close(self) -> None:
-        pass
+def create_edge_stage(
+    name: str, events: Queue[StageEvent], gates: dict[str, Event]
+) -> SessionScheduler:
+    if name == "front":
+        return SessionScheduler(FrontHooks())
+    elif name == "tool":
+        return SessionScheduler(ToolHooks())
+    else:
+        return SessionScheduler(EdgeHooks(name, events, gates))
 
 
 def text_chunk(text: str, seq: int, turn: int | None = None) -> TimedChunk:
@@ -156,20 +209,16 @@ def speech_chunk(seq: int, turn: int) -> TimedChunk:
 
 
 async def settle() -> None:
-    """Let every ready task run until it blocks."""
+    """Let every hop run until it blocks."""
     await asyncio.sleep(SETTLE_S)
 
 
-def cascade_graph(order: tuple[str, ...] = ("vad", "llm", "tts")) -> SessionGraph:
-    interrupt = ControlEdge("vad", INTERRUPT)
+def cascade_graph(order: tuple[str, ...] = ("front", "llm", "tts")) -> SessionGraph:
+    interrupt = ControlEdge("front", INTERRUPT, should_preempt=True)
     nodes = {
-        "vad": SessionNode(("vad",), ("input:pcm16",), execution="vad"),
-        "llm": SessionNode(
-            ("llm",), ("input:text",), execution="llm", controls=(interrupt,)
-        ),
-        "tts": SessionNode(
-            ("tts",), ("llm:text",), execution="tts", controls=(interrupt,)
-        ),
+        "front": SessionNode(("front",), ("input:pcm16",)),
+        "llm": SessionNode(("llm",), ("input:text",), controls=(interrupt,)),
+        "tts": SessionNode(("tts",), ("llm:text",), controls=(interrupt,)),
     }
     return SessionGraph({name: nodes[name] for name in order}, {"tts": ("text",)})
 
@@ -177,29 +226,82 @@ def cascade_graph(order: tuple[str, ...] = ("vad", "llm", "tts")) -> SessionGrap
 def edge_graph(edge: DataEdge) -> SessionGraph:
     return SessionGraph(
         {
-            "src": SessionNode(("src",), ("input:text",), execution="src"),
-            "sink": SessionNode(("sink",), (edge,), execution="sink"),
+            "src": SessionNode(("src",), ("input:text",)),
+            "sink": SessionNode(("sink",), (edge,)),
         },
         {"sink": ("text",)},
     )
+
+
+class Gates:
+    """One push and one control gate per node, open unless a test holds them."""
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        context = multiprocessing.get_context("spawn")
+        self.events: dict[str, Event] = {}
+        for name in names:
+            for kind in ("push", "control"):
+                gate = context.Event()
+                gate.set()
+                self.events[f"{name}.{kind}"] = gate
+
+    def hold(self, name: str, kind: str = "push") -> None:
+        self.events[f"{name}.{kind}"].clear()
+
+    def release(self, name: str, kind: str = "push") -> None:
+        self.events[f"{name}.{kind}"].set()
+
+
+class Log:
+    """The stage events seen so far, read from the workers' queue on demand."""
+
+    def __init__(self, events: Queue[StageEvent]) -> None:
+        self.events = events
+        self.seen: list[StageEvent] = []
+
+    def read(self) -> list[StageEvent]:
+        self.seen.extend(event_log(self.events))
+        return self.seen
+
+    def of(self, kind: str, name: str) -> list[str]:
+        return [event[-1] for event in self.read() if event[:2] == (kind, name)]
+
+    def names(self, kind: str) -> list[str]:
+        return [event[1] for event in self.read() if event[0] == kind]
 
 
 @asynccontextmanager
 async def open_graph(
     tmp_path: Path,
     graph: SessionGraph,
-    nodes: dict[str, RecordingNode | VadNode | ToolNode],
-) -> AsyncIterator[tuple[Coordinator, SessionIdentity]]:
+    names: tuple[str, ...],
+    params: dict[str, object] | None = None,
+) -> AsyncIterator[tuple[Coordinator, SessionIdentity, Gates, Log]]:
+    gates = Gates(names)
     async with pipeline(
-        tmp_path, names=list(nodes), session_request_owners=frozenset(nodes)
-    ) as (coordinator, _, _):
-        for name, node in nodes.items():
-            coordinator.session_execution_factories[name] = lambda work, node=node: node
+        tmp_path,
+        names=list(names),
+        factories={name: FACTORY for name in names},
+        factory_kwargs={"gates": gates.events},
+    ) as (coordinator, events, _):
         coordinator.session_graph = graph
-        identity = await coordinator.open_session(OmniRequest(None), limits=LIMITS)
-        yield coordinator, identity
-        await coordinator.close_session(identity)
-        await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
+        identity = await coordinator.open_session(
+            OmniRequest(None, params=params or {}), limits=LIMITS
+        )
+        log = Log(events)
+        try:
+            yield coordinator, identity, gates, log
+        finally:
+            for name in names:
+                gates.release(name)
+                gates.release(name, "control")
+            if identity.id in coordinator.graphs:
+                await coordinator.close_session(identity)
+            else:
+                pass
+            await wait_until(
+                lambda: not coordinator.sessions and not coordinator.graphs
+            )
 
 
 async def append(
@@ -222,70 +324,70 @@ async def next_data(outputs: AsyncIterator[OutputChunk]) -> OutputChunk:
     return output
 
 
-def recording_cascade(
-    events: list[str],
-) -> tuple[dict[str, RecordingNode | VadNode], RecordingNode, RecordingNode]:
-    llm = RecordingNode(name="llm", events=events)
-    tts = RecordingNode(name="tts", events=events)
-    return {"vad": VadNode(), "llm": llm, "tts": tts}, llm, tts
-
-
 @pytest.mark.asyncio
 async def test_interrupt_drops_queued_stale_output_but_not_the_next_turn(tmp_path):
     """Declared downstream first, the nodes still open upstream first, take the interrupt upstream first and close downstream first."""
-    events: list[str] = []
-    nodes, llm, tts = recording_cascade(events)
-    graph = cascade_graph(order=("tts", "llm", "vad"))
-    async with open_graph(tmp_path, graph, nodes) as (coordinator, identity):
-        assert events == ["open llm", "open tts"]
+    graph = cascade_graph(order=("tts", "llm", "front"))
+    async with open_graph(tmp_path, graph, ("front", "llm", "tts")) as (
+        coordinator,
+        identity,
+        gates,
+        log,
+    ):
+        assert log.names("open") == ["llm", "tts"]
         outputs = coordinator.session_outputs(identity)
-        tts.push_gate.clear()
+        gates.hold("tts")
         for seq in range(3):
             await append(coordinator, identity, text_chunk(f"old{seq}", seq, turn=1))
-        await wait_until(lambda: len(llm.pushed) == 3)
+        await wait_until(lambda: len(log.of("append", "llm")) == 3)
         await settle()
-        assert tts.pushed == ["text:llm(old0)"]
+        assert log.of("append", "tts") == ["text:llm(old0)"]
         await append(coordinator, identity, speech_chunk(3, turn=1))
-        await wait_until(lambda: events[-2:] == ["control llm", "control tts"])
-        tts.push_gate.set()
+        await wait_until(lambda: log.names("control") == ["llm", "tts"])
+        gates.release("tts")
         await append(coordinator, identity, text_chunk("new", 4, turn=2))
         output = await next_data(outputs)
         assert output.payload == {"text": "tts(llm(new))"}
-        assert tts.pushed == ["text:llm(old0)", "text:llm(new)"]
-    assert events[-2:] == ["close tts", "close llm"]
+        assert log.of("append", "tts") == ["text:llm(old0)", "text:llm(new)"]
+        await outputs.aclose()
+        await coordinator.close_session(identity)
+        await wait_until(lambda: log.names("close") == ["tts", "llm"])
 
 
 @pytest.mark.asyncio
 async def test_input_arriving_during_interrupt_waits_and_is_not_fenced(tmp_path):
-    events: list[str] = []
-    nodes, llm, _ = recording_cascade(events)
-    async with open_graph(tmp_path, cascade_graph(), nodes) as (coordinator, identity):
+    async with open_graph(tmp_path, cascade_graph(), ("front", "llm", "tts")) as (
+        coordinator,
+        identity,
+        gates,
+        log,
+    ):
         outputs = coordinator.session_outputs(identity)
-        llm.control_gate.clear()
+        gates.hold("llm", "control")
         await append(coordinator, identity, speech_chunk(0, turn=1))
-        await wait_until(lambda: "control llm" in events)
+        await wait_until(lambda: "llm" in log.names("control"))
         await append(coordinator, identity, text_chunk("new", 1, turn=2))
         await settle()
-        assert llm.pushed == []
-        llm.control_gate.set()
+        assert log.of("append", "llm") == []
+        gates.release("llm", "control")
         output = await next_data(outputs)
         assert output.payload == {"text": "tts(llm(new))"}
+        await outputs.aclose()
 
 
 @pytest.mark.asyncio
 async def test_drop_oldest_edge_keeps_newest_without_blocking_producer(tmp_path):
-    events: list[str] = []
-    src = RecordingNode(name="src", events=events)
-    sink = RecordingNode(name="sink", events=events)
     graph = edge_graph(DataEdge("src:text", capacity=2, overflow="drop_oldest"))
-    async with open_graph(tmp_path, graph, {"src": src, "sink": sink}) as (
+    async with open_graph(tmp_path, graph, ("src", "sink")) as (
         coordinator,
         identity,
+        gates,
+        log,
     ):
         outputs = coordinator.session_outputs(identity)
-        sink.push_gate.clear()
+        gates.hold("sink")
         await append(coordinator, identity, text_chunk("0", 0))
-        await wait_until(lambda: sink.pushed == ["text:src(0)"])
+        await wait_until(lambda: log.of("append", "sink") == ["text:src(0)"])
         for seq in range(1, 5):
             await append(coordinator, identity, text_chunk(str(seq), seq))
         receipts = [
@@ -293,33 +395,35 @@ async def test_drop_oldest_edge_keeps_newest_without_blocking_producer(tmp_path)
             for _ in range(5)
         ]
         assert receipts == [0, 1, 2, 3, 4]
-        sink.push_gate.set()
-        await wait_until(lambda: len(sink.pushed) == 3)
+        gates.release("sink")
+        await wait_until(lambda: len(log.of("append", "sink")) == 3)
         await settle()
-        assert sink.pushed == ["text:src(0)", "text:src(3)", "text:src(4)"]
+        assert log.of("append", "sink") == ["text:src(0)", "text:src(3)", "text:src(4)"]
+        await outputs.aclose()
 
 
 @pytest.mark.asyncio
 async def test_a_drop_oldest_client_edge_keeps_the_newest_input_and_never_rejects(
     tmp_path,
 ):
-    events: list[str] = []
-    node = RecordingNode(name="rt", events=events)
     graph = SessionGraph(
         {
             "rt": SessionNode(
-                ("rt",),
-                (DataEdge("input", capacity=2, overflow="drop_oldest"),),
-                execution="rt",
+                ("rt",), (DataEdge("input", capacity=2, overflow="drop_oldest"),)
             )
         },
         {"rt": ("text",)},
     )
-    async with open_graph(tmp_path, graph, {"rt": node}) as (coordinator, identity):
+    async with open_graph(tmp_path, graph, ("rt",)) as (
+        coordinator,
+        identity,
+        gates,
+        log,
+    ):
         outputs = coordinator.session_outputs(identity)
-        node.push_gate.clear()
+        gates.hold("rt")
         await coordinator.append_session(identity, text_chunk("0", 0))
-        await wait_until(lambda: node.pushed == ["text:0"])
+        await wait_until(lambda: log.of("append", "rt") == ["text:0"])
         for seq in range(1, 5):
             await coordinator.append_session(identity, text_chunk(str(seq), seq))
         dropped = [
@@ -327,71 +431,80 @@ async def test_a_drop_oldest_client_edge_keeps_the_newest_input_and_never_reject
             for _ in range(2)
         ]
         assert dropped == [1, 2]
-        node.push_gate.set()
+        gates.release("rt")
         received = [
             await asyncio.wait_for(anext(outputs), OUTPUT_TIMEOUT_S) for _ in range(6)
         ]
-        assert node.pushed == ["text:0", "text:3", "text:4"]
+        assert log.of("append", "rt") == ["text:0", "text:3", "text:4"]
         assert sorted(o.input_seq for o in received if o.kind == "input_done") == [
             0,
             3,
             4,
         ]
+        await outputs.aclose()
 
 
 @pytest.mark.asyncio
 async def test_a_tool_response_on_a_control_edge_passes_the_queued_audio(tmp_path):
-    events: list[str] = []
-    chat = RecordingNode(name="chat", events=events)
     graph = SessionGraph(
         {
             "chat": SessionNode(
                 ("chat",),
                 (DataEdge("input:pcm16", capacity=2),),
-                execution="chat",
                 controls=(ControlEdge("tool", TOOL_RESPONSE),),
             ),
-            "tool": SessionNode(("tool",), (f"input:{TOOL_CALL}",), execution="tool"),
+            "tool": SessionNode(("tool",), (f"input:{TOOL_CALL}",)),
         },
         {"chat": ("pcm16",)},
     )
-    async with open_graph(tmp_path, graph, {"chat": chat, "tool": ToolNode()}) as (
+    async with open_graph(tmp_path, graph, ("chat", "tool")) as (
         coordinator,
         identity,
+        gates,
+        log,
     ):
-        chat.push_gate.clear()
+        gates.hold("chat")
 
         def frame(seq: int) -> TimedChunk:
             return TimedChunk("audio", seq * 20, 20, seq, {"text": f"f{seq}"}, "pcm16")
 
         await append(coordinator, identity, frame(0))
-        await wait_until(lambda: chat.pushed == ["pcm16:f0"])
+        await wait_until(lambda: log.of("append", "chat") == ["pcm16:f0"])
         for seq in (1, 2):
             await coordinator.append_session(identity, frame(seq))
         with pytest.raises(QueueFullError):
             await coordinator.append_session(identity, frame(3))
         call = TimedChunk("tool", 60, 0, 3, {"calls": []}, TOOL_CALL, turn=1)
         await coordinator.append_session(identity, call)
-        await wait_until(lambda: "control chat" in events)
-        assert chat.pushed == ["pcm16:f0"]
-        chat.push_gate.set()
-        await wait_until(lambda: len(chat.pushed) == 3)
+        await settle()
+        assert log.of("append", "chat") == ["pcm16:f0"]
+        gates.release("chat")
+        await wait_until(lambda: len(log.of("append", "chat")) == 3)
+        assert [
+            event[2:]
+            for event in log.read()
+            if event[1] == "chat" and event[0] != "open"
+        ] == [
+            (identity.id + ":chat", "pcm16:f0"),
+            (identity.id + ":chat", TOOL_RESPONSE),
+            (identity.id + ":chat", "pcm16:f1"),
+            (identity.id + ":chat", "pcm16:f2"),
+        ]
 
 
 @pytest.mark.asyncio
 async def test_blocking_edge_holds_producer_until_consumer_drains(tmp_path):
-    events: list[str] = []
-    src = RecordingNode(name="src", events=events)
-    sink = RecordingNode(name="sink", events=events)
     graph = edge_graph(DataEdge("src:text", capacity=1))
-    async with open_graph(tmp_path, graph, {"src": src, "sink": sink}) as (
+    async with open_graph(tmp_path, graph, ("src", "sink")) as (
         coordinator,
         identity,
+        gates,
+        log,
     ):
         outputs = coordinator.session_outputs(identity)
-        sink.push_gate.clear()
+        gates.hold("sink")
         await append(coordinator, identity, text_chunk("0", 0))
-        await wait_until(lambda: sink.pushed == ["text:src(0)"])
+        await wait_until(lambda: log.of("append", "sink") == ["text:src(0)"])
         for seq in (1, 2):
             await append(coordinator, identity, text_chunk(str(seq), seq))
         receipts = [
@@ -401,26 +514,27 @@ async def test_blocking_edge_holds_producer_until_consumer_drains(tmp_path):
         await settle()
         assert receipts == [0, 1]
         assert coordinator.graphs[identity.id].inboxes["sink"].counts["src"] == 1
-        sink.push_gate.set()
-        await wait_until(lambda: len(sink.pushed) == 3)
-        assert sink.pushed == ["text:src(0)", "text:src(1)", "text:src(2)"]
+        gates.release("sink")
+        await wait_until(lambda: len(log.of("append", "sink")) == 3)
+        assert log.of("append", "sink") == ["text:src(0)", "text:src(1)", "text:src(2)"]
+        await outputs.aclose()
 
 
 @pytest.mark.asyncio
-async def test_node_failure_fails_outputs_and_closes_the_rest_downstream_first(
-    tmp_path,
-):
-    events: list[str] = []
-    nodes, llm, _ = recording_cascade(events)
-    graph = cascade_graph(order=("tts", "llm", "vad"))
-    async with open_graph(tmp_path, graph, nodes) as (coordinator, identity):
+async def test_node_failure_fails_outputs_and_closes_the_rest(tmp_path):
+    graph = cascade_graph(order=("tts", "llm", "front"))
+    async with open_graph(
+        tmp_path, graph, ("front", "llm", "tts"), params={"fail": "llm"}
+    ) as (coordinator, identity, _, log):
         outputs = coordinator.session_outputs(identity)
-        assert events == ["open llm", "open tts"]
-        llm.should_fail_push = True
+        assert log.names("open") == ["llm", "tts"]
         await append(coordinator, identity, text_chunk("boom", 0, turn=1))
-        with pytest.raises(RuntimeError, match="llm failed"):
+        # The failing append and the read the stage closes race to report it; the client sees one of them.
+        with pytest.raises(
+            RuntimeError, match="llm failed|session owner 'llm' closed the session"
+        ):
             await next_data(outputs)
         await wait_until(lambda: not coordinator.graphs)
-        assert sorted(events[2:]) == ["close llm", "close tts"]
+        assert sorted(log.names("close")) == ["llm", "tts"]
         with pytest.raises(ValueError, match="unknown or stale session"):
             await coordinator.append_session(identity, text_chunk("late", 1, turn=1))
