@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "mlx/mlx.h"
-#include "qwen3_decoder.h"
+#include "qwen3_asr/qwen3_decoder.h"
 
 namespace cohere_transcribe {
 
