@@ -11,6 +11,7 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 from typing_extensions import Unpack
 
+from sglang_omni.audio.semantic_vad import SemanticEOUModel, SemanticVADConfig
 from sglang_omni.audio.vad import Emit, StreamingVAD, VADConfig, VADEvent, offsets_to_ms
 from sglang_omni.client import Client, GenerateRequest, Message, SamplingParams
 from sglang_omni.serve.realtime.audio_buffer import RealtimeAudioBuffer
@@ -27,7 +28,6 @@ from sglang_omni.serve.realtime.events import (
     make_event,
     parse_conversation_client_event,
 )
-from sglang_omni.serve.realtime.semantic_vad import SemanticEOUModel, SemanticVADConfig
 from sglang_omni.serve.realtime.turn_detector import TurnDetector, build_turn_detector
 
 DEFAULT_INSTRUCTIONS = (

@@ -8,6 +8,12 @@ from typing import ClassVar
 from pydantic import Field, model_validator
 
 from sglang_omni.config.schema import PipelineConfig, SessionNodeConfig, StageConfig
+from sglang_omni.models.turn_detection.node import SESSION_PORTS as TURN_DETECTION_PORTS
+from sglang_omni.models.turn_detection.node import (
+    TURN_DETECTION_STAGE,
+    TurnDetectionStageConfig,
+    turn_detection_stage,
+)
 from sglang_omni.models.vad.node import SESSION_PORTS as VAD_PORTS
 from sglang_omni.models.vad.node import VAD_STAGE, VADStageConfig, vad_stage
 from sglang_omni.proto.session import SessionLimits
@@ -45,9 +51,11 @@ class AudioSessionPipelineConfig(PipelineConfig):
     )
     stage_groups: ClassVar[tuple[StageGroup, ...]] = (
         StageGroup(lambda: [vad_stage()], None, VAD_PORTS),
+        StageGroup(lambda: [turn_detection_stage()], None, TURN_DETECTION_PORTS),
     )
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
         VAD_STAGE: VADStageConfig,
+        TURN_DETECTION_STAGE: TurnDetectionStageConfig,
     }
     session_nodes: dict[str, SessionNodeConfig]
     session_publish: dict[str, list[str]]

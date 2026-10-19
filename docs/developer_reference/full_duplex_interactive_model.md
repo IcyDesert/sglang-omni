@@ -104,12 +104,14 @@ Install `sglang-omni` by following [Installation](../get_started/installation.md
 python -m pip install websockets httpx
 ```
 
-The profile `qwen3-asr-qwen3.8-27b-customvoice` runs three Qwen models on two GPUs: [Qwen3-ASR](../cookbook/qwen3_asr.md) for recognition, Qwen3.8-27B for the answers and [Qwen3-TTS](../cookbook/qwen3_tts.md) CustomVoice for the speech. Install the two speech models' dependencies as their cookbooks say, then download the checkpoints (all public, no token):
+The profile `qwen3-asr-qwen3-tts-base-clone` runs three Qwen models on one GPU: [Qwen3-ASR](../cookbook/qwen3_asr.md) for recognition, Qwen3-4B for the answers and [Qwen3-TTS](../cookbook/qwen3_tts.md) Base speaking in a voice cloned from `reference_zh.wav` in the profile's directory, with Qwen3-ForcedAligner finding where each word of the reply ends in its audio and [Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3) deciding when the user has finished speaking. Install the two speech models' dependencies as their cookbooks say, then download the checkpoints (all public, no token):
 
 ```bash
 hf download Qwen/Qwen3-ASR-1.7B
-hf download Qwen/Qwen3.8-27B
-hf download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+hf download Qwen/Qwen3-4B-Instruct-2507
+hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base
+hf download Qwen/Qwen3-ForcedAligner-0.6B
+hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-gpu.onnx
 ```
 
 ### Launching
@@ -123,10 +125,16 @@ PYTHONPATH=. python examples/streaming_cascade/alignment_worker.py --model Qwen/
 Then start the cascade:
 
 ```bash
-sgl-omni serve --config examples/streaming_cascade/profiles/qwen3-asr-qwen3.8-27b-customvoice/launch.yaml --enable-realtime --port 8765
+sgl-omni serve --config examples/streaming_cascade/profiles/qwen3-asr-qwen3-tts-base-clone/launch.yaml --enable-realtime --port 8765
 ```
 
-One command starts everything: the profile's `services` are started in order and waited for, a service already answering on its port is reused, and the cascade starts once every service and the worker answer; stopping the server stops the services it started. This profile puts Qwen3.8-27B on GPU 0 and the two speech models on GPU 1 through each service's `env`. [Profiles](#profiles) lists the other bundled profiles.
+Then open the browser page and talk, as [Voice Conversation](#voice-conversation) describes:
+
+```bash
+python playground/cascade/app.py --api-base http://127.0.0.1:8765 --port 8090
+```
+
+One command starts everything: the profile's `services` are started in order and waited for, a service already answering on its port is reused, and the cascade starts once every service and the worker answer; stopping the server stops the services it started. The profile's `turn_detection` node ends a turn only when Smart Turn takes a pause for its end, so a pause in the middle of a sentence does not cut it, as [Turn Detection](#turn-detection) describes. When an interrupted reply is cut, the profile's aligner keeps the words the listener heard: the forced aligner's word ends for the sentences whose audio was complete, and its own recognizer's transcript of the delivered audio for the sentence it was cut in. The page sends the position it played with `conversation.item.truncate` and marks the heard part of the reply. [Profiles](#profiles) lists the other bundled profiles, such as `qwen3-asr-qwen3.8-27b-customvoice` with Qwen3.8-27B on two GPUs.
 
 To use services you already run, drop their `services` entries and point the nodes' `base_url` at them; a command-line override such as `--session_nodes.llm.base_url http://127.0.0.1:9000/v1` changes one field without editing the file. The rest of this section lists every launch mode and what each profile needs started beforehand; [Configuration](#configuration), [Node Reference](#node-reference) and [Compatibility and Constraints](#compatibility-and-constraints) list every setting and the settings that cannot be combined.
 
@@ -215,7 +223,7 @@ Every profile is a `launch.yaml` under `examples/streaming_cascade/profiles/`.
 | --- | --- | --- | --- | --- | --- | --- |
 | `qwen3-asr-qwen3.8-27b-customvoice` | Qwen3-ASR-1.7B service on 8002 (`openai_transcription`) | Qwen3.8-27B on 8003, thinking off | Qwen3-TTS-12Hz-1.7B-CustomVoice on 8005, speaker `Vivian` | 2: the language model on GPU 0, both speech models on GPU 1 | `vad`, `asr`, `dialog`, `llm`, `tts`, `aligner` (forced, recognizing the sentence at the cut) | Alignment worker on 8010 |
 | `qwen3-asr-qwen3-tts-customvoice` | Qwen3-ASR-1.7B service on 8002 | Qwen3-4B-Instruct-2507 on 8000 | Qwen3-TTS-12Hz-1.7B-CustomVoice on 8005, speaker `Vivian` | 1 | `vad`, `asr`, `dialog`, `llm`, `tts`, `aligner` (forced, recognizing the sentence at the cut, published) | Alignment worker on 8010 |
-| `qwen3-asr-qwen3-tts-base-clone` | Qwen3-ASR-1.7B service on 8002 | Qwen3-4B-Instruct-2507 on 8000 | Qwen3-TTS-12Hz-1.7B-Base on 8005, cloning `reference_zh.wav` in the profile directory | 1 | `vad`, `asr`, `dialog`, `llm`, `tts`, `aligner` (forced, recognizing the sentence at the cut, published) | Alignment worker on 8010 |
+| `qwen3-asr-qwen3-tts-base-clone` | Qwen3-ASR-1.7B service on 8002 | Qwen3-4B-Instruct-2507 on 8000 | Qwen3-TTS-12Hz-1.7B-Base on 8005, cloning `reference_zh.wav` in the profile directory | 1 | `vad`, `turn_detection` (published), `asr`, `dialog`, `llm`, `tts`, `aligner` (forced, recognizing the sentence at the cut, published) | Alignment worker on 8010 |
 | `nemotron-qwen3-tts` | Nemotron 3.5 streaming ASR service on 8001 (`realtime_transcription`) | Qwen3-4B-Instruct-2507 on 8000 | Qwen3-TTS-12Hz-0.6B-Base on 8004, cloning `reference.wav` | 1 | `vad`, `asr`, `dialog`, `llm`, `tts`, `aligner` (forced) | Alignment worker on 8010; a recording at `reference.wav`, with `reference_text` set to its transcript |
 | `nemotron-stage-qwen3-tts` | Nemotron 3.5 ASR as the `asr` stage on GPU 0, with `running_transcript` | Qwen3-4B-Instruct-2507 on 8000 | Qwen3-TTS-12Hz-0.6B-Base on 8004, cloning `reference.wav` | 1 | `vad`, `asr` (stage), `transcript`, `dialog`, `llm`, `tts`, `aligner` (forced) | Alignment worker on 8010; a recording at `reference.wav`, with `reference_text` set to its transcript |
 
@@ -223,13 +231,7 @@ Every profile is a `launch.yaml` under `examples/streaming_cascade/profiles/`.
 
 ### Voice Conversation
 
-Open the browser page to try the conversation:
-
-```bash
-python playground/cascade/app.py --api-base http://127.0.0.1:8765 --port 8090
-```
-
-Open `http://127.0.0.1:8090`, speak, and the reply plays as it is produced. Speaking while the reply plays interrupts it.
+With the page from [Launching](#launching) running, open `http://127.0.0.1:8090`, speak, and the reply plays as it is produced. Speaking while the reply plays interrupts it.
 
 Any OpenAI Realtime client works the same way. Open a WebSocket to `/v1/realtime`, wait for `session.created`, and send the session settings:
 
@@ -254,6 +256,14 @@ Send 16 kHz mono PCM16 audio at real-time pace as `{"type": "input_audio_buffer.
 To end turns yourself instead of by silence, set `"turn_detection": null` in the first `session.update`; `input_audio_buffer.commit` then ends the utterance after the audio sent before it.
 
 Instructions and turn detection can change with a later `session.update` and apply from the next turn; sampling (`sglang.sampling.temperature`, `max_new_tokens_per_unit`) is set by the first one. [Session settings](#session-settings) lists every field.
+
+### Turn Detection
+
+Without it an utterance ends when the `vad` node hears `silence_duration_ms` of silence, so a pause to think in the middle of a sentence ends the turn and the reply answers half a sentence. A profile with a `turn_detection` node, such as `qwen3-asr-qwen3-tts-base-clone`, ends the turn only when the [Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3) end-of-turn model, scoring the utterance so far at each pause the `vad` node reports, finds it complete, or when the pause outlasts the longest pause the eagerness allows. The node reads the Session input and `vad:session` and publishes `session`: its `speech.started` opens the turn and its `speech.stopped` ends it, so the recognizer, the dialog and the client read `turn_detection:session` where they read `vad:session` before, and speech that resumes inside a held pause continues the utterance instead of interrupting a reply.
+
+The stage loads the BSD-2 licensed `smart-turn-v3.2-gpu.onnx` from the Hugging Face repository `pipecat-ai/smart-turn-v3` through the Hugging Face cache, or from the file or directory `stages.turn_detection.factory.model_path` names, and verifies its SHA-256 at startup. The stage's `factory.eagerness` (`low`, `medium` or `high`, default `medium`) sets how readily a pause ends the turn: `high` takes a shorter silence on a confident score and gives up a held pause sooner, `low` waits longer. The profile sets the `vad` node's `silence_duration_ms` to 160, the pause the detector scores as a candidate end; a client that selects `{"type": "server_vad"}` on this profile gets the VAD's boundaries unchanged, with that pause.
+
+A client selects the behaviour per session with the standard field, `{"turn_detection": {"type": "semantic_vad", "eagerness": "high"}}`; `session.created` lists `semantic_vad` under `turn_control` when the profile has the node. The Qwen3-Omni Session graph takes the node the same way: declare it in `examples/qwen3_omni/session_h200.yaml` beside `vad`, let `dialog` read `turn_detection:session` in place of `vad:session`, and publish `turn_detection: [session]` in place of `vad: [session]`.
 
 ### Scripted Conversation
 
@@ -346,7 +356,7 @@ A realtime client sends its settings in `session.update`. The first `session.upd
 | `instructions` | `system_prompt` of every node that has it (the `dialog`) | Any time; applies to the next prompt. At most 65536 characters, else `instructions exceed context or have invalid type`. |
 | `sglang.sampling.temperature` | `temperature` of every node that has it (`openai_chat`), 0 to 2 | First `session.update` only. |
 | `sglang.sampling.max_new_tokens_per_unit` | `max_tokens` of `openai_chat`, at least 1 | First `session.update` only. |
-| `audio.input.turn_detection` | The session's `vad` stage: `threshold`, `prefix_padding_ms`, `silence_duration_ms`; `type` must be `server_vad` | Any time. `null` turns detection off and utterances end only at `input_audio_buffer.commit`; send it in the first `session.update` (see [Allowed, with consequences](#allowed-with-consequences)). `eagerness` and `interrupt_response` are accepted and have no effect. |
+| `audio.input.turn_detection` | `type: server_vad` reaches the session's `vad` stage: `threshold`, `prefix_padding_ms`, `silence_duration_ms`; with a `turn_detection` node, `type: semantic_vad` and its `eagerness` reach that node, and `server_vad` makes it pass the VAD's boundaries through | Any time. `null` turns detection off and utterances end only at `input_audio_buffer.commit`; send it in the first `session.update` (see [Allowed, with consequences](#allowed-with-consequences)). `interrupt_response` is accepted and has no effect. |
 | `output_modalities` | `["text", "audio"]` or `["text"]` | Any time. |
 
 The realtime endpoint takes no per-node options. A `/v1/session` client sets them, together with the standard fields, as the `params` of its open frame and later as the fields of a `configure` control:
@@ -475,6 +485,17 @@ Declared as `vad: {stages: [vad], inputs: [input]}`; reports `speech.started` an
 | `max_open_sessions` | integer ≥ 1 | `16` | Sessions the detector holds at once. |
 | `max_concurrency` | integer ≥ 1 | `4` | Sessions it processes at once. |
 
+#### Stage `turn_detection`
+
+Declared as `turn_detection: {stages: [turn_detection], inputs: ["input:pcm16", "input:session", "vad:session"]}`; reports the turn's `speech.started` and `speech.stopped`, which the recognizer and the dialog read in place of the VAD's. A session's `turn_detection` overrides `eagerness`; set the options under `stages.turn_detection.factory` or as `--turn_detection.factory.<option>`.
+
+| Option | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `model_path` | string | `pipecat-ai/smart-turn-v3` | The Smart Turn ONNX file, its directory, or the Hugging Face repository holding `smart-turn-v3.2-gpu.onnx`. |
+| `eagerness` | `low`, `medium` or `high` | `medium` | How readily a pause ends the turn: the silence a confident, a likely and an unlikely end of turn needs. |
+| `max_open_sessions` | integer ≥ 1 | `16` | Sessions the node holds at once. |
+| `max_concurrency` | integer ≥ 1 | `4` | Sessions it processes at once. |
+
 #### Stage `asr`
 
 Declared as `asr: {stages: [asr], inputs: ["input:pcm16"]}`; runs Nemotron 3.5 streaming ASR on the GPU set by `stages.asr.gpu` (default 0) and produces the running `text` a `running_transcript` node reads.
@@ -535,7 +556,7 @@ Each rule is followed by the error it raises.
 - `instructions` longer than 65536 characters — `instructions exceed context or have invalid type`.
 - A `model` other than the deployment's — `model differs from deployment`.
 - An audio format other than 16 kHz input or 24 kHz output PCM — `unsupported PCM format or sample rate`.
-- A `turn_detection` with a `type` other than `server_vad` — `turn detection type is unavailable`; any non-null `turn_detection` in a profile without a `vad` node — `VAD is only available for turn-based sessions`.
+- A `turn_detection` with a `type` other than `server_vad`, or other than `server_vad` and `semantic_vad` in a profile with a `turn_detection` node — `turn detection type is unavailable`; any non-null `turn_detection` in a profile without a `vad` node — `VAD is only available for turn-based sessions`.
 - `nodes` in `session.update` — `invalid session configuration`.
 - `response.create` — `manual turn commands are not granted`.
 - `response.cancel` in a profile where no node takes `interrupt` from `input` on a control edge — `no node takes the control 'interrupt' from 'input'`.
@@ -647,6 +668,10 @@ Control types sent into a Session are `commit` (the utterance ends here) and `co
 ### VAD node
 
 Voice activity detection is a stage node: `sglang_omni.models.vad` hosts one Silero detector per Session in a CPU stage of its own, `vad`, declared with `stages: [vad]`, reading the Session input's audio and controls and publishing `session`. It emits `speech.started` and `speech.stopped` controls whose `t_ms` is the boundary on the input audio timeline, `speech.started` reaching `prefix_padding_ms` before the first speech frame; `commit` resets the detector. Nodes that place utterances read it through a `vad:session` edge. Its detector defaults are the stage's `factory` options `threshold`, `prefix_padding_ms` and `silence_duration_ms`; a Session's `turn_detection` overrides them for that Session alone, at open and through `configure`.
+
+### Turn detection node
+
+End-of-turn detection is a stage node beside the VAD: `sglang_omni.models.turn_detection` runs the Smart Turn v3.2 model in a CPU stage of its own, `turn_detection`, declared with `stages: [turn_detection]`, reading the Session input's audio and controls and `vad:session`, and publishing `session`. It emits the same `speech.started` and `speech.stopped` controls as the VAD, at the turn's boundaries: the VAD's `speech.started` opens a turn, and at each `speech.stopped` of the VAD the node scores the turn's audio, ending the turn after the silence that score requires, up to the longest pause of the eagerness preset; speech that resumes before then continues the turn, and `commit` forgets it. Nodes that place utterances or interrupt replies on speech read `turn_detection:session` in place of `vad:session`. The stage's `factory` options are `model_path` (`SGLANG_OMNI_SMART_TURN_MODEL_PATH` when unset) and `eagerness`; a Session's `turn_detection` selects `semantic_vad` with an `eagerness`, or `server_vad`, which passes the VAD's boundaries through, at open and through `configure`. `SessionPorts.turn_detection_types` names the `turn_detection.type` values a Session's nodes implement, and the realtime bridge offers them as `turn_control`.
 
 ### Interruption
 

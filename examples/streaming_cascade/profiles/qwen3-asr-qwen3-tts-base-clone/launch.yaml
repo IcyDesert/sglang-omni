@@ -1,6 +1,12 @@
-# Qwen3-ASR transcribes each utterance through its transcription endpoint, Qwen3-4B answers and Qwen3-TTS Base speaks it in a voice cloned from a reference recording, each a service of its own, with the VAD node beside the cascade.
+# Qwen3-ASR transcribes each utterance through its transcription endpoint, Qwen3-4B answers and Qwen3-TTS Base speaks it in a voice cloned from a reference recording, each a service of its own, with the VAD node beside the cascade, and Smart Turn ending the turns: the turn_detection node holds a turn across a pause the end-of-turn model does not take for its end.
 config_cls: StreamingCascadePipelineConfig
 model_path: examples/streaming_cascade/profiles/qwen3-asr-qwen3-tts-base-clone
+
+stages:
+  vad:
+    factory:
+      # A pause this long is a candidate end the turn_detection node scores; SemanticVADConfig.candidate_pause_ms.
+      silence_duration_ms: 160
 
 services:
   - name: chat
@@ -17,9 +23,12 @@ session_nodes:
   vad:
     stages: [vad]
     inputs: [input]
+  turn_detection:
+    stages: [turn_detection]
+    inputs: ["input:pcm16", "input:session", "vad:session"]
   asr:
     kind: openai_transcription
-    inputs: [input, "vad:session"]
+    inputs: [input, "turn_detection:session"]
     base_url: "http://127.0.0.1:8002/v1"
     model: Qwen/Qwen3-ASR-1.7B
   dialog:
@@ -28,7 +37,7 @@ session_nodes:
       - asr
       - {source: "llm:text_delta", feedback: true, overflow: drop_oldest, capacity: 1024}
       - {source: "tts:session", feedback: true, overflow: drop_oldest, capacity: 1024}
-      - "vad:session"
+      - "turn_detection:session"
       - "input:session"
       - {kind: control, source: input, event: interrupt}
       - {kind: control, source: aligner, event: reply.progress}
@@ -62,7 +71,7 @@ session_nodes:
     inputs: ["llm:text_delta", "tts:pcm_f32le", "tts:session", "dialog:session", "input:session"]
 
 session_publish:
-  vad: [session]
+  turn_detection: [session]
   asr: [transcript]
   dialog: [session]
   llm: [text_delta]

@@ -405,6 +405,7 @@ async def test_qwen3_omni_node_outputs_project_without_a_model_adapter():
         unit_ms=200,
         controls=frozenset({COMMIT, CONFIGURE, INTERRUPT, TRUNCATE}),
         hot_settings=frozenset({"turn_detection"}),
+        turn_detection_types=("server_vad",),
     )
     ports = vad_only.with_node(QWEN3_OMNI_PORTS)
     assert ports.output == AudioPort(PCM_F32, 24000)

@@ -1762,8 +1762,8 @@ def realtime_unavailable_response(message: str) -> JSONResponse:
 
 def register_realtime(app: FastAPI) -> None:
     """Mount the OpenAI-compatible WebSocket Realtime endpoint."""
+    from sglang_omni.audio.smart_turn import load_smart_turn
     from sglang_omni.serve.realtime import RealtimeSessionManager
-    from sglang_omni.serve.realtime.smart_turn import load_smart_turn
 
     client: Client = app.state.client
     model_name: str = app.state.model_name

@@ -10,6 +10,7 @@ from sglang_omni.proto.streams import (
     COMMIT,
     CONFIGURE,
     PCM16,
+    SERVER_VAD,
     SESSION_INPUT_SAMPLE_RATE_HZ,
     SESSION_UNIT_MS,
     AudioPort,
@@ -24,6 +25,7 @@ SESSION_PORTS = SessionPorts(
     unit_ms=SESSION_UNIT_MS,
     controls=frozenset({COMMIT, CONFIGURE}),
     hot_settings=frozenset({"turn_detection"}),
+    turn_detection_types=(SERVER_VAD,),
 )
 
 

@@ -82,6 +82,7 @@ CASCADE_PORTS = SessionPorts(
     controls=frozenset({COMMIT, CONFIGURE, INTERRUPT, TRUNCATE}),
     hot_settings=frozenset({"instructions", "sampling", "turn_detection"}),
     sampling_parameters=("temperature", "max_new_tokens_per_unit"),
+    turn_detection_types=("server_vad",),
 )
 
 
@@ -494,7 +495,9 @@ def test_profile_graph_turns_formats_and_ports():
     assert [n.name for n in settings.nodes if n.ends_turns] == ["llm", "tts"]
     assert settings.publish["llm"] == [TEXT_DELTA]
     hot_settings = frozenset({"instructions", "sampling"})
-    assert settings.ports(200) == replace(CASCADE_PORTS, hot_settings=hot_settings)
+    assert settings.ports(200) == replace(
+        CASCADE_PORTS, hot_settings=hot_settings, turn_detection_types=()
+    )
     assert declared(unit_ms=100).session_ports().unit_ms == 100
     text_only = ComponentGraphConfig.model_validate(yaml.safe_load(TEXT_ONLY)).ports(
         200

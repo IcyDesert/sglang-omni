@@ -36,6 +36,9 @@ TOOL_CALL = "tool_call"
 # {"responses": [{"id": str, "name": str, "response": object}, ...]}
 TOOL_RESPONSE = "tool_response"
 SESSION_CONTROL = "session"  # {"type": <control type>, ...}
+# `turn_detection.type` of a realtime session: speech boundaries end turns, or an end-of-turn model holds a turn across a pause
+SERVER_VAD = "server_vad"
+SEMANTIC_VAD = "semantic_vad"
 
 COMMIT = "commit"  # the utterance ends here
 CONFIGURE = "configure"  # settings change; answered with CONFIGURED
@@ -124,7 +127,7 @@ class ImagePort:
 
 @dataclass(frozen=True)
 class SessionPorts:
-    """What a pipeline's Session accepts and produces; `input` is one audio port and the image ports of the nodes that see; hot_settings are the realtime session fields a CONFIGURE control may change while it is open."""
+    """What a pipeline's Session accepts and produces; `input` is one audio port and the image ports of the nodes that see; hot_settings are the realtime session fields a CONFIGURE control may change while it is open; turn_detection_types are the `turn_detection.type` values its nodes implement."""
 
     input: tuple[AudioPort | ImagePort, ...]
     output: AudioPort | None
@@ -132,6 +135,7 @@ class SessionPorts:
     controls: frozenset[str] = frozenset()
     hot_settings: frozenset[str] = frozenset()
     sampling_parameters: tuple[str, ...] = ()
+    turn_detection_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         audio_ports = [port for port in self.input if isinstance(port, AudioPort)]
@@ -177,5 +181,11 @@ class SessionPorts:
                 parameter
                 for parameter in node.sampling_parameters
                 if parameter not in self.sampling_parameters
+            ),
+            turn_detection_types=self.turn_detection_types
+            + tuple(
+                kind
+                for kind in node.turn_detection_types
+                if kind not in self.turn_detection_types
             ),
         )
