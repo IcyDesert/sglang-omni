@@ -35,6 +35,7 @@ from sglang_omni.models.streaming_cascade.config import (
 )
 from sglang_omni.models.streaming_cascade.dialog import heard_prefix
 from sglang_omni.models.streaming_cascade.generators import ChatDelta
+from sglang_omni.models.streaming_cascade.numerals import spoken_text
 from sglang_omni.models.streaming_cascade.recognizers import probe_realtime_service
 from sglang_omni.models.streaming_cascade.running_transcript import (
     RunningTranscript,
@@ -683,6 +684,156 @@ async def test_openai_speech_tags_each_sentence_with_its_language(backends):
     ]
     await drain(build({**tts, "language": "English"}), inputs)
     assert spoken[-1] == "你好世界。" and " ".join(spoken[:-1]) == "Hello world."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["english_tts"], indirect=True)
+async def test_openai_speech_reads_the_digits_of_an_english_sentence_as_words(
+    backends,
+):
+    settings, _, spoken, _ = backends
+    tts = settings.component_graph().node("tts").component.model_dump()
+    await drain(
+        build({**tts, "language": "auto", "max_sentence_words": 24}),
+        [
+            text_chunk("This year is 2024.", 1, "English"),
+            control_chunk(TURN_DONE, turn=1),
+            text_chunk("今年是2024年。", 2, "Chinese"),
+            control_chunk(TURN_DONE, turn=2),
+        ],
+    )
+    assert spoken == ["This year is twenty twenty four.", "今年是2024年。"]
+
+
+@pytest.mark.parametrize(
+    "text, language, spoken, origin",
+    [
+        ("我有3个", "English", "我有 three 个", [0, 1] + [2] * 7 + [3]),
+        ("我有3个", "Chinese", "我有 三 个", [0, 1, 2, 2, 2, 3]),
+        ("3.14", "Chinese", "三点一四", [3, 3, 3, 3]),
+        ("21", "Japanese", "21", [1, 1]),
+        ("In 2024.", "English", "In twenty twenty four.", [0, 1, 2] + [6] * 18 + [7]),
+    ],
+)
+def test_spoken_text_reads_numbers_in_the_sentence_language(
+    text, language, spoken, origin
+):
+    assert spoken_text(text, language) == (spoken, origin)
+
+
+@pytest.mark.parametrize(
+    ("text", "spoken"),
+    [
+        pytest.param(
+            "This year is 2024.", "This year is twenty twenty four.", id="year"
+        ),
+        pytest.param(
+            "Built in 1887, 1900, 1905, 2000 and 2005.",
+            "Built in eighteen eighty seven, nineteen hundred, nineteen oh five, two thousand and two thousand five.",
+            id="years_ending_in_00_to_09",
+        ),
+        pytest.param(
+            "The iPhone 17 costs 799 dollars, or 12,999 yuan.",
+            "The iPhone seventeen costs seven hundred ninety nine dollars, or twelve thousand nine hundred ninety nine yuan.",
+            id="cardinals_with_a_thousands_separator",
+        ),
+        pytest.param(
+            "Call 138 1234 5678, 13812345678 or 0199.",
+            "Call one three eight one two three four five six seven eight, one three eight one two three four five six seven eight or zero one nine nine.",
+            id="grouped_long_and_zero_led_digits_are_spelled",
+        ),
+        pytest.param(
+            "Over 21,000 people, about 3.5 million.",
+            "Over twenty one thousand people, about three point five million.",
+            id="thousands_and_decimals",
+        ),
+        pytest.param(
+            "Codes 007, 001, 00 and 0.",
+            "Codes zero zero seven, zero zero one, zero zero and zero.",
+            id="multiple_leading_zeros",
+        ),
+        pytest.param(
+            "Version 2.0.1.",
+            "Version two point zero . one.",
+            id="version_separators",
+        ),
+        pytest.param(
+            "It takes 3-5 days.",
+            "It takes three to five days.",
+            id="range_separator",
+        ),
+        pytest.param(
+            "The 21st century began on January 1st, 2001, in the 3rd millennium.",
+            "The twenty first century began on January first, two thousand one, in the third millennium.",
+            id="ordinals",
+        ),
+    ],
+)
+def test_spoken_text_reads_english_years_prices_and_phone_numbers(text, spoken):
+    spoken_words, origin = spoken_text(text, "English")
+    assert spoken_words == spoken
+    assert len(origin) == len(spoken) and origin[-1] == len(text) - 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "digits, words",
+    [("007", "zero zero seven"), ("001", "zero zero one"), ("00", "zero zero")],
+)
+async def test_openai_speech_preserves_multiple_leading_zeros(
+    digits: str, words: str
+) -> None:
+    assert await spoken_requests(
+        {"language": "English"}, [text_chunk(f"The code is {digits}.", 1, "English")]
+    ) == [("English", f"The code is {words}.")]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("It takes 3-5 days.", "It takes three to five days."),
+        ("Wait 3 - 5 DAYS.", "Wait three to five DAYS."),
+        ("Wait 3\u20135 minutes.", "Wait three to five minutes."),
+        ("Walk 3.5-5 kilometers.", "Walk three point five to five kilometers."),
+        ("Pay 1,000-2,000 dollars.", "Pay one thousand to two thousand dollars."),
+        ("In 2024-2025 years.", "In twenty twenty four to twenty twenty five years."),
+        ("Compute 3-5 = -2.", "Compute three - five = - two."),
+        ("Version 2.0.1.", "Version two point zero . one."),
+        (
+            "Call 138-1234-5678.",
+            "Call one hundred thirty eight - one thousand two hundred thirty four - five thousand six hundred seventy eight.",
+        ),
+        ("Model X3-5 days.", "Model X three - five days."),
+        ("Code 007-009 days.", "Code zero zero seven - zero zero nine days."),
+    ],
+)
+def test_spoken_text_recognizes_quantity_ranges(text: str, expected: str) -> None:
+    spoken, origin = spoken_text(text, "English")
+    assert spoken == expected
+    assert len(origin) == len(spoken) and origin == sorted(origin)
+    assert origin[-1] == len(text) - 1
+
+
+def test_spoken_range_maps_each_endpoint_and_to_back_to_source() -> None:
+    spoken, origin = spoken_text("3-5 days.", "English")
+    assert spoken == "three to five days."
+    assert origin == [0] * len("three") + [1] * len(" to ") + [2] * len("five") + list(
+        range(3, 9)
+    )
+
+
+@pytest.mark.parametrize("language", ["Chinese", "Japanese"])
+def test_quantity_range_words_are_only_inserted_for_english(language: str) -> None:
+    spoken, origin = spoken_text("3-5 days.", language)
+    assert "to" not in spoken
+    assert "-" in spoken and len(origin) == len(spoken)
+
+
+@pytest.mark.asyncio
+async def test_openai_speech_reads_a_quantity_range_as_to() -> None:
+    assert await spoken_requests(
+        {"language": "English"}, [text_chunk("It takes 3-5 days.", 1, "English")]
+    ) == [("English", "It takes three to five days.")]
 
 
 @pytest.mark.asyncio
@@ -1374,8 +1525,10 @@ async def test_chat_deltas_carry_the_language_of_their_messages():
     ]
 
 
-async def spoken_languages(spec: dict, deltas: list[TimedChunk]) -> list[str]:
-    """The language tag of each sentence the synthesizer speaks for the deltas of turn 1."""
+async def spoken_requests(
+    spec: dict, deltas: list[TimedChunk]
+) -> list[tuple[str, str]]:
+    """The language tag and the input of each sentence the synthesizer speaks for the deltas of turn 1."""
     bodies = []
 
     def answer(request: httpx.Request) -> httpx.Response:
@@ -1387,7 +1540,23 @@ async def spoken_languages(spec: dict, deltas: list[TimedChunk]) -> list[str]:
     tts = build({"kind": "openai_speech", **HTTP_SERVICE, **spec})
     tts.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
     await drain(tts, [*deltas, control_chunk(TURN_DONE, turn=1)])
-    return [body["language"] for body in bodies]
+    return [(body["language"], body["input"]) for body in bodies]
+
+
+async def spoken_languages(spec: dict, deltas: list[TimedChunk]) -> list[str]:
+    return [language for language, _ in await spoken_requests(spec, deltas)]
+
+
+@pytest.mark.asyncio
+async def test_openai_speech_keeps_the_digits_of_a_chinese_script_sentence_tagged_english():
+    deltas = [
+        text_chunk("This year is 2024. ", 1, "English"),
+        text_chunk("今年是2024年。", 1, "English"),
+    ]
+    assert await spoken_requests({"language": "auto"}, deltas) == [
+        ("English", "This year is twenty twenty four."),
+        ("English", "今年是2024年。"),
+    ]
 
 
 @pytest.mark.asyncio

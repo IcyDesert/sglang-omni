@@ -23,6 +23,7 @@ from sglang_omni.models.streaming_cascade.base import (
     replying,
     sentences,
 )
+from sglang_omni.models.streaming_cascade.numerals import spoken_text
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.proto.streams import (
     REPLY_PROGRESS,
@@ -40,6 +41,10 @@ UNSPOKEN_SYMBOLS = re.compile(
 )
 
 
+def has_chinese_characters(sentence: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in sentence)
+
+
 class OpenAISpeechSynthesizerConfig(ComponentConfig):
     """Sentence-chunked `/v1/audio/speech` streaming PCM, one request per sentence.
 
@@ -47,6 +52,8 @@ class OpenAISpeechSynthesizerConfig(ComponentConfig):
     service, `auto` follows the language the recognizer heard from the
     user, and any other name tags every sentence without Chinese characters.
     Without a known user language `auto` tags by script like `English`.
+    A sentence tagged English, with no Chinese characters, reaches the
+    service with its numbers read out as words.
     """
 
     kind: Literal["openai_speech"] = "openai_speech"
@@ -140,7 +147,7 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
         """The language tag of one sentence."""
         if self.config.language == "auto" and self.session_language is not None:
             return self.session_language
-        elif any("\u4e00" <= char <= "\u9fff" for char in sentence):
+        elif has_chinese_characters(sentence):
             # Note (Junnan Li): A sentence with CJK characters is spoken as Chinese whatever the configured language, so a reply in the user's language keeps the right tag.
             return "Chinese"
         elif self.config.language == "auto":
@@ -169,7 +176,13 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
             "stream": True,
         }
         if self.config.language:
-            body["language"] = self.sentence_language(sentence)
+            language = self.sentence_language(sentence)
+            body["language"] = language
+            if language == "English" and not has_chinese_characters(sentence):
+                # Note (ruoyu): A Base voice cloned from a Chinese reference read the digits of English sentences as Chinese numerals in 12 of 50 takes and the same numbers written as words in 0 of 50; the aligner reads the digits with the same words.
+                body["input"] = spoken_text(sentence, language)[0]
+            else:
+                pass
         else:
             pass
         if self.config.reference_audio_path:

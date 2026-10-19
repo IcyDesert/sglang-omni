@@ -9,14 +9,12 @@ import argparse
 import base64
 import binascii
 import logging
-import re
 import threading
 
 import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from num2words import num2words
 from pydantic import BaseModel, ConfigDict, Field
 from qwen_asr import Qwen3ForcedAligner
 
@@ -25,60 +23,9 @@ from sglang_omni.models.streaming_cascade.alignment import (
     AlignmentBoundary,
     AlignmentResult,
 )
+from sglang_omni.models.streaming_cascade.numerals import spoken_text
 
 logger = logging.getLogger("alignment_worker")
-
-DIGITS = re.compile(r"\d+")
-CHINESE_DIGITS = "零一二三四五六七八九"
-CHINESE_UNITS = ("", "十", "百", "千")
-
-
-def chinese_numeral(digits: str) -> str:
-    """`digits` read out in Chinese: a number up to 9999 with its place units, anything longer digit by digit."""
-    if len(digits) > 4:
-        return "".join(CHINESE_DIGITS[int(digit)] for digit in digits)
-    elif int(digits) == 0:
-        return CHINESE_DIGITS[0]
-    else:
-        spoken = ""
-        for position, digit in enumerate(reversed(digits)):
-            if digit == "0":
-                spoken = (
-                    "零" if spoken and not spoken.startswith("零") else ""
-                ) + spoken
-            elif position == 1 and digit == "1" and len(digits) == 2:
-                spoken = "十" + spoken
-            else:
-                spoken = CHINESE_DIGITS[int(digit)] + CHINESE_UNITS[position] + spoken
-        return spoken.rstrip("零")
-
-
-def number_words(digits: str, language: str) -> str:
-    if language == "Chinese":
-        return chinese_numeral(digits)
-    elif language == "English":
-        # Note (Junnan Li): The aligner splits a hyphenated number word in two, so the spoken form is written with a space.
-        return num2words(int(digits), lang="en").replace("-", " ")
-    else:
-        return digits
-
-
-def spoken_text(text: str, language: str) -> tuple[str, list[int]]:
-    """`text` with each digit run read out as words, and for each spoken character the original character it stands for."""
-    spoken = []
-    origin: list[int] = []
-    cursor = 0
-    for match in DIGITS.finditer(text):
-        spoken.append(text[cursor : match.start()])
-        origin.extend(range(cursor, match.start()))
-        # Note (Junnan Li): Number words joined to their neighbours without a space would read as one token to the aligner.
-        words = f" {number_words(match.group(), language)} "
-        spoken.append(words)
-        origin.extend([match.end() - 1] * len(words))
-        cursor = match.end()
-    spoken.append(text[cursor:])
-    origin.extend(range(cursor, len(text)))
-    return "".join(spoken), origin
 
 
 class AlignmentRequest(BaseModel):
