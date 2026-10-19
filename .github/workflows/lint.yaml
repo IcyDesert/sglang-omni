@@ -66,3 +66,6 @@ jobs:
 
       - name: Test realtime demo heard text
         run: node --test playground/cascade/frontend/orb/session.test.mjs
+
+      - name: Test native realtime playback cadence and lifecycle
+        run: node --test playground/realtime/frontend/orb/*.test.mjs

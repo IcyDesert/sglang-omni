@@ -122,7 +122,7 @@ export class DuplexSession {
 
   emit(name, payload) {
     const listener = this.listeners[name];
-    if (listener) listener(payload);
+    if (listener) return listener(payload);
   }
 
   record(direction, event, extra = null) {
@@ -286,7 +286,7 @@ export class DuplexSession {
     return found;
   }
 
-  handle(event) {
+  async handle(event) {
     this.record("receive", event);
     const extension = event.sglang || {};
     switch (event.type) {
@@ -319,7 +319,7 @@ export class DuplexSession {
           this.image = null;
           this.stopFrames();
         }
-        this.emit("granted", this.granted);
+        await this.emit("granted", this.granted);
         this.emit("image", this.image);
         break;
       }
