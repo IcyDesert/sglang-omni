@@ -7,7 +7,7 @@ import re
 NUMBER = re.compile(
     r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:(?P<ordinal_suffix>st|nd|rd|th)\b)?"
 )
-WORD_CHARACTER = re.compile(r"\w")
+ADJACENT_WORD = re.compile(r"\S*\w")
 GROUP_BEFORE = re.compile(r"\d \Z")
 GROUP_AFTER = re.compile(r"\A \d")
 CHINESE_DIGITS = "零一二三四五六七八九"
@@ -149,7 +149,7 @@ def english_numeral(digits: str, is_grouped: bool) -> str:
     if (
         is_grouped
         or len(digits) > MAX_CARDINAL_DIGITS
-        or digits[0] == "0" < digits[1:2]
+        or (len(digits) > 1 and digits.startswith("0"))
     ):
         return " ".join(ENGLISH_ONES[int(digit)] for digit in digits)
     elif len(digits) == 4 and FIRST_SPOKEN_YEAR <= number <= LAST_SPOKEN_YEAR:
@@ -194,11 +194,11 @@ def spoken_text(text: str, language: str) -> tuple[str, list[int]]:
         numeral = match.group()[: -len(ordinal_suffix) if ordinal_suffix else None]
         words = number_words(numeral, language, is_grouped, ordinal_suffix)
         # Note (Junnan Li): Number words joined to their neighbours without a space would read as one token to the aligner.
-        if WORD_CHARACTER.match(before[-1:]):
+        if before and not before[-1].isspace():
             words = f" {words}"
         else:
             pass
-        if WORD_CHARACTER.match(after[:1]):
+        if ADJACENT_WORD.match(after):
             words = f"{words} "
         else:
             pass

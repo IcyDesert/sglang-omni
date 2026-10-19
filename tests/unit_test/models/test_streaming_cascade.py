@@ -743,6 +743,21 @@ def test_spoken_text_reads_numbers_in_the_sentence_language(
             id="thousands_and_decimals",
         ),
         pytest.param(
+            "Codes 007, 001, 00 and 0.",
+            "Codes zero zero seven, zero zero one, zero zero and zero.",
+            id="multiple_leading_zeros",
+        ),
+        pytest.param(
+            "Version 2.0.1.",
+            "Version two point zero . one.",
+            id="version_separators",
+        ),
+        pytest.param(
+            "It takes 3-5 days.",
+            "It takes three - five days.",
+            id="range_separator",
+        ),
+        pytest.param(
             "The 21st century began on January 1st, 2001, in the 3rd millennium.",
             "The twenty first century began on January first, two thousand one, in the third millennium.",
             id="ordinals",
@@ -753,6 +768,19 @@ def test_spoken_text_reads_english_years_prices_and_phone_numbers(text, spoken):
     spoken_words, origin = spoken_text(text, "English")
     assert spoken_words == spoken
     assert len(origin) == len(spoken) and origin[-1] == len(text) - 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "digits, words",
+    [("007", "zero zero seven"), ("001", "zero zero one"), ("00", "zero zero")],
+)
+async def test_openai_speech_preserves_multiple_leading_zeros(
+    digits: str, words: str
+) -> None:
+    assert await spoken_requests(
+        {"language": "English"}, [text_chunk(f"The code is {digits}.", 1, "English")]
+    ) == [("English", f"The code is {words}.")]
 
 
 @pytest.mark.asyncio
