@@ -25,7 +25,7 @@ def backend_requests():
 
 @pytest.fixture(params=["streaming"])
 def backends(request, backend_requests):
-    """Loopback transcription, chat SSE and streaming speech on one HTTP server.
+    """Loopback transcription, chat SSE, streaming speech and forced alignment on one HTTP server.
 
     In the streaming scenario the chat holds its reply until the
     speech service has sent audio, so a cascade that waits for the whole reply fails.
@@ -45,8 +45,11 @@ def backends(request, backend_requests):
             self.wfile.flush()
 
         def do_GET(self):
-            assert self.path == "/v1/models"
-            self.send("application/json", json.dumps({"data": []}).encode())
+            if self.path == "/health":
+                self.send("application/json", b'{"status": "ready"}')
+            else:
+                assert self.path == "/v1/models"
+                self.send("application/json", json.dumps({"data": []}).encode())
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
@@ -81,12 +84,24 @@ def backends(request, backend_requests):
                 self.send("audio/pcm", pcm[:3], **rate)
                 self.wfile.write(pcm[3:])
                 audio_sent.set()
+            elif self.path == "/align" and scenario == "failed_align":
+                self.send_response(500)
+                self.end_headers()
+            elif self.path == "/align":
+                backend_requests.append(json.loads(body))
+                self.send("application/json", b'{"boundaries": []}')
             else:
                 self.send_response(404)
                 self.end_headers()
 
         def chat(self, request: dict) -> None:
             assert request["model"] == CHAT_MODEL
+            if request.get("min_tokens", 0) > request["max_tokens"]:
+                self.send_response(400)
+                self.end_headers()
+                return
+            else:
+                pass
             received_messages.append(request["messages"])
             backend_requests.append(request)
             self.send("text/event-stream")

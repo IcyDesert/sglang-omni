@@ -17,6 +17,7 @@ import yaml
 
 from sglang_omni.audio.segmentation import UtteranceSegmenter
 from sglang_omni.config.manager import ConfigManager
+from sglang_omni.models.streaming_cascade.alignment import AlignmentConfig
 from sglang_omni.models.streaming_cascade.base import (
     ChatMessage,
     Replies,
@@ -64,6 +65,7 @@ from sglang_omni.proto.streams import (
     SessionPorts,
     control_type,
 )
+from tests.unit_test.fixtures.cascade_backends import CHAT_MODEL
 from tests.unit_test.fixtures.cascade_fakes import QUIET, build, drain
 from tests.unit_test.fixtures.session_outputs import control_chunk
 
@@ -695,7 +697,7 @@ async def test_openai_speech_refuses_audio_of_an_unnamed_rate(backends):
 
 @pytest.mark.asyncio
 async def test_realtime_probe_requests_models_over_http(backends):
-    """The loopback server answers only `/v1/models`, so a passing probe asked for it."""
+    """The loopback server answers no realtime endpoint, so a passing probe asked for `/v1/models` over HTTP."""
     base_url = backends[0].component_graph().node("asr").component.base_url
     ws_url = base_url.replace("http", "ws").removesuffix("/v1")
     await probe_realtime_service(
@@ -703,6 +705,87 @@ async def test_realtime_probe_requests_models_over_http(backends):
             {"kind": "realtime_transcription", "base_url": ws_url, "model": "test-asr"}
         )
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["length_chat"], indirect=True)
+async def test_the_chat_probe_streams_one_token_sampled_with_the_node_settings(
+    backends, backend_requests
+):
+    llm = backends[0].component_graph().node("llm").component.model_dump()
+    config = COMPONENTS.parse({**llm, "temperature": 0.7, "extra_body": {"top_p": 0.9}})
+    await COMPONENTS.kind("openai_chat").probe(config)
+    [request] = backend_requests
+    assert [message["role"] for message in request.pop("messages")] == ["user"]
+    assert request == {
+        "model": CHAT_MODEL,
+        "stream": True,
+        "max_tokens": 1,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minimum_tokens", [0, 1, 16])
+@pytest.mark.parametrize("backends", ["length_chat"], indirect=True)
+async def test_the_chat_probe_preserves_the_real_request_minimum_tokens(
+    backends, backend_requests, minimum_tokens: int
+) -> None:
+    llm = backends[0].component_graph().node("llm").component.model_dump()
+    config = COMPONENTS.parse(
+        {
+            **llm,
+            "max_tokens": 32,
+            "extra_body": {"min_tokens": minimum_tokens, "top_p": 0.9},
+        }
+    )
+    await COMPONENTS.kind("openai_chat").probe(config)
+    [request] = backend_requests
+    assert request["max_tokens"] == 1 and request["min_tokens"] == 0
+    assert request["top_p"] == 0.9
+    assert config.max_tokens == 32
+    assert config.extra_body == {"min_tokens": minimum_tokens, "top_p": 0.9}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["failed_chat"], indirect=True)
+async def test_the_chat_probe_fails_the_start_when_the_service_cannot_complete(
+    backends,
+):
+    llm = backends[0].component_graph().node("llm").component
+    with pytest.raises(RuntimeError, match="LLM stopped"):
+        await COMPONENTS.kind("openai_chat").probe(llm)
+
+
+def loopback_aligner(backends) -> AlignmentConfig:
+    """A forced alignment config whose worker is the loopback server."""
+    base_url = backends[0].component_graph().node("asr").component.base_url
+    return COMPONENTS.parse(
+        {
+            "kind": "alignment",
+            "method": "forced",
+            "alignment_url": base_url.removesuffix("/v1"),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_forced_alignment_probe_aligns_one_clip(backends, backend_requests):
+    await COMPONENTS.kind("alignment").probe(loopback_aligner(backends))
+    [request] = backend_requests
+    assert len(base64.b64decode(request.pop("audio"))) == 2 * 24000
+    assert request.pop("text")
+    assert request == {"sample_rate_hz": 24000, "audio_format": "pcm16"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends", ["failed_align"], indirect=True)
+async def test_the_forced_alignment_probe_fails_the_start_when_the_worker_cannot_align(
+    backends,
+):
+    with pytest.raises(RuntimeError, match="answered 500"):
+        await COMPONENTS.kind("alignment").probe(loopback_aligner(backends))
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from sglang_omni.audio.spoken_prefix import spoken_prefix_end
 from sglang_omni.models.streaming_cascade.base import (
+    PROBE_TIMEOUT_S,
     SPEECH_SAMPLE_RATE_HZ,
     ComponentConfig,
     StreamComponent,
@@ -43,6 +44,8 @@ from sglang_omni.scheduling.session import ChunkEmitter
 logger = logging.getLogger(__name__)
 
 MAX_ALIGNMENT_AUDIO_BYTES = 32 * 1024 * 1024
+WARM_UP_TEXT = "hello"
+WARM_UP_SAMPLES = np.zeros(SPEECH_SAMPLE_RATE_HZ, dtype=np.float32)
 
 
 class AlignmentBoundary(BaseModel):
@@ -101,9 +104,25 @@ class AlignmentConfig(ComponentConfig):
 
 async def probe_alignment_worker(config: AlignmentConfig) -> None:
     if config.method == "forced":
-        await probe_models(
-            f"{config.alignment_url.rstrip('/')}/health", config.timeout_s, ""
-        )
+        worker_url = config.alignment_url.rstrip("/")
+        await probe_models(f"{worker_url}/health", config.timeout_s, "")
+        # Note (ruoyu): The worker's first request after startup ran past a sentence's timeout_s of 2 s on a cold container, and took 0.45 s on a restarted worker, so the first reply of a fresh deployment had no word ends; one alignment here pays that before the node reports ready.
+        async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_S) as client:
+            try:
+                response = await client.post(
+                    f"{worker_url}/align",
+                    json=alignment_request(
+                        WARM_UP_TEXT, pcm16_bytes(WARM_UP_SAMPLES), None
+                    ),
+                )
+            except httpx.TransportError as error:
+                raise RuntimeError(
+                    f"cannot reach {worker_url}/align: {error!r}"
+                ) from error
+        if response.status_code != 200:
+            raise RuntimeError(f"{worker_url}/align answered {response.status_code}")
+        else:
+            pass
     else:
         pass
     if config.hears():
@@ -403,18 +422,10 @@ class Alignment(StreamComponent):
             return []
         else:
             pass
-        body = with_language(
-            {
-                "text": sentence.text,
-                "audio": base64.b64encode(pcm16).decode(),
-                "sample_rate_hz": SPEECH_SAMPLE_RATE_HZ,
-                "audio_format": "pcm16",
-            },
-            sentence.language,
-        )
         try:
             response = await self.client.post(
-                f"{self.config.alignment_url.rstrip('/')}/align", json=body
+                f"{self.config.alignment_url.rstrip('/')}/align",
+                json=alignment_request(sentence.text, pcm16, sentence.language),
             )
         except httpx.TransportError as error:
             logger.warning("alignment worker failed: %r", error)
@@ -458,6 +469,21 @@ def progress(emit: ChunkEmitter, turn: int, text_end: int, audio_ms: float) -> N
 
 def pcm16_bytes(samples: np.ndarray) -> bytes:
     return (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+
+
+def alignment_request(
+    text: str, pcm16: bytes, language: str | None
+) -> dict[str, object]:
+    """The worker's request for the word ends of text in its pcm16 audio."""
+    return with_language(
+        {
+            "text": text,
+            "audio": base64.b64encode(pcm16).decode(),
+            "sample_rate_hz": SPEECH_SAMPLE_RATE_HZ,
+            "audio_format": "pcm16",
+        },
+        language,
+    )
 
 
 def heard_audio(reply: SpokenReply, cut_ms: float) -> HeardAudio | None:

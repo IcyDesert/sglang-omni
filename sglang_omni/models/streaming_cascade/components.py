@@ -19,6 +19,7 @@ from sglang_omni.models.streaming_cascade.dialog import Dialog, DialogConfig
 from sglang_omni.models.streaming_cascade.generators import (
     OpenAIChatGenerator,
     OpenAIChatGeneratorConfig,
+    probe_chat_service,
 )
 from sglang_omni.models.streaming_cascade.recognizers import (
     OpenAITranscriptionRecognizer,
@@ -182,7 +183,7 @@ COMPONENTS.register(
     consumes=frozenset({MESSAGES}),
     produces=frozenset({TEXT_DELTA, SESSION_CONTROL}),
     ends_turns=True,
-    probe=probe_openai_service,
+    probe=probe_chat_service,
 )
 COMPONENTS.register(
     OpenAISpeechSynthesizerConfig,
