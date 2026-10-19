@@ -39,6 +39,7 @@ from sglang_omni.models.streaming_cascade.running_transcript import (
     RunningTranscript,
     RunningTranscriptConfig,
 )
+from sglang_omni.models.streaming_cascade.speakable import speakable_text
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.proto.streams import (
     AUDIO,
@@ -626,6 +627,11 @@ async def test_openai_speech_reports_each_sentence_end_as_a_character_offset(bac
         pytest.param(
             "今天最高25℃，体感20°。", ["今天最高25℃，体感20°。"], id="unit_symbols_stay"
         ),
+        pytest.param(
+            "3*4 is 12, and 3 * 4 too.",
+            ["3*4 is 12, and 3 * 4 too."],
+            id="multiplication_stays",
+        ),
     ],
 )
 async def test_openai_speech_sends_only_the_spoken_words_to_the_speech_service(
@@ -638,6 +644,24 @@ async def test_openai_speech_sends_only_the_spoken_words_to_the_speech_service(
         [text_chunk(reply, 1), control_chunk(TURN_DONE, turn=1)],
     )
     assert spoken == expected_spoken
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected_text", "expected_origin"),
+    [
+        pytest.param("好😄的", "好的", [0, 2], id="emoji"),
+        pytest.param("看[文档](http://x.io)吧", "看文档吧", [0, 2, 3, 18], id="link"),
+        pytest.param("**很**好", "很好", [2, 5], id="emphasis"),
+        pytest.param("2*3", "2*3", [0, 1, 2], id="multiplication"),
+    ],
+)
+def test_speakable_text_maps_each_spoken_character_to_the_reply(
+    reply, expected_text, expected_origin
+):
+    text, origin = speakable_text(reply)
+    assert text == expected_text
+    assert origin == expected_origin
+    assert "".join(reply[index] for index in origin) == text
 
 
 @pytest.mark.asyncio

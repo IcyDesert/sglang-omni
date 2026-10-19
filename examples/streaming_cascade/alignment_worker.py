@@ -25,6 +25,7 @@ from sglang_omni.models.streaming_cascade.alignment import (
     AlignmentBoundary,
     AlignmentResult,
 )
+from sglang_omni.models.streaming_cascade.speakable import speakable_text
 
 logger = logging.getLogger("alignment_worker")
 
@@ -130,7 +131,10 @@ def create_app(model: str, device: str, default_language: str) -> FastAPI:
             language = default_language
         else:
             language = request.language
-        text, origin = spoken_text(request.text, language)
+        # Note (Junnan Li): The speech service read only the speakable words, so the aligner aligns those and maps each back to the reply text.
+        speakable, speakable_origin = speakable_text(request.text)
+        text, spoken_origin = spoken_text(speakable, language)
+        origin = [speakable_origin[index] for index in spoken_origin]
         with inference_lock:
             result = aligner.align(
                 audio=(samples, request.sample_rate_hz),
