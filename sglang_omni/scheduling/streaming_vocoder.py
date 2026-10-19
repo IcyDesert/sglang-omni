@@ -30,6 +30,7 @@ across threads keep their own ``state_lock`` discipline.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine, Mapping, Sequence
@@ -40,7 +41,20 @@ from typing_extensions import Generic, TypeVar
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.message import OutgoingMessage
+from sglang_omni.proto.session import (
+    SessionOperation,
+    TimedChunk,
+    find_session_operation,
+)
+from sglang_omni.proto.streams import (
+    AUDIO,
+    INTERRUPT,
+    PCM_F32,
+    REPLY_PROGRESS,
+    SESSION_CONTROL,
+    control_type,
+)
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
@@ -149,6 +163,13 @@ class StreamingVocoderBase(
         self.stream_states: dict[str, StreamStateT] = {}
         self.emitted_stream_ids: set[str] = set()
         self.completed_stream_request_ids: dict[str, None] = {}
+        # Note (Junnan Li): A Session's appends reach the client as timed chunks in arrival order; a control unit waits for the units before it.
+        self.session_appends: dict[str, SessionOperation] = {}
+        self.session_units: dict[str, list[str]] = {}
+        self.session_unit_audio_ms: dict[str, float] = {}
+        self.pending_session_controls: dict[str, list[OutgoingMessage]] = {}
+        self.session_reads: dict[str, IncomingMessage] = {}
+        self.reply_progress: dict[str, tuple[int | None, int, float]] = {}
         self.sample_rate = int(sample_rate)
         self.stream_source_hint = stream_source_hint or type(self).__name__
         self.stream_input_modality = str(stream_input_modality)
@@ -196,19 +217,90 @@ class StreamingVocoderBase(
             self.completed_stream_request_ids.clear()
             self.on_serving_stop()
 
+    def handle_new_request_batch_with_loop(
+        self, batch: list[IncomingMessage], loop: asyncio.AbstractEventLoop
+    ) -> None:
+        """A Session's open, read, close and control are answered here; an interrupt drops the units of its turn."""
+        requests: list[IncomingMessage] = []
+        for message in batch:
+            operation = find_session_operation(message.data.request.metadata)
+            if operation is None or operation.operation == "append":
+                requests.append(message)
+                continue
+            else:
+                pass
+            session_id = operation.session_identity.id
+            if operation.operation == "open":
+                self.session_units.setdefault(session_id, [])
+                self.answer_session_operation(message, {"opened": True})
+            elif operation.operation == "read":
+                # Note (Junnan Li): The read stays open until the close answers it; the units' chunks stream on their own request ids.
+                self.session_reads[session_id] = message
+            elif operation.operation == "close":
+                for request_id in list(self.session_units.get(session_id, [])):
+                    self.pending_session_controls.pop(request_id, None)
+                    self.abort(request_id)
+                self.session_units.pop(session_id, None)
+                self.reply_progress.pop(session_id, None)
+                read = self.session_reads.pop(session_id, None)
+                if read is not None:
+                    self.answer_session_operation(read, {"closed": True})
+                else:
+                    pass
+                self.answer_session_operation(message, {"closed": True})
+            elif operation.operation == "control":
+                event = operation.chunk
+                if control_type(event) == INTERRUPT and event.turn is not None:
+                    for request_id, unit in list(self.session_appends.items()):
+                        if (
+                            unit.session_identity == operation.session_identity
+                            and unit.chunk.turn == event.turn
+                        ):
+                            self.abort(request_id)
+                        else:
+                            pass
+                else:
+                    pass
+                self.answer_session_operation(message, {"controlled": True})
+            else:
+                raise ValueError("unknown session operation")
+        super().handle_new_request_batch_with_loop(requests, loop)
+
+    def answer_session_operation(
+        self, message: IncomingMessage, data: dict[str, bool]
+    ) -> None:
+        self.outbox.put(
+            OutgoingMessage(
+                request_id=message.request_id,
+                type="result",
+                data=StagePayload(message.request_id, message.data.request, data),
+            )
+        )
+
     def is_streaming_payload(self, payload: StagePayload) -> bool:
+        """A Session unit always streams; a control unit relays at its stream done."""
         params = payload.request.params
         if not isinstance(params, dict):
             raise TypeError(
                 f"{self.stream_source_hint} request params must be a dict, got "
                 f"{type(params).__name__}"
             )
+        elif find_session_operation(payload.request.metadata) is not None:
+            return True
         else:
-            pass
-        return bool(params.get("stream", False))
+            return bool(params.get("stream", False))
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
         self.completed_stream_request_ids.pop(request_id, None)
+        operation = find_session_operation(payload.request.metadata)
+        if operation is not None and operation.operation == "append":
+            self.session_appends[request_id] = operation
+            self.session_units.setdefault(operation.session_identity.id, []).append(
+                request_id
+            )
+            self.session_unit_audio_ms[request_id] = 0.0
+        else:
+            pass
         state = self.get_or_create_stream_state(request_id)
         if state is None:
             return
@@ -284,8 +376,17 @@ class StreamingVocoderBase(
             return []
         else:
             pass
+        operation = self.session_appends.get(request_id)
+        if operation is not None and operation.chunk.format == SESSION_CONTROL:
+            return self.finish_session_control(request_id, payload, state)
+        else:
+            pass
         waveform = self.decode_delta(request_id, state, is_final=True)
-        if waveform is None and not self.stream_has_emitted(request_id):
+        if (
+            waveform is None
+            and not self.stream_has_emitted(request_id)
+            and operation is None
+        ):
             waveform = self.fallback_full_decode(request_id, payload, state)
         else:
             pass
@@ -295,6 +396,19 @@ class StreamingVocoderBase(
             messages.append(self.stream_chunk_message(request_id, waveform))
         else:
             pass
+        messages.extend(self.terminal_messages(request_id, payload, state))
+        return messages
+
+    def terminal_messages(
+        self, request_id: str, payload: StagePayload, state: StreamStateT
+    ) -> list[OutgoingMessage]:
+        """The request's result, preceded for a Session unit by its reply progress and followed by the controls that waited for it."""
+        messages: list[OutgoingMessage] = []
+        operation = self.session_appends.get(request_id)
+        if operation is not None:
+            messages.append(self.reply_progress_message(request_id, operation))
+        else:
+            pass
         messages.append(
             OutgoingMessage(
                 request_id=request_id,
@@ -302,15 +416,116 @@ class StreamingVocoderBase(
                 data=StagePayload(
                     request_id=payload.request_id,
                     request=payload.request,
-                    data=self.final_result_data(request_id, payload, state),
+                    data=(
+                        {}
+                        if operation is not None
+                        else self.final_result_data(request_id, payload, state)
+                    ),
                 ),
             )
         )
         self.record_completed_stream_request_id(request_id)
+        messages.extend(self.release_session_unit(request_id))
         return messages
+
+    def reply_progress_message(
+        self, request_id: str, operation: SessionOperation
+    ) -> OutgoingMessage:
+        chunk = operation.chunk
+        session_id = operation.session_identity.id
+        turn, text_end, audio_ms = self.reply_progress.get(session_id, (None, 0, 0.0))
+        if turn != chunk.turn:
+            text_end, audio_ms = 0, 0.0
+        else:
+            pass
+        text_end += len(str(chunk.payload["text"]))
+        audio_ms += self.session_unit_audio_ms.get(request_id, 0.0)
+        self.reply_progress[session_id] = (chunk.turn, text_end, audio_ms)
+        progress = TimedChunk(
+            "control",
+            0,
+            0,
+            chunk.seq,
+            {"type": REPLY_PROGRESS, "text_end": text_end, "audio_ms": audio_ms},
+            format=SESSION_CONTROL,
+            turn=chunk.turn,
+        )
+        return OutgoingMessage(
+            request_id=request_id,
+            type="stream",
+            data=progress.to_dict(),
+            metadata={"modality": progress.modality},
+        )
+
+    def finish_session_control(
+        self, request_id: str, payload: StagePayload, state: StreamStateT
+    ) -> list[OutgoingMessage]:
+        """Relay an appended control to the client once every unit appended before it has finished."""
+        operation = self.session_appends[request_id]
+        chunk = operation.chunk
+        session_id = operation.session_identity.id
+        if self.reply_progress.get(session_id, (None,))[0] == chunk.turn:
+            del self.reply_progress[session_id]
+        else:
+            pass
+        messages = [
+            OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                data=chunk.to_dict(),
+                metadata={"modality": chunk.modality},
+            ),
+            OutgoingMessage(
+                request_id=request_id,
+                type="result",
+                data=StagePayload(
+                    request_id=payload.request_id, request=payload.request, data={}
+                ),
+            ),
+        ]
+        if self.session_units[session_id][0] == request_id:
+            self.record_completed_stream_request_id(request_id)
+            return [*messages, *self.release_session_unit(request_id)]
+        else:
+            self.pending_session_controls[request_id] = messages
+            return []
+
+    def release_session_unit(self, request_id: str) -> list[OutgoingMessage]:
+        """Forget a finished unit; the controls queued behind it that are now first in line go out."""
+        operation = self.session_appends.pop(request_id, None)
+        self.session_unit_audio_ms.pop(request_id, None)
+        if operation is None:
+            return []
+        else:
+            pass
+        units = self.session_units[operation.session_identity.id]
+        units.remove(request_id)
+        released: list[OutgoingMessage] = []
+        while units and units[0] in self.pending_session_controls:
+            control_id = units[0]
+            released.extend(self.pending_session_controls.pop(control_id))
+            self.record_completed_stream_request_id(control_id)
+            released.extend(self.release_session_unit(control_id))
+        if not units:
+            self.session_units.pop(operation.session_identity.id, None)
+        else:
+            pass
+        return released
 
     def clear_stream_state(self, request_id: str) -> None:
         self.emitted_stream_ids.discard(request_id)
+        if request_id in self.pending_session_controls and not self.is_aborted(
+            request_id
+        ):
+            # Note (Junnan Li): A relayed control keeps waiting for the units before it after its own request state is gone.
+            pass
+        elif request_id in self.session_appends:
+            # Note (Junnan Li): An aborted unit still lets the controls queued behind it go out.
+            self.pending_session_controls.pop(request_id, None)
+            for message in self.release_session_unit(request_id):
+                self.outbox.put(message)
+        else:
+            pass
         state = self.stream_states.pop(request_id, None)
         if state is not None:
             self.release_stream_resources(request_id, state)
@@ -429,12 +644,33 @@ class StreamingVocoderBase(
     def stream_chunk_message(
         self, request_id: str, waveform: torch.Tensor
     ) -> OutgoingMessage:
-        return OutgoingMessage(
-            request_id=request_id,
-            type="stream",
-            data=self.stream_payload(request_id, waveform),
-            metadata={"modality": "audio"},
-        )
+        operation = self.session_appends.get(request_id)
+        if operation is None:
+            return OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                data=self.stream_payload(request_id, waveform),
+                metadata={"modality": "audio"},
+            )
+        else:
+            samples = waveform.detach().reshape(-1).to(torch.float32).cpu().numpy()
+            duration_ms = len(samples) * 1000 / self.sample_rate
+            chunk = TimedChunk(
+                AUDIO,
+                self.session_unit_audio_ms[request_id],
+                duration_ms,
+                operation.chunk.seq,
+                samples.astype("<f4").tobytes(),
+                format=PCM_F32,
+                turn=operation.chunk.turn,
+            )
+            self.session_unit_audio_ms[request_id] += duration_ms
+            return OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                data=chunk.to_dict(),
+                metadata={"modality": AUDIO},
+            )
 
     def pump_one_step(self) -> list[str] | None:
         """Returns None when no stream is ready, otherwise the request ids

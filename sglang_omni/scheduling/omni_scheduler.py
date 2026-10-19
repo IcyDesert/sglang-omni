@@ -2155,7 +2155,10 @@ class OmniScheduler(Generic[RequestDataT]):
                 pass
             req_output = mr_output.outputs[rid]
             session_unit = self.active_session_unit(rid)
-            if session_unit is not None:
+            if (
+                session_unit is not None
+                and _get_active_stage() == session_unit.stages[-1]
+            ):
                 assert bridge is not None
                 messages = bridge.stream_messages(rid, sched_req.data, req_output)
             elif self.stream_output_builder is not None:
@@ -2192,7 +2195,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     def flush_stream_output(self, request_id: str, req_data: ARRequestData) -> None:
         session_unit = self.active_session_unit(request_id)
-        if session_unit is not None:
+        if session_unit is not None and _get_active_stage() == session_unit.stages[-1]:
             bridge = self.session_bridge
             assert bridge is not None
             self.put_stream_messages(
@@ -2449,8 +2452,6 @@ class OmniScheduler(Generic[RequestDataT]):
                     terminal_error = callback_error
                 else:
                     pass
-                data.prefill_input_embeds = None
-                data.decode_input_embeds = None
                 # Note: (Jiaxin Deng) close the model-path interval before
                 # _close_completed_request, which discards the same rid that
                 # _emit_model_path_end_once dedups on. Emitting afterwards
@@ -2460,6 +2461,8 @@ class OmniScheduler(Generic[RequestDataT]):
                     status="error" if terminal_error is not None else "success",
                 )
                 abort_cleanup_needed = self.close_completed_request(req)
+                data.prefill_input_embeds = None
+                data.decode_input_embeds = None
 
             if abort_cleanup_needed:
                 self.run_abort_callback(rid)
@@ -3851,7 +3854,7 @@ class OmniScheduler(Generic[RequestDataT]):
         request_id = req.rid
         bridge = self.session_bridge
         if bridge is not None:
-            bridge.complete(request_id)
+            bridge.complete(request_id, req.omni_data)
         else:
             pass
         with self.request_admission_lock:
