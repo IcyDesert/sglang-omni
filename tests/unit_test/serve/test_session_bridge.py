@@ -407,8 +407,8 @@ async def test_qwen3_omni_node_outputs_project_without_a_model_adapter():
         hot_settings=frozenset({"turn_detection"}),
     )
     ports = vad_only.with_node(QWEN3_OMNI_PORTS)
-    assert ports.output == AudioPort(PCM16, 24000)
-    assert ports.hot_settings == {"instructions", "sampling", "turn_detection"}
+    assert ports.output == AudioPort(PCM_F32, 24000)
+    assert ports.hot_settings == {"sampling", "turn_detection"}
     assert ports.unit_ms == 200
     with pytest.raises(ValueError, match="share its audio input port"):
         vad_only.with_node(replace(QWEN3_OMNI_PORTS, input=(AudioPort(PCM16, 24000),)))
@@ -416,10 +416,11 @@ async def test_qwen3_omni_node_outputs_project_without_a_model_adapter():
     assert capabilities_of(ports).supports_truncate
     h = Harness(ports)
     await h.open()
-    pcm = np.array([1000, -1000], dtype="<i2").tobytes()
+    samples = np.array([0.5, -0.5], dtype="<f4")
+    pcm = (samples * 32767).astype("<i2").tobytes()
     h.client.control(TURN_STARTED, turn=1)
     h.client.emit(TEXT, TEXT_DELTA, {"text": "Hi"}, turn=1)
-    h.client.emit(AUDIO, PCM16, pcm)
+    h.client.emit(AUDIO, PCM_F32, samples.tobytes())
     h.client.control(TURN_DONE, turn=1)
     h.client.control(TURN_STARTED, turn=2)
     h.client.emit(TEXT, TEXT_DELTA, {"text": "Well"}, turn=2)

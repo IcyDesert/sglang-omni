@@ -17,16 +17,12 @@ import msgpack
 from sglang_omni.admission import QueueFullError
 from sglang_omni.pipeline.replicas import assign_replica_bindings
 from sglang_omni.pipeline.session_delivery import DeliveryPacer
-from sglang_omni.pipeline.session_execution import (
-    SessionExecution,
-    SessionExecutionFactory,
-)
 from sglang_omni.profiler.duplex_events import (
     emit_session_output_event,
     emit_session_unit_event,
     emit_session_unit_ready_event,
 )
-from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
+from sglang_omni.proto import OmniRequest, StreamMessage
 from sglang_omni.proto.session import (
     DEFAULT_MAX_OUTPUT_LEAD_MS,
     SESSION_METADATA_KEY,
@@ -124,13 +120,8 @@ class Session:
     stages: tuple[str, ...]
     bindings: dict[str, int]
     limits: SessionLimits
-    owned_by_execution: bool = False
     # A node of a graph merges its sources' clocks and ends; only a client's input keeps one timeline and one EOS per modality.
     is_node: bool = False
-    work_owners: dict[str, set[str]] = field(default_factory=dict)
-    work_released: dict[str, asyncio.Event] = field(default_factory=dict)
-    released_work_owners: dict[str, set[str]] = field(default_factory=dict)
-    execution: SessionExecution | None = None
     opened: list[str] = field(default_factory=list)
     pending: deque[PendingSessionChunk] = field(default_factory=deque)
     pending_bytes: int = 0
@@ -138,6 +129,8 @@ class Session:
     # Note (Junnan Li): Waiting controls in arrival order, each with the input seq it arrived at; the pump stops before the first.
     control_barriers: deque[tuple[int, object]] = field(default_factory=deque)
     in_flight_append: Literal["accepted", "submitted"] | None = None
+    # Note (Junnan Li): The appends the owners hold, by request id; an interrupt names those of its turn to every owner.
+    submitted_appends: dict[str, TimedChunk] = field(default_factory=dict)
     outputs: deque[tuple[OutputChunk, int]] = field(default_factory=deque)
     output_bytes: int = 0
     pacer: DeliveryPacer | None = None
@@ -229,7 +222,6 @@ class CoordinatorSessions:
         self.session_graph: SessionGraph | None = None
         self.session_stream_handlers: dict[str, SessionStreamHandler] = {}
         self.session_cleanup_tasks: set[asyncio.Task[None]] = set()
-        self.session_execution_factories: dict[str, SessionExecutionFactory] = {}
 
     def owned_session_task(
         self, coroutine: Coroutine[None, None, None]
@@ -300,9 +292,8 @@ class CoordinatorSessions:
         limits: SessionLimits | None,
         session_id: str | None,
         is_node: bool = False,
-        execution: str | None = None,
     ) -> SessionIdentity:
-        """Open fixed owners in upstream order before accepting input; a client route begins at entry_stage, and with `execution` that component runs the session while the owners track the requests it starts."""
+        """Open fixed owners in upstream order before accepting input; a client route begins at entry_stage."""
         if (
             self.is_sessions_stopping
             or not self.running
@@ -319,7 +310,6 @@ class CoordinatorSessions:
             stages=owners,
             bindings=bindings,
             limits=limits or SessionLimits(),
-            owned_by_execution=execution is not None,
             is_node=is_node,
         )
         if not is_node:
@@ -342,7 +332,13 @@ class CoordinatorSessions:
                 else:
                     pass
                 session.request = replace(request, inputs=None)
-                await self.attach_session_output(session, request, execution)
+                # Note (Junnan Li): The read is sent before any append, so the owner attaches it before an output can be emitted.
+                request_id = await self.submit_session_operation(
+                    session, "read", owner=session.stages[-1]
+                )
+                session.read_task = asyncio.create_task(
+                    self.read_session(session, request_id)
+                )
         except BaseException:
             await asyncio.shield(
                 self.owned_session_task(self.close_session_state(session))
@@ -387,28 +383,6 @@ class CoordinatorSessions:
             )
         else:
             return bindings, owners
-
-    async def attach_session_output(
-        self, session: Session, request: OmniRequest, execution: str | None
-    ) -> None:
-        """Open the named execution component on the session, or else send the terminal owner's read."""
-        if execution is not None:
-            factory = self.session_execution_factories.get(execution)
-            if factory is None:
-                raise ValueError("unknown session execution component")
-            else:
-                session.execution = factory(CoordinatorSessionWork(self, session))
-            await session.execution.open(
-                request, CoordinatorSessionEmitter(self, session)
-            )
-        else:
-            # Note (Junnan Li): The read is sent before any append, so the owner attaches it before an output can be emitted.
-            request_id = await self.submit_session_operation(
-                session, "read", owner=session.stages[-1]
-            )
-            session.read_task = asyncio.create_task(
-                self.read_session(session, request_id)
-            )
 
     async def append_session(
         self,
@@ -608,19 +582,13 @@ class CoordinatorSessions:
                 chunk = pending_chunk.chunk
                 session.in_flight_append = "accepted"
                 try:
-                    if session.execution is not None:
-                        session.in_flight_append = "submitted"
-                        session.wake.set()
-                        await session.execution.append(chunk)
-                    else:
-                        request_id = await self.submit_session_operation(
-                            session, "append", chunk=chunk, request_id=pending_chunk.request_id
-                        )
-                        session.in_flight_append = "submitted"
-                        session.wake.set()
-                        await self.finish_session_operation(
-                            session, "append", request_id
-                        )
+                    request_id = await self.submit_session_operation(
+                        session, "append", chunk=chunk, request_id=pending_chunk.request_id
+                    )
+                    session.submitted_appends[request_id] = chunk
+                    session.in_flight_append = "submitted"
+                    session.wake.set()
+                    await self.finish_session_operation(session, "append", request_id)
                     self.emit_session_output(
                         session,
                         pending_chunk.request_id,
@@ -673,6 +641,7 @@ class CoordinatorSessions:
         stages: list[str] | None = None,
         should_preempt: bool = False,
         is_ordered: bool = True,
+        preempted_request_ids: tuple[str, ...] = (),
     ) -> None:
         """Deliver a control event to the named logical stages, or to every stage of the route.
 
@@ -682,7 +651,6 @@ class CoordinatorSessions:
         still in flight. A control that is not ordered goes out at once and
         only holds the appends after it. A graph orders the client's
         controls and sends its node control edges' events at once.
-        An execution component receives the event itself and stops its own work.
         """
         graph = self.graphs.get(session_identity.id)
         if graph is not None and graph.session_identity == session_identity:
@@ -702,13 +670,7 @@ class CoordinatorSessions:
             for owner in session.stages
             if stages is None or self.replica_topology.logical_name(owner) in stages
         ]
-        if session.execution is not None and stages is not None:
-            raise ValueError("an execution component takes the whole control")
-        elif (
-            session.execution is None
-            and stages is not None
-            and len(owners) != len(stages)
-        ):
+        if stages is not None and len(owners) != len(stages):
             raise ValueError(
                 f"control stages {stages} are not all on the session route"
             )
@@ -732,17 +694,22 @@ class CoordinatorSessions:
                 else:
                     session.wake.clear()
                     await session.wake.wait()
-            if session.execution is not None:
-                await session.execution.control(event)
-            else:
-                for owner in owners:
-                    await self.session_operation(
-                        session,
-                        "control",
-                        owner=owner,
-                        chunk=event,
-                        should_preempt=should_preempt,
-                    )
+            for owner in owners:
+                await self.session_operation(
+                    session,
+                    "control",
+                    owner=owner,
+                    chunk=event,
+                    should_preempt=should_preempt,
+                    preempted_request_ids=preempted_request_ids,
+                )
+            # Note (Junnan Li): Every owner aborted these appends as the control arrived, so none sends their completion.
+            for request_id in preempted_request_ids:
+                future = self.completion_futures.get(request_id)
+                if future is not None and not future.done():
+                    future.set_result(None)
+                else:
+                    pass
         finally:
             session.control_barriers.remove(barrier)
             session.wake.set()
@@ -756,6 +723,7 @@ class CoordinatorSessions:
         chunk: TimedChunk | None = None,
         request_id: str | None = None,
         should_preempt: bool = False,
+        preempted_request_ids: tuple[str, ...] = (),
     ) -> None:
         request_id = await self.submit_session_operation(
             session,
@@ -764,6 +732,7 @@ class CoordinatorSessions:
             chunk=chunk,
             request_id=request_id,
             should_preempt=should_preempt,
+            preempted_request_ids=preempted_request_ids,
         )
         await self.finish_session_operation(session, operation, request_id)
 
@@ -776,6 +745,7 @@ class CoordinatorSessions:
         chunk: TimedChunk | None = None,
         request_id: str | None = None,
         should_preempt: bool = False,
+        preempted_request_ids: tuple[str, ...] = (),
     ) -> str:
         """Send one operation to its owner, or an append along the route; the chunks an append or a read streams back enter the session's outputs."""
         session_identity = session.session_identity
@@ -785,7 +755,7 @@ class CoordinatorSessions:
             stages=session.stages,
             chunk=chunk,
             should_preempt=should_preempt,
-            owned_by_execution=session.owned_by_execution,
+            preempted_request_ids=preempted_request_ids,
         )
         request = replace(
             session.request,
@@ -881,6 +851,7 @@ class CoordinatorSessions:
             else:
                 raise
         finally:
+            session.submitted_appends.pop(request_id, None)
             self.session_stream_handlers.pop(request_id, None)
             future = self.completion_futures.get(request_id)
             if future is not None:
@@ -914,109 +885,6 @@ class CoordinatorSessions:
             ) from session.cleanup_error
         else:
             pass
-
-    def handle_session_work_release(self, request_id: str, owner: str) -> None:
-        for session in self.sessions.values():
-            owners = session.work_owners.get(request_id)
-            if owners is not None:
-                session.released_work_owners.setdefault(request_id, set()).add(owner)
-                owners.discard(owner)
-                if not owners:
-                    session.work_released[request_id].set()
-                else:
-                    pass
-                return
-            else:
-                pass
-
-    def handle_session_work_start(self, request_id: str, owner: str) -> None:
-        for session in self.sessions.values():
-            owners = session.work_owners.get(request_id)
-            if owners is not None:
-                if owner not in session.stages:
-                    raise ValueError("work started outside session owners")
-                elif owner in session.released_work_owners.get(request_id, set()):
-                    pass
-                else:
-                    owners.add(owner)
-                    session.work_released[request_id].clear()
-                return
-            else:
-                pass
-
-    async def stream_session_request(
-        self,
-        identity: SessionIdentity,
-        request_id: str,
-        request: OmniRequest,
-        terminal_stages: set[str] | None = None,
-    ) -> AsyncIterator[CompleteMessage | StreamMessage]:
-        """Run one pipeline request owned by the session; its owners report the work they start and release."""
-        session = self.get_session(identity)
-        if session.is_closing:
-            raise RuntimeError("session is closing")
-        elif request_id in session.work_owners:
-            raise ValueError("request ID is already owned by this session")
-        else:
-            pass
-        operation = SessionOperation(
-            "append", identity, session.stages, owned_by_execution=True
-        )
-        request = replace(
-            request,
-            metadata={
-                **request.metadata,
-                SESSION_METADATA_KEY: operation.to_dict(),
-            },
-        )
-        queue: asyncio.Queue[CompleteMessage | StreamMessage] = asyncio.Queue()
-        track_session_request(session, request_id)
-        try:
-            try:
-                await self.submit_request(
-                    request_id,
-                    request,
-                    stream_queue=queue,
-                    target_stage=session.stages[0],
-                    terminal_stages=terminal_stages,
-                    replica_bindings=session.bindings,
-                )
-            except Exception:
-                # Note (Junnan Li): A refused submission reached no stage, so no owner will release it.
-                forget_session_request(session, request_id)
-                raise
-            terminals = self.expected_terminal_stages(request_id)
-            completed: set[str] = set()
-            while True:
-                message = await queue.get()
-                if isinstance(message, CompleteMessage):
-                    if not message.success:
-                        raise RuntimeError(message.error or "session work failed")
-                    else:
-                        completed.add(
-                            self.replica_topology.logical_name(message.from_stage)
-                        )
-                    yield message
-                    if not terminals or completed >= terminals:
-                        break
-                    else:
-                        pass
-                else:
-                    yield message
-        finally:
-            future = self.completion_futures.get(request_id)
-            if future is not None:
-                await self.release_submission(request_id, future)
-            else:
-                pass
-            if request_id in session.work_owners:
-                await asyncio.wait_for(
-                    session.work_released[request_id].wait(),
-                    session.limits.operation_timeout_s,
-                )
-                forget_session_request(session, request_id)
-            else:
-                pass
 
     def begin_session_close(self, session: Session) -> None:
         session.is_closing = True
@@ -1058,32 +926,6 @@ class CoordinatorSessions:
         if session.read_task is not None:
             session.read_task.cancel()
             await asyncio.gather(session.read_task, return_exceptions=True)
-        else:
-            pass
-        if session.execution is not None:
-            try:
-                await asyncio.wait_for(
-                    session.execution.close(),
-                    max(0, cleanup_deadline_s - asyncio.get_running_loop().time()),
-                )
-            except asyncio.TimeoutError as exc:
-                logger.error(
-                    f"Session execution close timed out: session={session.session_identity.id} owners={session.work_owners}",
-                    exc_info=exc,
-                )
-                self.fail_session_cleanup(session, exc)
-                return
-            except Exception as exc:
-                if session.work_owners:
-                    logger.error(
-                        f"Session execution close failed: session={session.session_identity.id} owners={session.work_owners}",
-                        exc_info=exc,
-                    )
-                    self.fail_session_cleanup(session, exc)
-                    return
-                else:
-                    # Note (Junnan Li): The execution released all its work, so its error ends this session only.
-                    session.error = session.error or exc
         else:
             pass
         if session.pump is not None and session.pump is not asyncio.current_task():
@@ -1161,78 +1003,5 @@ class CoordinatorSessions:
                     session_identity, output_chunk(output), is_ordered=False
                 )
             )
-        else:
-            pass
-
-
-def track_session_request(session: Session, request_id: str) -> None:
-    """The request starts on the session's first owner, which holds it until it reports the release."""
-    session.work_owners[request_id] = {session.stages[0]}
-    session.work_released[request_id] = asyncio.Event()
-    session.released_work_owners[request_id] = set()
-
-
-def forget_session_request(session: Session, request_id: str) -> None:
-    session.work_owners.pop(request_id, None)
-    session.work_released.pop(request_id, None)
-    session.released_work_owners.pop(request_id, None)
-
-
-class CoordinatorSessionEmitter:
-    """Session output channel handed to an execution component."""
-
-    def __init__(self, sessions: CoordinatorSessions, session: Session) -> None:
-        self.sessions = sessions
-        self.session = session
-
-    async def emit_output(self, chunk: TimedChunk) -> None:
-        self.sessions.emit_session_output(
-            self.session, self.session.session_identity.id, chunk.seq, chunk
-        )
-
-    def fail(self, error: BaseException) -> None:
-        self.sessions.fail_session(self.session, error)
-
-
-class CoordinatorSessionWork:
-    """Stage ownership of the pipeline requests an execution component starts."""
-
-    def __init__(self, sessions: CoordinatorSessions, session: Session) -> None:
-        self.sessions = sessions
-        self.session = session
-        self.session_id = session.session_identity.id
-        self.operation_timeout_s = session.limits.operation_timeout_s
-
-    def stream(
-        self,
-        request_id: str,
-        request: OmniRequest,
-        terminal_stages: set[str] | None = None,
-    ) -> AsyncIterator[CompleteMessage | StreamMessage]:
-        return self.sessions.stream_session_request(
-            self.session.session_identity, request_id, request, terminal_stages
-        )
-
-    async def abort(self, request_id: str) -> bool:
-        if request_id in self.session.work_owners:
-            return await self.sessions.abort(request_id)
-        else:
-            return False
-
-    async def release_all(self, timeout_s: float) -> None:
-        session = self.session
-        deadline_s = asyncio.get_running_loop().time() + timeout_s
-        for request_id, owners in list(session.work_owners.items()):
-            if owners:
-                await self.sessions.abort(request_id)
-                await asyncio.wait_for(
-                    session.work_released[request_id].wait(),
-                    max(0, deadline_s - asyncio.get_running_loop().time()),
-                )
-            else:
-                pass
-            forget_session_request(session, request_id)
-        if session.work_owners:
-            raise RuntimeError("session still owns unreleased backend work")
         else:
             pass

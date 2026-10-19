@@ -21,15 +21,7 @@ import torch
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.proto.session import (
-    SESSION_METADATA_KEY,
-    SessionIdentity,
-    SessionOperation,
-    TimedChunk,
-)
 from sglang_omni.scheduling import streaming_vocoder
-from sglang_omni.scheduling.message import IncomingMessage
-from sglang_omni.scheduling.session_request_ownership import SessionRequestOwnership
 from sglang_omni.scheduling.streaming_vocoder import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     StreamingVocoderBase,
@@ -37,44 +29,6 @@ from sglang_omni.scheduling.streaming_vocoder import (
 )
 
 SAMPLE_RATE = 16000
-
-
-def test_session_owned_vocoder_retains_owner_until_resource_release() -> None:
-    scheduler = FakeStreamingVocoder()
-    bridge = SessionRequestOwnership(scheduler)
-    identity = SessionIdentity("graph", 1)
-    owners = ("vocoder",)
-    bridge.apply_operation(
-        make_payload(),
-        SessionOperation("open", identity, owners, owned_by_execution=True),
-    )
-    payload = make_payload()
-    operation = SessionOperation(
-        "append",
-        identity,
-        owners,
-        TimedChunk("audio", 0, 20, 0, b"pcm"),
-        owned_by_execution=True,
-    )
-    payload.request.metadata[SESSION_METADATA_KEY] = operation.to_dict()
-    scheduler.inbox.put(bridge.admit(IncomingMessage("r", "new_request", payload)))
-    message = scheduler.inbox.get_nowait()
-    scheduler.handle_new_request_batch([message])
-    assert bridge.sessions[identity].requests == {"r"}
-    scheduler.handle_stream_chunk("r", item([1, 2]))
-    scheduler.handle_stream_done("r")
-    outputs = [bridge.restore_output(output) for output in drain(scheduler)]
-    assert any(output.type == "released" for output in outputs)
-    terminal = next(output for output in outputs if output.type == "result")
-    assert (
-        terminal.data.request.metadata[SESSION_METADATA_KEY]["owned_by_execution"]
-        is True
-    )
-    assert not bridge.sessions[identity].requests
-    bridge.apply_operation(
-        make_payload(),
-        SessionOperation("close", identity, owners, owned_by_execution=True),
-    )
 
 
 @dataclass

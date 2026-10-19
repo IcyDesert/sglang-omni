@@ -12,7 +12,6 @@ import pytest
 
 from sglang_omni.models.qwen3_omni.session_node import SESSION_PORTS as QWEN3_OMNI_PORTS
 from sglang_omni.pipeline.session_delivery import DeliveryPacer
-from sglang_omni.pipeline.session_execution import SessionEmitter, SessionWork
 from sglang_omni.proto import OmniRequest
 from sglang_omni.proto.session import (
     ControlEdge,
@@ -22,7 +21,7 @@ from sglang_omni.proto.session import (
     SessionNode,
     TimedChunk,
 )
-from sglang_omni.proto.streams import control_type
+from sglang_omni.proto.streams import PCM_F32, control_type
 from sglang_omni.serve.realtime.output_buffer import OutputBuffer
 from sglang_omni.serve.realtime.session_bridge import SessionBridge
 from sglang_omni.serve.realtime.types import RuntimeLimits
@@ -32,14 +31,12 @@ from tests.unit_test.fixtures.session_pipeline import (
     chunk,
     event_log,
     pipeline,
-    reply_chunks,
     wait_until,
 )
 
 LEAD_MS = 250
 OUTPUT_TIMEOUT_S = 10
 IDENTITY = SessionIdentity("session", 1)
-GRAPH_OWNERS = frozenset({"source", "sink"})
 
 
 def output(
@@ -158,13 +155,13 @@ def test_a_horizon_below_one_sample_holds_the_whole_chunk(pacer):
     assert (head.duration_ms, len(head.payload)) == (1, 32)
 
 
-QWEN_CHUNK_BYTES = 3200
-QWEN_CHUNK_MS = QWEN_CHUNK_BYTES / 2 / 24
+QWEN_CHUNK_BYTES = 6400
+QWEN_CHUNK_MS = QWEN_CHUNK_BYTES / 4 / 24
 QWEN_LEAD_MS = 1000
 
 
 def held_qwen_reply(count: int) -> DeliveryPacer:
-    """A pacer holding a Qwen3-Omni reply of `count` 67 ms chunks behind the first lead, its turn.done after them."""
+    """A pacer holding a Qwen3-Omni reply of `count` 67 ms float chunks behind the first lead, its turn.done after them."""
     pacer = DeliveryPacer(QWEN_LEAD_MS, asyncio.Event())
     pacer.offer(control("turn.started"), 10)
     for index in range(count):
@@ -172,8 +169,8 @@ def held_qwen_reply(count: int) -> DeliveryPacer:
             output(
                 index * QWEN_CHUNK_MS,
                 QWEN_CHUNK_MS,
-                bytes([index % 256]) * QWEN_CHUNK_BYTES,
-                "pcm16",
+                bytes([index % 255]) * QWEN_CHUNK_BYTES,
+                PCM_F32,
             ),
             3300,
         )
@@ -197,7 +194,7 @@ def test_input_end_coalesces_audio_within_realtime_budgets(release_before_eos):
     )
     assert sum(item.duration_ms for item in audio) == pytest.approx(600 * QWEN_CHUNK_MS)
     assert b"".join(item.payload for item in audio) == b"".join(
-        bytes([index % 256]) * QWEN_CHUNK_BYTES for index in range(600)
+        bytes([index % 255]) * QWEN_CHUNK_BYTES for index in range(600)
     )
     assert labels(released)[-1] == "turn.done"
     assert sum(size for _, size in released) == 10 + 600 * 3300 + 10
@@ -362,93 +359,43 @@ async def test_a_client_route_confirms_input_while_audio_is_held_and_flushes_at_
         await wait_until(lambda: not coordinator.sessions)
 
 
-class ReplyExecution:
-    """An execution node that answers its first input with a whole reply at once, like the Qwen3-Omni node."""
-
-    def __init__(self, work: SessionWork, reply_ms: float) -> None:
-        self.work = work
-        self.reply_ms = reply_ms
-        self.emitter: SessionEmitter | None = None
-        self.controls: list[tuple[str | None, int | None, float]] = []
-
-    async def open(self, request: OmniRequest, emitter: SessionEmitter) -> None:
-        self.emitter = emitter
-
-    async def append(self, chunk: TimedChunk) -> None:
-        assert self.emitter is not None
-        if chunk.seq == 0:
-            for emitted in reply_chunks(self.reply_ms):
-                await self.emitter.emit_output(emitted)
-        else:
-            pass
-
-    async def control(self, event: TimedChunk) -> None:
-        assert self.emitter is not None
-        self.controls.append((control_type(event), event.turn, time.monotonic()))
-        if control_type(event) == "interrupt":
-            await self.emitter.emit_output(control_chunk("turn.interrupted", turn=1))
-        else:
-            pass
-
-    async def close(self) -> None:
-        await self.work.release_all(5)
-
-
-async def open_reply_graph(coordinator, reply_ms: float) -> tuple[list, object]:
-    executions: list[ReplyExecution] = []
-
-    def factory(work: SessionWork) -> ReplyExecution:
-        executions.append(ReplyExecution(work, reply_ms))
-        return executions[-1]
-
-    coordinator.session_execution_factories["reply"] = factory
+async def open_reply_graph(coordinator, reply_ms: float) -> SessionIdentity:
+    """A graph of one node over the route that answers its first input with a whole reply at once, like the Qwen3-Omni node."""
     coordinator.session_route = None
     coordinator.session_graph = SessionGraph(
         nodes={
             "model": SessionNode(
                 stages=("source", "sink"),
                 inputs=("input",),
-                execution="reply",
                 controls=(ControlEdge("input", "interrupt"),),
             )
         },
         publish={"model": ("pcm16", "session")},
     )
     coordinator.max_output_lead_ms = LEAD_MS
-    identity = await coordinator.open_session(OmniRequest(None))
-    return executions, identity
+    return await coordinator.open_session(
+        OmniRequest(None, {"emit_reply_ms": reply_ms})
+    )
 
 
 @pytest.mark.asyncio
 async def test_a_graph_node_publishing_audio_is_paced_and_gets_its_turn_done_back(
     tmp_path,
 ):
-    async with pipeline(tmp_path, session_request_owners=GRAPH_OWNERS) as (
-        coordinator,
-        _,
-        _,
-    ):
-        executions, identity = await open_reply_graph(coordinator, 1000)
+    async with pipeline(tmp_path) as (coordinator, events, _):
+        identity = await open_reply_graph(coordinator, 1000)
         outputs = coordinator.session_outputs(identity)
         await coordinator.append_session(identity, chunk(0))
-        received = await receive_reply(outputs)
-        assert_paced(received, 1000)
-        await wait_until(lambda: executions[0].controls)
-        ((kind, turn, returned_at),) = executions[0].controls
-        assert (kind, turn) == ("turn.done", 1)
-        assert returned_at >= received[-1][1]
+        assert_paced(await receive_reply(outputs), 1000)
+        await wait_for_turn_done_returned(events)
         await outputs.aclose()
         await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
 
 
 @pytest.mark.asyncio
 async def test_an_interrupt_drops_the_held_audio_of_its_turn(tmp_path):
-    async with pipeline(tmp_path, session_request_owners=GRAPH_OWNERS) as (
-        coordinator,
-        _,
-        _,
-    ):
-        executions, identity = await open_reply_graph(coordinator, 3000)
+    async with pipeline(tmp_path) as (coordinator, events, _):
+        identity = await open_reply_graph(coordinator, 3000)
         outputs = coordinator.session_outputs(identity)
         await coordinator.append_session(identity, chunk(0))
         held = await receive_until(outputs, is_audio)
@@ -458,6 +405,18 @@ async def test_an_interrupt_drops_the_held_audio_of_its_turn(tmp_path):
         assert "turn.done" not in [control_type(item) for item, _ in received]
         delivered = held + [item for item, _ in received]
         assert sum(item.duration_ms for item in delivered if is_audio(item)) < 1000
-        assert [kind for kind, _, _ in executions[0].controls] == ["interrupt"]
+        controls: list = []
+
+        def interrupted() -> bool:
+            controls.extend(
+                event for event in event_log(events) if event[0] == "control"
+            )
+            return len(controls) >= 2
+
+        await wait_until(interrupted)
+        assert [(event[1], event[3]) for event in controls] == [
+            ("source", "interrupt"),
+            ("sink", "interrupt"),
+        ]
         await outputs.aclose()
         await wait_until(lambda: not coordinator.sessions and not coordinator.graphs)
