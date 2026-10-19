@@ -11,7 +11,7 @@ import logging
 import multiprocessing
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from multiprocessing.context import SpawnProcess
@@ -57,9 +57,7 @@ from tests.unit_test.fixtures.session_outputs import control_chunk
 
 REPLICA_COUNT = 2
 EVENT_POLL_TIMEOUT_S = 1
-OwnerEvent = tuple[
-    Literal["open", "close", "finished", "cancelled", "compute"], str, str
-]
+OwnerEvent = tuple[Literal["open", "close", "finished", "cancelled"], str, str]
 AppendEvent = tuple[Literal["append"], str, str, int]
 ControlEvent = tuple[Literal["control"], str, str, str]
 StageEvent = OwnerEvent | AppendEvent | ControlEvent
@@ -264,6 +262,17 @@ class Hooks(SessionHooks):
     def control(self, session_identity: SessionIdentity, event: TimedChunk) -> None:
         state = self.states[session_identity]
         self.events.put(("control", self.name, state.session_id, event.payload["type"]))
+        logical_name = self.name.partition(REPLICA_SEPARATOR)[0]
+        if (
+            state.reply_ms
+            and logical_name == "sink"
+            and event.payload["type"] == "interrupt"
+        ):
+            self.emitters[session_identity](
+                control_chunk("turn.interrupted", turn=event.turn)
+            )
+        else:
+            pass
 
     def close(self, session_identity: SessionIdentity) -> None:
         state = self.states.get(session_identity)
@@ -280,16 +289,7 @@ class Hooks(SessionHooks):
 
 
 def make_session_scheduler(name: str, events: Queue[StageEvent]) -> SessionScheduler:
-    def compute(payload: StagePayload) -> StagePayload:
-        events.put(("compute", name, payload.request_id))
-        if payload.request.params.get("fail_on") == name:
-            raise RuntimeError(f"compute failed on {name}")
-        else:
-            pass
-        payload.data = {"stage": name, "echo": payload.request.params}
-        return payload
-
-    return SessionScheduler(Hooks(name, events), compute_fn=compute)
+    return SessionScheduler(Hooks(name, events))
 
 
 class LoudnessDetector:
@@ -347,20 +347,18 @@ async def pipeline(
     replicate_entry: bool = False,
     list_next: bool = False,
     names: list[str] | None = None,
-    session_request_owners: frozenset[str] = frozenset(),
     factories: Mapping[str, str] | None = None,
+    factory_kwargs: Mapping[str, object] | None = None,
     other_terminals: tuple[str, ...] = (),
-    terminal_stages_resolver: Callable[[OmniRequest], list[str]] | None = None,
 ) -> AsyncIterator[tuple[Coordinator, Queue[StageEvent], list[SpawnProcess]]]:
     """A linear route of synthetic stages, or with `names`, unchained terminal stages.
 
-    `session_request_owners` are the stages that track the requests of an
-    execution-held node; `factories` replaces the synthetic hooks of the named
-    stages with another factory taking `name` and `events`; `other_terminals`
-    are terminal stages beside the route, as other models of the pipeline;
-    `terminal_stages_resolver` derives the terminal stages of each request.
+    `factories` replaces the synthetic hooks of the named stages with another
+    factory taking `name`, `events` and `factory_kwargs`; `other_terminals`
+    are terminal stages beside the route, as other models of the pipeline.
     """
     factories = factories or {}
+    factory_kwargs = factory_kwargs or {}
     ctx = multiprocessing.get_context("spawn")
     is_chained = names is None
     names = names or (
@@ -401,7 +399,6 @@ async def pipeline(
         logical_process_plan=plan,
         replica_topology=topology,
         session_route=(lambda: names) if is_chained else None,
-        terminal_stages_resolver=terminal_stages_resolver,
     )
     events = ctx.Queue()
     processes = []
@@ -413,7 +410,7 @@ async def pipeline(
             spec = StageLaunchConfig(
                 stage_name=stage.name,
                 factory=stage.factory_path,
-                factory_kwargs={"name": stage.name, "events": events},
+                factory_kwargs={"name": stage.name, "events": events, **factory_kwargs},
                 next_stages=stage.next,
                 is_terminal=stage.terminal,
                 recv_endpoint=endpoints[stage.name],
@@ -421,7 +418,6 @@ async def pipeline(
                 abort_endpoint=abort,
                 stage_endpoints=endpoints,
                 replica_topology=topology.to_dict(),
-                owns_session_requests=stage.name in session_request_owners,
             )
             process = ctx.Process(target=worker, args=(spec, ready))
             process.expected_exitcode = 0

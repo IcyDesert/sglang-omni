@@ -713,8 +713,6 @@ class SessionNodeConfig(BaseModel):
     inputs: list[str | SessionDataEdgeConfig | SessionControlEdgeConfig] = Field(
         min_length=1
     )
-    execution: str | None = None
-    "Import path of the coordinator-side component running this node over its stages."
 
 
 class PipelineConfig(BaseModel):
@@ -929,7 +927,6 @@ class PipelineConfig(BaseModel):
         nodes = {
             name: SessionNode(
                 stages=tuple(node.stages),
-                execution=node.execution,
                 inputs=tuple(
                     entry if isinstance(entry, str) else entry.edge()
                     for entry in node.inputs

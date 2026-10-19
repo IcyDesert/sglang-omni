@@ -12,11 +12,7 @@ from collections.abc import Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Generic, TypeVar
 
-from sglang_omni.scheduling.message import (
-    IncomingMessage,
-    OutgoingMessage,
-    emit_session_release,
-)
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +105,6 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
         self.capacity_freed = threading.Condition(self.lock)
         self.inbox: CountingInbox = CountingInbox()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
-        self.session_release_tracking: set[str] = set()
         self.requires_tp_work_fanout: bool = True
         self.fn = compute_fn
         self.dispatch_fn = dispatch_fn
@@ -162,7 +157,6 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
                 with self.lock:
                     try:
                         if self.consume_reachable_tombstone(request_id):
-                            emit_session_release(self, request_id)
                             continue
                         else:
                             pass
@@ -303,7 +297,6 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
             # have registered side effects the abort-time callback ran too
             # early to see.
             self.run_abort_callback(request_id)
-            emit_session_release(self, request_id)
             return
         else:
             pass
@@ -315,10 +308,8 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
             self.outbox.put(
                 OutgoingMessage(request_id=request_id, type="error", data=exc)
             )
-            emit_session_release(self, request_id)
             return
 
         self.outbox.put(
             OutgoingMessage(request_id=request_id, type="result", data=result)
         )
-        emit_session_release(self, request_id)

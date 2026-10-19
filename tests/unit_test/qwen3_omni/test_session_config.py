@@ -7,6 +7,7 @@ import pytest
 
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.placement import build_stage_placement_plan
+from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.config.schema import SessionNodeConfig
 from sglang_omni.config.topology import compile_logical_processes
 from sglang_omni.models.qwen3_omni.config import Qwen3OmniSessionPipelineConfig
@@ -16,41 +17,63 @@ from sglang_omni.proto.streams import (
     IMAGE_FRAME,
     INTERRUPT,
     PCM16,
+    PCM_F32,
     SESSION_CONTROL,
     TEXT_DELTA,
-    TRANSCRIPT_FORMAT,
 )
 
 
 def profile_config() -> Qwen3OmniSessionPipelineConfig:
-    path = Path(__file__).resolve().parents[3] / "examples/qwen3_omni/session.yaml"
+    path = Path(__file__).resolve().parents[3] / "examples/qwen3_omni/session_h200.yaml"
     return ConfigManager.from_file(str(path)).config
 
 
-def test_qwen3_omni_profile_declares_the_native_node_beside_the_vad_on_one_gpu():
+def test_qwen3_omni_profile_declares_persistent_stage_routes_and_feedback() -> None:
     config = profile_config()
-    assert config.resolved_entry_stage == "preprocessing"
-    with pytest.raises(ValueError, match="forks at 'preprocessing'"):
-        config.session_route()
+    assert config.resolved_entry_stage == "dialog"
     graph = config.session_graph()
-    assert graph.input_nodes() == ("vad", "qwen_omni")
-    assert graph.reading_nodes("vad", SESSION_CONTROL) == ("qwen_omni",)
-    assert graph.reading_nodes("input", PCM16) == ("vad", "qwen_omni")
-    assert graph.reading_nodes("input", IMAGE_FRAME) == ("qwen_omni",)
+    assert graph.input_nodes() == ("vad", "dialog")
+    assert graph.reading_nodes("vad", SESSION_CONTROL) == ("dialog",)
+    assert graph.reading_nodes("input", PCM16) == ("vad", "dialog")
+    assert graph.reading_nodes("input", IMAGE_FRAME) == ("dialog",)
+    assert graph.reading_nodes("dialog", "qwen.unit") == ("qwen_omni",)
     assert config.session_ports().input_modalities == ("audio", "image")
     assert graph.publish == {
         "vad": (SESSION_CONTROL,),
-        "qwen_omni": (PCM16, SESSION_CONTROL, TEXT_DELTA, TRANSCRIPT_FORMAT),
+        "dialog": (SESSION_CONTROL,),
+        "qwen_omni": (PCM_F32, SESSION_CONTROL, TEXT_DELTA),
     }
-    assert "cascade" not in {s.name for s in config.stages}
+    assert "cascade" not in {stage.name for stage in config.stages}
     node = graph.nodes["qwen_omni"]
-    assert node.execution == (
-        "sglang_omni.models.qwen3_omni.session_execution.create_session_execution_factory"
+    assert node.stages == (
+        "preprocessing",
+        "image_encoder",
+        "audio_encoder",
+        "thinker",
+        "talker_ar",
+        "code2wav",
     )
-    assert node.controls == (ControlEdge("input", INTERRUPT, None, True),)
-    assert set(node.stages) == {s.name for s in config.stages} - {"vad"}
-    talker = next(s for s in config.stages if s.name == "talker_ar")
+    assert node.controls == (
+        ControlEdge("input", "configure"),
+        ControlEdge("dialog", INTERRUPT, should_preempt=True),
+        ControlEdge("dialog", "qwen.truncate"),
+    )
+    assert graph.reading_nodes("qwen_omni", SESSION_CONTROL) == ("dialog",)
+    thinker = config.stage_named("thinker")
+    talker = config.stage_named("talker_ar")
+    code2wav = config.stage_named("code2wav")
+    for stage in (thinker, talker):
+        assert resolve_stage_factory_args(stage, config)["execution_mode"] == "session"
+    assert code2wav.factory_path.endswith(
+        "code2wav_scheduler.create_code2wav_scheduler"
+    )
+    assert thinker.stream_to == ["talker_ar"] and talker.stream_to == ["code2wav"]
+    assert (
+        talker.can_accept_stream_before_payload
+        and code2wav.can_accept_stream_before_payload
+    )
     assert talker.factory.enable_partial_start is True
+    assert config.max_sessions == 16
     plan, stages = compile_logical_processes(config)
     expanded, topology = expand_replica_stages(stages, plan)
     placement = build_stage_placement_plan(

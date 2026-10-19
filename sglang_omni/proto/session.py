@@ -13,8 +13,6 @@ from typing_extensions import NotRequired
 
 SESSION_METADATA_KEY: Literal["omni_session"] = "omni_session"
 GRAPH_INPUT = "input"
-SESSION_WORK_STARTED = "session_work_started"
-SESSION_WORK_RELEASED = "session_work_released"
 # Note (Junnan Li): msgspec encodes bytes as base64 text by default; keep them native on both sides.
 BUILTIN_TYPES = (bytes,)
 ChunkPayload = bytes | dict[str, object] | None
@@ -73,7 +71,7 @@ class SessionOperationDict(TypedDict):
     stages: list[str]
     chunk: TimedChunkDict | None
     should_preempt: bool
-    owned_by_execution: NotRequired[bool]
+    preempted_request_ids: NotRequired[list[str]]
 
 
 @dataclass(frozen=True)
@@ -229,14 +227,11 @@ class SessionNode:
     `<node>:<format>`, or a `DataEdge` naming one of these with the bound
     of its edge; without a format the node takes every chunk its source
     emits. The inputs naming one source are one edge. `controls` are the
-    control edges the node receives. `execution` names the
-    coordinator-side component that runs the node over its stages instead
-    of the stages holding the session.
+    control edges the node receives.
     """
 
     stages: tuple[str, ...]
     inputs: tuple[str | DataEdge, ...]
-    execution: str | None = None
     controls: tuple[ControlEdge, ...] = ()
 
     def edges(self) -> dict[str, frozenset[str] | None]:
@@ -421,12 +416,12 @@ class SessionOperation:
 
     An append carries the input chunk; a control carries its event as the
     chunk and targets one stage, and with should_preempt that stage cancels
-    the session's in-flight appends as soon as the control arrives. A read
+    the session's in-flight appends as soon as the control arrives. A graph's
+    interrupt also names its turn's appends in preempted_request_ids; each
+    stage it reaches aborts them, dropping their results and anything they
+    send it later. A read
     targets the terminal owner and stays open until the close answers it; the
-    chunks the stage emits outside an append stream on it. Requests of
-    a node held by an execution carry owned_by_execution: they follow the
-    pipeline's own edges within the session's stages and report the work they
-    start and release; other session requests pass through the stages in order.
+    chunks the stage emits outside an append stream on it.
     """
 
     operation: SessionOperationKind
@@ -434,7 +429,7 @@ class SessionOperation:
     stages: tuple[str, ...]
     chunk: TimedChunk | None = None
     should_preempt: bool = False
-    owned_by_execution: bool = False
+    preempted_request_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> SessionOperationDict:
         fields: SessionOperationDict = {
@@ -444,8 +439,8 @@ class SessionOperation:
             "chunk": None if self.chunk is None else self.chunk.to_dict(),
             "should_preempt": self.should_preempt,
         }
-        if self.owned_by_execution:
-            fields["owned_by_execution"] = True
+        if self.preempted_request_ids:
+            fields["preempted_request_ids"] = list(self.preempted_request_ids)
         else:
             pass
         return fields

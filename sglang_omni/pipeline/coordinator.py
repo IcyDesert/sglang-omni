@@ -38,12 +38,7 @@ from sglang_omni.proto import (
     is_update_action,
 )
 from sglang_omni.proto.admin import AdminResponse
-from sglang_omni.proto.session import (
-    DEFAULT_MAX_OUTPUT_LEAD_MS,
-    SESSION_WORK_RELEASED,
-    SESSION_WORK_STARTED,
-    SessionGraph,
-)
+from sglang_omni.proto.session import DEFAULT_MAX_OUTPUT_LEAD_MS, SessionGraph
 
 logger = logging.getLogger(__name__)
 
@@ -876,20 +871,6 @@ class Coordinator(SessionGraphRunner):
 
     async def handle_completion(self, msg: CompleteMessage) -> None:
         """Handle a completion message from a stage."""
-        if (
-            isinstance(msg.result, dict)
-            and msg.result.get(SESSION_WORK_STARTED) is True
-        ):
-            self.handle_session_work_start(msg.request_id, msg.from_stage)
-            return
-        elif (
-            isinstance(msg.result, dict)
-            and msg.result.get(SESSION_WORK_RELEASED) is True
-        ):
-            self.handle_session_work_release(msg.request_id, msg.from_stage)
-            return
-        else:
-            pass
         request_id = msg.request_id
         logger.debug(
             "Coordinator received completion: req=%s from %s success=%s",

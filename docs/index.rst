@@ -150,8 +150,6 @@ Supported Models
    cookbook/auk.md
    cookbook/cosmos3_nano.md
 
-   cookbook/streaming_cascade.md
-
 .. toctree::
    :maxdepth: 1
    :caption: General Usage
@@ -175,7 +173,7 @@ Supported Models
    developer_reference/main.md
    developer_reference/apiserver_design.md
    developer_reference/pipeline.md
-   developer_reference/session_graph.md
+   developer_reference/full_duplex_interactive_model.md
    developer_reference/config.md
    developer_reference/adding_parameters.md
    developer_reference/communication.md
