@@ -32,15 +32,12 @@ from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     GraphKeyStats,
 )
 from sglang_omni.models.qwen3_omni.components.codec_state_pool import CodecStatePool
+from sglang_omni.models.qwen3_omni.payload_types import NO_SPEECH, UNIT_FORMAT
 from sglang_omni.platforms import current_platform
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.message import (
-    IncomingMessage,
-    OutgoingMessage,
-    emit_session_release,
-)
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.streaming_vocoder import (
     StreamingVocoderBase,
     vocoder_decode_stream_priority,
@@ -255,7 +252,10 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self.total_upsample = int(model.total_upsample)
         self.cuda_graph_runner = cuda_graph_runner if bool(enable_cuda_graph) else None
         super().__init__(
-            None, sample_rate=sample_rate, stream_source_hint="Qwen3-Omni code2wav"
+            None,
+            sample_rate=sample_rate,
+            stream_source_hint="Qwen3-Omni code2wav",
+            reply_unit_format=UNIT_FORMAT,
         )
         self.initial_codec_chunk_frames = min(
             max(int(initial_codec_chunk_frames), 0), int(stream_chunk_size)
@@ -930,16 +930,16 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def final_result_data(
         self, request_id: str, payload: StagePayload, state: Code2WavStreamState
     ) -> dict[str, bytes | list[int] | str | int]:
-        del payload
-        if not state.audio_parts:
+        if not state.audio_parts and NO_SPEECH not in payload.data:
             raise RuntimeError(f"code2wav produced no audio for {request_id!r}")
         else:
             pass
         if state.stream_enabled:
             return {"modality": "audio", "sample_rate": self.sample_rate}
+        elif not state.audio_parts:
+            full = np.zeros(0, dtype=np.float32)
         else:
-            pass
-        full = np.concatenate(state.audio_parts).astype(np.float32, copy=False)
+            full = np.concatenate(state.audio_parts).astype(np.float32, copy=False)
         return audio_waveform_payload(
             full,
             sample_rate=self.sample_rate,
@@ -1185,7 +1185,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def release_stream_resources(
         self, request_id: str, state: Code2WavStreamState
     ) -> None:
-        pending_slot = state.pending.slot if state.pending is not None else None
+        del request_id
         if state.pending is not None:
             self.retire_slot(state.pending.slot)
             state.pending = None
@@ -1204,24 +1204,6 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             event.record(read_stream)
             self.retired_chunks.append(RetiredChunks(event=event, chunks=state.chunks))
             state.chunks = []
-        else:
-            pass
-        if request_id in self.session_release_tracking:
-            if pending_slot is not None:
-                pending_slot.synchronize()
-            else:
-                pass
-            if self.device.type == "cuda":
-                read_stream = self.decode_stream or torch.cuda.default_stream(
-                    self.device
-                )
-                read_stream.synchronize()
-                self.reap_retired()
-            else:
-                pass
-            state.chunks.clear()
-            state.audio_parts.clear()
-            emit_session_release(self, request_id)
         else:
             pass
 

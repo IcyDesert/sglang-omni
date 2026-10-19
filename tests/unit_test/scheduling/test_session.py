@@ -11,6 +11,8 @@ from unittest.mock import Mock
 
 import msgpack
 import pytest
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.admission import ContextExhaustedError, QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -35,6 +37,7 @@ from sglang_omni.scheduling.sglang_backend.ar_session import (
     BridgeSession,
     SessionUnit,
 )
+from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from tests.unit_test.fixtures.session_outputs import control_chunk
 from tests.unit_test.fixtures.session_pipeline import (
     compute_registered,
@@ -517,7 +520,6 @@ def test_context_exhaustion_releases_append_unit() -> None:
     )
     scheduler = Mock(spec=OmniScheduler)
     scheduler.scheduler_thread_id = None
-    scheduler.session_release_tracking = set()
     scheduler.request_admission_lock = threading.RLock()
     scheduler.deferred_request_payloads = {}
     scheduler.pending_request_builds = {}
@@ -648,3 +650,40 @@ def test_ar_session_control_preserves_session(should_preempt: bool) -> None:
                 payload,
                 SessionOperation("control", invalid_identity, ("thinker",), event),
             )
+
+
+def test_ar_bridge_binds_the_native_request_and_hands_an_aborted_unit_to_the_adapter() -> (
+    None
+):
+    identity = SessionIdentity("native")
+    adapter = ARSessionAdapter()
+    adapter.bind_request = Mock()
+    order: list[str] = []
+    adapter.on_abort = Mock(side_effect=lambda identity, unit: order.append("model"))
+    scheduler = Mock()
+    scheduler.model_config.vocab_size = 100
+    native = scheduler.session_controller.get.return_value
+    native.session_id = identity.id
+    native.abort_req.side_effect = lambda: order.append("native")
+    native_request = Mock(origin_input_ids=[10, 20, 30], to_finish=None)
+    native.create_req.return_value = native_request
+    bridge = ARSessionBridge(scheduler, adapter)
+    bridge.sessions[identity.id] = BridgeSession(session_identity=identity)
+    payload = StagePayload("unit", OmniRequest(None), {})
+    unit = bridge.accept(
+        payload,
+        SessionOperation(
+            "append", identity, ("thinker",), TimedChunk("text", 0, 0, 0, {})
+        ),
+    )
+    request = Req("unit", "", [30], SamplingParams(max_new_tokens=1), vocab_size=100)
+    request.tokenizer = Mock()
+    request_data = SGLangARRequestData(req=request)
+    bridge.create_session_request(payload, request_data)
+    assert request_data.req is native_request
+    assert unit.native_offset == 2 and unit.prompt_length == 1
+    adapter.bind_request.assert_called_once_with(identity, request_data, unit)
+    bridge.release_append_unit("unit")
+    adapter.on_abort.assert_called_once_with(identity, unit)
+    assert order == ["model", "native"]
+    assert bridge.sessions[identity.id].unit is None

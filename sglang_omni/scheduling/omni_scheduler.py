@@ -96,7 +96,6 @@ from sglang_omni.scheduling.message import (
     OutgoingMessage,
     put_messages,
 
-    emit_session_release,
 )
 from sglang_omni.scheduling.sglang_backend.ar_session import (
     ARSessionAdapter,
@@ -349,7 +348,6 @@ class OmniScheduler(Generic[RequestDataT]):
     ) -> None:
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
-        self.session_release_tracking: set[str] = set()
         self.requires_tp_work_fanout: bool = False
 
         # --- Request builder: StagePayload → SGLangARRequestData ----------
@@ -1250,11 +1248,24 @@ class OmniScheduler(Generic[RequestDataT]):
             pending_stream_done = ingress.done if ingress is not None else False
             payload.prefetched_stream_done = pending_stream_done
             session_unit = self.active_session_unit(req_id)
-            if session_unit is None and not self.is_request_build_ready(
+            if not self.is_request_build_ready(
                 payload,
                 pending_stream_done=pending_stream_done,
             ):
                 self.deferred_request_payloads[req_id] = payload
+                continue
+            else:
+                pass
+            result = self.complete_without_generation(payload, session_unit)
+            if result is not None:
+                self.pending_stream_ingress.pop(req_id, None)
+                if session_unit is not None:
+                    self.session_bridge.complete(req_id)
+                else:
+                    pass
+                self.outbox.put(
+                    OutgoingMessage(request_id=req_id, type="result", data=result)
+                )
                 continue
             else:
                 pass
@@ -1826,6 +1837,12 @@ class OmniScheduler(Generic[RequestDataT]):
     ) -> bool:
         del request_id, chunk
         return True
+
+    def complete_without_generation(
+        self, payload: StagePayload, session_unit: SessionUnit | None
+    ) -> StagePayload | None:
+        """The result of a build-ready request its model cannot generate for, or None to build it."""
+        return None
 
     def is_request_build_ready(
         self,
@@ -2409,7 +2426,6 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.first_emit_done.discard(rid)
                 self.emit_model_path_end_once(rid, status="aborted")
                 detach_request_data(req)
-                emit_session_release(self, rid)
                 continue
             else:
                 pass
@@ -2472,7 +2488,6 @@ class OmniScheduler(Generic[RequestDataT]):
             if terminal_error is not None:
                 self.first_emit_done.discard(rid)
                 self.emit_request_error(rid, terminal_error)
-                emit_session_release(self, rid)
                 continue
             else:
                 pass
@@ -2485,7 +2500,6 @@ class OmniScheduler(Generic[RequestDataT]):
                     data=result,
                 )
             )
-            emit_session_release(self, rid)
 
     def on_stream_chunk(self, request_id: str, chunk: StreamItem) -> None:
         if request_id in self.completed_request_ids:
@@ -2717,14 +2731,6 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         self.drain_inbox_for_request(request_id)
-        if not running_abort and (pending is None or pending[2].done()):
-            emit_session_release(self, request_id)
-        elif pending is not None:
-            pending[2].add_done_callback(
-                lambda _: emit_session_release(self, request_id)
-            )
-        else:
-            pass
 
     def admin(
         self, action: str, payload: dict[str, object] | None = None

@@ -132,11 +132,31 @@ class ARSessionAdapter:
         """Select a fresh model turn or relay a unit that needs no generation."""
         return ARSessionPreparation()
 
+    def complete_without_generation(
+        self,
+        session_identity: SessionIdentity,
+        chunk: TimedChunk,
+        payload: StagePayload,
+    ) -> StagePayload:
+        """The result of a unit its model cannot generate for."""
+        return payload
+
     def finish_input(
         self, session_identity: SessionIdentity, payload: StagePayload
     ) -> StagePayload | None:
         """Return a relayed EOS payload, or None to use normal generation."""
         return None
+
+    def bind_request(
+        self,
+        session_identity: SessionIdentity,
+        request_data: SGLangARRequestData,
+        unit: "SessionUnit",
+    ) -> None:
+        """Attach model-specific inputs to the native request once retained turns precede the unit's ids."""
+
+    def on_abort(self, session_identity: SessionIdentity, unit: "SessionUnit") -> None:
+        """Take what an aborted unit generated before its native request is dropped."""
 
     def build(
         self,
@@ -178,6 +198,8 @@ class SessionUnit:
     # SGLang Req. create_req builds it from token ids produced from the OmniRequest, joins tokens
     # from earlier turns, and binds it to the streaming session.
     session_request: Req | None = None
+    # Note (Junnan Li): A deferred payload passes through routing again; the unit is prepared once.
+    is_prepared: bool = False
     is_enqueued: bool = False
     # note (Junnan Li): Only completed units commit their spans to retained history.
     embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
@@ -289,6 +311,10 @@ class ARSessionBridge:
                 return session.unit
 
     def prepare_unit(self, unit: SessionUnit, payload: StagePayload) -> bool:
+        if unit.is_prepared:
+            return False
+        else:
+            unit.is_prepared = True
         preparation = self.adapter.prepare_unit(
             unit.session_identity, unit.chunk, payload
         )
@@ -437,10 +463,12 @@ class ARSessionBridge:
         else:
             # Note (Junnan Li): An adapter that rewrote the unit's request keeps its payload; the stream builder reads the params from it.
             pass
+        self.adapter.bind_request(unit.session_identity, request_data, unit)
 
     def release_append_unit(self, request_id: str) -> None:
         unit = self.units_by_request_id.pop(request_id, None)
         if unit is not None:
+            self.adapter.on_abort(unit.session_identity, unit)
             streaming_session = self.bridge_scheduler.session_controller.get(
                 unit.session_identity.id
             )

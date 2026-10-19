@@ -60,22 +60,15 @@ from sglang_omni.proto import (
     SubmitMessage,
 )
 from sglang_omni.proto.request import RoutedPayloads
-from sglang_omni.proto.session import (
-    SESSION_WORK_RELEASED,
-    SESSION_WORK_STARTED,
-    SessionOperation,
-    find_session_operation,
-)
+from sglang_omni.proto.session import SessionOperation, find_session_operation
 from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.message import (
     IncomingMessage,
     OutgoingMessage,
     ResultOwningScheduler,
     StageScheduler,
-    emit_session_release,
 )
 from sglang_omni.serve.stage_routes import StageHttpServer, StageRoutesError
-from sglang_omni.scheduling.session_request_ownership import SessionRequestOwnership
 
 TorchProfiler = current_platform.get_torch_profiler()
 
@@ -202,8 +195,6 @@ class Stage:
         self.running = False
         self.aborted: set[str] = set()
         self.active_requests: set[str] = set()
-        self.session_request_owners: dict[str, tuple[str, ...]] = {}
-        self.session_request_ownership: SessionRequestOwnership | None = None
         self.stream_queue: StreamQueue | None = None
         self.stream_chunk_counters: dict[tuple[str, str], int] = {}
         self.first_stream_chunk_seen: set[str] = set()
@@ -736,14 +727,7 @@ class Stage:
         payload: "StagePayload",
     ) -> None:
         if request_id in self.aborted:
-            await self.execute(payload)
             return
-        else:
-            pass
-        session_operation = find_session_operation(payload.request.metadata)
-        if session_operation is not None and session_operation.owned_by_execution:
-            self.session_request_owners[request_id] = session_operation.stages
-            self.scheduler.session_release_tracking.add(request_id)
         else:
             pass
         self.active_requests.add(request_id)
@@ -1173,28 +1157,18 @@ class Stage:
 
     async def execute(self, payload: StagePayload) -> None:
         request_id = payload.request_id
-        session_operation = find_session_operation(payload.request.metadata)
         if request_id in self.aborted:
-            if (
-                session_operation is not None
-                and session_operation.owned_by_execution
-                and self.owns_external_io
-            ):
-                await self.send_session_work_event(
-                    request_id, self.name, SESSION_WORK_RELEASED
-                )
-            else:
-                pass
             return
         else:
             pass
+        session_operation = find_session_operation(payload.request.metadata)
+        if session_operation is not None:
+            # Note (Junnan Li): A preempted append dies here as the control arrives: its result here and anything it sends here later are dropped.
+            for preempted_request_id in session_operation.preempted_request_ids:
+                self.on_abort(preempted_request_id)
+        else:
+            pass
         if (
-            session_operation is not None
-            and session_operation.owned_by_execution
-            and await self.execute_owned_session_operation(payload, session_operation)
-        ):
-            return
-        elif (
             session_operation is not None
             and session_operation.operation == "append"
             and self.owns_external_io
@@ -1216,10 +1190,6 @@ class Stage:
         else:
             pass
         msg = IncomingMessage(request_id=request_id, type="new_request", data=payload)
-        if self.session_request_ownership is not None:
-            msg = self.session_request_ownership.admit(msg)
-        else:
-            pass
         enqueue = getattr(self.scheduler, "enqueue", None)
         if enqueue is not None:
             enqueue(msg)
@@ -1249,38 +1219,6 @@ class Stage:
             )
         else:
             pass
-
-    async def execute_owned_session_operation(
-        self, payload: StagePayload, session_operation: SessionOperation
-    ) -> bool:
-        """Track a request of an execution-owned session; returns whether this stage answered it itself, so it does not reach the scheduler."""
-        request_id = payload.request_id
-        if self.name not in session_operation.stages:
-            await self.send_failure(request_id, "stage is outside session owners")
-            return True
-        else:
-            self.session_request_owners[request_id] = session_operation.stages
-        if session_operation.operation == "append":
-            self.scheduler.session_release_tracking.add(request_id)
-            if self.owns_external_io:
-                await self.send_session_work_event(
-                    request_id, self.name, SESSION_WORK_STARTED
-                )
-            else:
-                pass
-            return False
-        elif self.session_request_ownership is not None:
-            if self.role == "leader" and self.tp_fanout is not None:
-                self.tp_fanout.fanout_work(payload)
-            else:
-                pass
-            result = self.session_request_ownership.apply_operation(
-                payload, session_operation
-            )
-            await self.route_result(request_id, result)
-            return True
-        else:
-            return False
 
     async def on_admin(self, msg: AdminMessage) -> None:
         operation = msg.operation
@@ -1481,10 +1419,6 @@ class Stage:
 
             stream_run: list[OutgoingMessage] = []
             for batch_index in range(_OUTBOX_DRAIN_BATCH_SIZE):
-                if self.session_request_ownership is not None:
-                    out = self.session_request_ownership.restore_output(out)
-                else:
-                    pass
                 if out.type == "stream" and out.target is not None:
                     stream_run.append(out)
                 else:
@@ -1493,11 +1427,7 @@ class Stage:
                         stream_run = []
                     else:
                         pass
-                    if out.type == "released":
-                        await self.send_session_work_event(
-                            out.request_id, self.name, SESSION_WORK_RELEASED
-                        )
-                    elif out.type == "admitted":
+                    if out.type == "admitted":
                         if out.request_id not in self.aborted:
                             self.record_replica_bindings(
                                 out.request_id,
@@ -1604,10 +1534,6 @@ class Stage:
         while True:
             out = await self.wait_outbox_message()
 
-            if self.session_request_ownership is not None:
-                out = self.session_request_ownership.restore_output(out)
-            else:
-                pass
             if out.type == "wakeup":
                 return
             elif out.type == "result":
@@ -1789,7 +1715,7 @@ class Stage:
         is_forwarded_at_admission = False
         if session_operation is None:
             pass
-        elif not session_operation.owned_by_execution:
+        else:
             owners = session_operation.stages
             if self.name in owners:
                 index = owners.index(self.name)
@@ -1820,16 +1746,6 @@ class Stage:
                 return
             else:
                 is_forwarded_at_admission = expected in self.stream_targets
-        else:
-            payload_targets = [actual] if isinstance(actual, str) else actual or []
-            try:
-                for target in [*payload_targets, *self.stream_targets]:
-                    self.validate_session_target(request_id, target)
-            except ValueError as exc:
-                await self.send_failure(request_id, str(exc))
-                return
-            else:
-                pass
         if on_submitted is not None:
             # Claim before any stream completion, so a refused result sends none.
             next_stages = actual
@@ -1949,22 +1865,12 @@ class Stage:
             )
         else:
             pass
-        self.validate_session_target(request_id, target)
         target = self.resolve_target_instance(request_id, target)
         endpoint = self.endpoints.get(target)
         if endpoint is None:
             raise RuntimeError(
                 f"Stage {self.name}: no endpoint configured for target {target!r}"
             )
-        else:
-            pass
-        session_operation = find_session_operation(payload.request.metadata)
-        if (
-            session_operation is not None
-            and session_operation.owned_by_execution
-            and session_operation.operation == "append"
-        ):
-            await self.send_session_work_event(request_id, target, SESSION_WORK_STARTED)
         else:
             pass
         projector = self.project_payload.get(target)
@@ -2284,7 +2190,6 @@ class Stage:
             return
         else:
             pass
-        self.validate_session_target(request_id, target)
         target = self.resolve_target_instance(request_id, target)
         if target in self.same_process_targets:
             await self.send_local_stream_chunks(
@@ -2423,7 +2328,6 @@ class Stage:
             return
         else:
             pass
-        self.validate_session_target(request_id, target)
         target = self.resolve_target_instance(request_id, target)
         endpoint = self.endpoints.get(target)
         if endpoint is None:
@@ -2553,7 +2457,6 @@ class Stage:
         self, request_id: str, *, keep_replica_bindings: bool = False
     ) -> None:
         self.active_requests.discard(request_id)
-        self.session_request_owners.pop(request_id, None)
         self.input_handler.cancel(request_id)
         if self.stream_queue is not None:
             self.stream_queue.close(request_id)
@@ -2567,29 +2470,6 @@ class Stage:
         self.nonlocal_stream_targets.pop(request_id, None)
         if not keep_replica_bindings:
             self.replica_bindings.pop(request_id, None)
-        else:
-            pass
-
-    async def send_session_work_event(
-        self, request_id: str, from_stage: str, event: str
-    ) -> None:
-        """Report to the coordinator that a session-owned request started or released work on `from_stage`."""
-        await self.control_plane.send_complete(
-            CompleteMessage(
-                request_id=request_id,
-                from_stage=from_stage,
-                success=True,
-                result={event: True},
-            )
-        )
-
-    def validate_session_target(self, request_id: str, target: str) -> None:
-        owners = self.session_request_owners.get(request_id)
-        if (
-            owners is not None
-            and self.resolve_target_instance(request_id, target) not in owners
-        ):
-            raise ValueError("target is outside session owners")
         else:
             pass
 
@@ -2654,14 +2534,6 @@ class Stage:
         self.comm.cleanup(request_id)
         self.clear_request_state(request_id)
         self.scheduler.abort(request_id)
-        if (
-            self.session_request_ownership is not None
-            and request_id not in self.session_request_ownership.operations
-        ):
-            self.scheduler.session_release_tracking.add(request_id)
-            emit_session_release(self.scheduler, request_id)
-        else:
-            pass
 
     def on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
@@ -19,6 +21,7 @@ from sglang_omni.proto.streams import (
     SESSION_CONTROL,
     TEXT_DELTA,
     TURN_DONE,
+    TURN_STARTED,
 )
 from sglang_omni.scheduling.message import IncomingMessage
 from tests.unit_test.scheduling.test_streaming_vocoder import (
@@ -226,3 +229,50 @@ def test_a_relayed_control_unit_streams_without_a_stream_param():
         ("c1", "result"),
     ]
     assert out[0][2].format == SESSION_CONTROL
+
+
+REPLY_UNIT = "reply"
+
+
+def reply_unit(request_id: str, seq: int) -> StagePayload:
+    return append_payload(
+        request_id, TimedChunk("control", 0, 0, seq, {}, format=REPLY_UNIT, turn=1)
+    )
+
+
+def test_a_declared_reply_unit_publishes_its_turn_around_relayed_text_and_audio():
+    vocoder = FakeStreamingVocoder(reply_unit_format=REPLY_UNIT)
+    vocoder.handle_new_request_batch(
+        [IncomingMessage("r1", "new_request", reply_unit("r1", 5))]
+    )
+    text = TimedChunk("text", 0, 0, 5, {"text": "hi"}, format=TEXT_DELTA, turn=1)
+    vocoder.handle_stream_chunk(
+        "r1",
+        StreamItem(
+            0,
+            torch.empty(0, dtype=torch.long),
+            "talker_ar",
+            {"modality": "text", "stream": True, "chunk": text.to_dict()},
+        ),
+    )
+    vocoder.handle_stream_chunk("r1", item([1, 2]))
+    vocoder.handle_stream_done("r1")
+    out = chunks(drain(vocoder))
+    kinds = [
+        (
+            (c.format, c.payload["type"] if c.format == SESSION_CONTROL else None)
+            if c is not None
+            else kind
+        )
+        for _, kind, c in out
+    ]
+    assert kinds == [
+        (SESSION_CONTROL, TURN_STARTED),
+        (TEXT_DELTA, None),
+        (PCM_F32, None),
+        (SESSION_CONTROL, REPLY_PROGRESS),
+        (SESSION_CONTROL, TURN_DONE),
+        "result",
+    ]
+    assert all(c is None or c.turn == 1 for _, _, c in out)
+    assert out[1][2].payload == {"text": "hi"}

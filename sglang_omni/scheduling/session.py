@@ -64,11 +64,7 @@ from sglang_omni.proto.session import (
     TimedChunk,
     find_session_operation,
 )
-from sglang_omni.scheduling.message import (
-    IncomingMessage,
-    OutgoingMessage,
-    emit_session_release,
-)
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 DEFAULT_MAX_OPEN_SESSIONS = 64
@@ -387,7 +383,6 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         else:
             pass
         self.finish_operation(request_id)
-        emit_session_release(self, request_id)
 
     def run_batch(
         self, batch: list[IncomingMessage], loop: asyncio.AbstractEventLoop

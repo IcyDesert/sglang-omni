@@ -48,10 +48,14 @@ from sglang_omni.proto.session import (
 )
 from sglang_omni.proto.streams import (
     AUDIO,
+    CONTROL,
     INTERRUPT,
     PCM_F32,
     REPLY_PROGRESS,
     SESSION_CONTROL,
+    TEXT,
+    TURN_DONE,
+    TURN_STARTED,
     control_type,
 )
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
@@ -130,6 +134,10 @@ class StreamingVocoderBase(
     the base-owned scaffold error/log text; it defaults to the subclass name.
     ``stream_input_modality`` defaults to discrete ``audio_codes`` and can be
     set to ``audio_latents`` by continuous-latent vocoders.
+    ``reply_unit_format`` names the Session unit format whose one unit is a
+    whole reply; the vocoder then publishes ``turn.started`` before that
+    unit's first chunk and ``turn.done`` after its last. Other units carry
+    text deltas of a reply and publish neither.
     """
 
     pump_on_chunk_batch = True
@@ -147,6 +155,7 @@ class StreamingVocoderBase(
         sample_rate: int,
         stream_source_hint: str | None = None,
         stream_input_modality: str = "audio_codes",
+        reply_unit_format: str | None = None,
         batch_compute_fn: (
             Callable[
                 [list[StagePayload]],
@@ -165,12 +174,15 @@ class StreamingVocoderBase(
         self.completed_stream_request_ids: dict[str, None] = {}
         # Note (Junnan Li): A Session's appends reach the client as timed chunks in arrival order; a control unit waits for the units before it.
         self.session_appends: dict[str, SessionOperation] = {}
+        # Note (Junnan Li): A unit that is a whole reply publishes turn.started before its first chunk and turn.done after its last.
+        self.started_reply_units: set[str] = set()
         self.session_units: dict[str, list[str]] = {}
         self.session_unit_audio_ms: dict[str, float] = {}
         self.pending_session_controls: dict[str, list[OutgoingMessage]] = {}
         self.session_reads: dict[str, IncomingMessage] = {}
         self.reply_progress: dict[str, tuple[int | None, int, float]] = {}
         self.sample_rate = int(sample_rate)
+        self.reply_unit_format = reply_unit_format
         self.stream_source_hint = stream_source_hint or type(self).__name__
         self.stream_input_modality = str(stream_input_modality)
         super().__init__(
@@ -406,7 +418,14 @@ class StreamingVocoderBase(
         messages: list[OutgoingMessage] = []
         operation = self.session_appends.get(request_id)
         if operation is not None:
+            messages.extend(self.reply_unit_start(request_id, operation))
             messages.append(self.reply_progress_message(request_id, operation))
+            if self.is_reply_unit(operation):
+                messages.append(
+                    self.session_control_message(request_id, operation, TURN_DONE)
+                )
+            else:
+                pass
         else:
             pass
         messages.append(
@@ -438,7 +457,10 @@ class StreamingVocoderBase(
             text_end, audio_ms = 0, 0.0
         else:
             pass
-        text_end += len(str(chunk.payload["text"]))
+        if not self.is_reply_unit(operation):
+            text_end += len(str(chunk.payload["text"]))
+        else:
+            pass
         audio_ms += self.session_unit_audio_ms.get(request_id, 0.0)
         self.reply_progress[session_id] = (chunk.turn, text_end, audio_ms)
         progress = TimedChunk(
@@ -494,6 +516,7 @@ class StreamingVocoderBase(
         """Forget a finished unit; the controls queued behind it that are now first in line go out."""
         operation = self.session_appends.pop(request_id, None)
         self.session_unit_audio_ms.pop(request_id, None)
+        self.started_reply_units.discard(request_id)
         if operation is None:
             return []
         else:
@@ -597,6 +620,22 @@ class StreamingVocoderBase(
             )
         else:
             pass
+        operation = self.session_appends.get(request_id)
+        if operation is not None and metadata.get("modality") == TEXT:
+            # Note (Junnan Li): A reply's text reaches the client through its audio's owner, in order with the audio.
+            for message in self.reply_unit_start(request_id, operation):
+                self.outbox.put(message)
+            self.outbox.put(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="stream",
+                    data=metadata["chunk"],
+                    metadata={"modality": TEXT},
+                )
+            )
+            return None
+        else:
+            pass
         if metadata.get("modality") not in (None, self.stream_input_modality):
             raise ValueError(
                 f"{self.stream_source_hint} stream chunk modality must be "
@@ -653,6 +692,8 @@ class StreamingVocoderBase(
                 metadata={"modality": "audio"},
             )
         else:
+            for message in self.reply_unit_start(request_id, operation):
+                self.outbox.put(message)
             samples = waveform.detach().reshape(-1).to(torch.float32).cpu().numpy()
             duration_ms = len(samples) * 1000 / self.sample_rate
             chunk = TimedChunk(
@@ -671,6 +712,41 @@ class StreamingVocoderBase(
                 data=chunk.to_dict(),
                 metadata={"modality": AUDIO},
             )
+
+    def is_reply_unit(self, operation: SessionOperation) -> bool:
+        return (
+            self.reply_unit_format is not None
+            and operation.chunk.format == self.reply_unit_format
+        )
+
+    def reply_unit_start(
+        self, request_id: str, operation: SessionOperation
+    ) -> list[OutgoingMessage]:
+        if not self.is_reply_unit(operation) or request_id in self.started_reply_units:
+            return []
+        else:
+            self.started_reply_units.add(request_id)
+            return [self.session_control_message(request_id, operation, TURN_STARTED)]
+
+    @staticmethod
+    def session_control_message(
+        request_id: str, operation: SessionOperation, event: str
+    ) -> OutgoingMessage:
+        chunk = TimedChunk(
+            CONTROL,
+            0,
+            0,
+            operation.chunk.seq,
+            {"type": event},
+            format=SESSION_CONTROL,
+            turn=operation.chunk.turn,
+        )
+        return OutgoingMessage(
+            request_id=request_id,
+            type="stream",
+            data=chunk.to_dict(),
+            metadata={"modality": chunk.modality},
+        )
 
     def pump_one_step(self) -> list[str] | None:
         """Returns None when no stream is ready, otherwise the request ids
