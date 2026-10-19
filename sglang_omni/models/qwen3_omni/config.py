@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import base64
+import math
+from dataclasses import replace
 from typing import ClassVar
 
 from pydantic import Field, model_validator
@@ -18,9 +20,10 @@ from sglang_omni.config import (
     StageConfig,
 )
 from sglang_omni.config.session_audio import AudioSessionPipelineConfig, StageGroup
+from sglang_omni.models.qwen3_omni.session_input import INPUT_BYTES_PER_SECOND
 from sglang_omni.models.qwen3_omni.session_node import SESSION_PORTS
 from sglang_omni.platforms import current_platform
-from sglang_omni.proto.session import GRAPH_INPUT
+from sglang_omni.proto.session import GRAPH_INPUT, SessionLimits
 from sglang_omni.proto.streams import IMAGE, SessionPorts
 from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
 from sglang_omni.serve.server_warmup import WARMUP_MAX_TOKENS, warmup_tone_wav_bytes
@@ -689,6 +692,14 @@ class Qwen3OmniSessionPipelineConfig(AudioSessionPipelineConfig):
             )
         else:
             return ports
+
+    def session_limits(self) -> SessionLimits:
+        limits = super().session_limits()
+        # The dialog forwards the complete utterance in one unit, including its wire envelope.
+        utterance_bytes = math.ceil(self.max_utterance_seconds * INPUT_BYTES_PER_SECOND)
+        return replace(
+            limits, max_chunk_bytes=max(limits.max_chunk_bytes, utterance_bytes + 1024)
+        )
 
 
 EntryClass = Qwen3OmniSpeechPipelineConfig
