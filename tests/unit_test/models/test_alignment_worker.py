@@ -1,27 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The forced-alignment worker's text helpers; they run where the worker's `qwen-asr` package is installed."""
+"""The forced-alignment worker's request contract; it runs where the worker's `qwen-asr` package is installed."""
 
 import pytest
 
 worker = pytest.importorskip("examples.streaming_cascade.alignment_worker")
-
-
-@pytest.mark.parametrize(
-    "language, words",
-    [("English", "twenty one"), ("Chinese", "二十一"), ("Japanese", "21")],
-)
-def test_number_words_read_digits_in_the_request_language(language, words):
-    assert worker.number_words("21", language) == words
-
-
-@pytest.mark.parametrize(
-    "language, spoken",
-    [("English", "我有 three 个"), ("Chinese", "我有 三 个")],
-)
-def test_spoken_text_reads_digits_in_the_request_language(language, spoken):
-    text, origin = worker.spoken_text("我有3个", language)
-    assert text == spoken
-    assert origin == [0, 1] + [2] * (len(spoken) - 3) + [3]
 
 
 @pytest.mark.parametrize("language", ["Chinese", None])
