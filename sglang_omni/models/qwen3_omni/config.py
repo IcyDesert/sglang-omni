@@ -20,11 +20,10 @@ from sglang_omni.config import (
 from sglang_omni.config.session_audio import AudioSessionPipelineConfig, StageGroup
 from sglang_omni.models.qwen3_omni.session_node import SESSION_PORTS
 from sglang_omni.platforms import current_platform
-from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
-from sglang_omni.serve.server_warmup import WARMUP_MAX_TOKENS, warmup_tone_wav_bytes
-
 from sglang_omni.proto.session import GRAPH_INPUT
 from sglang_omni.proto.streams import IMAGE, SessionPorts
+from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
+from sglang_omni.serve.server_warmup import WARMUP_MAX_TOKENS, warmup_tone_wav_bytes
 from sglang_omni.utils.cpu import effective_cpu_count
 
 _PKG = "sglang_omni.models.qwen3_omni"
@@ -647,12 +646,19 @@ class Qwen3OmniSessionPipelineConfig(AudioSessionPipelineConfig):
         self, stage_name: str
     ) -> dict[str, float | int | dict[str, int]]:
         if stage_name in {"thinker", "talker_ar"}:
-            return {
+            kwargs = {
                 "server_args_overrides": {
                     "max_running_requests": self.max_sessions
                     + REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV,
                 }
             }
+            if stage_name == "talker_ar":
+                kwargs["max_running_requests"] = (
+                    self.max_sessions + REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV
+                )
+            else:
+                pass
+            return kwargs
         elif stage_name in {"vad", "code2wav"}:
             return {}
         elif stage_name == "dialog":

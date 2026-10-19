@@ -900,7 +900,7 @@ async def test_the_chat_probe_preserves_the_real_request_minimum_tokens(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("backends", ["failed_chat"], indirect=True)
+@pytest.mark.parametrize("backends", ["failed_probe"], indirect=True)
 async def test_the_chat_probe_fails_the_start_when_the_service_cannot_complete(
     backends,
 ):

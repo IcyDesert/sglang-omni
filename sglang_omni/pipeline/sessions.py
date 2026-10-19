@@ -583,7 +583,10 @@ class CoordinatorSessions:
                 session.in_flight_append = "accepted"
                 try:
                     request_id = await self.submit_session_operation(
-                        session, "append", chunk=chunk, request_id=pending_chunk.request_id
+                        session,
+                        "append",
+                        chunk=chunk,
+                        request_id=pending_chunk.request_id,
                     )
                     session.submitted_appends[request_id] = chunk
                     session.in_flight_append = "submitted"
@@ -684,7 +687,10 @@ class CoordinatorSessions:
                     raise RuntimeError("session is closing")
                 elif (
                     session.control_barriers[0] is barrier
-                    and (not session.pending or session.pending[0].chunk.seq >= barrier[0])
+                    and (
+                        not session.pending
+                        or session.pending[0].chunk.seq >= barrier[0]
+                    )
                     and (
                         session.in_flight_append is None
                         or (should_preempt and session.in_flight_append == "submitted")

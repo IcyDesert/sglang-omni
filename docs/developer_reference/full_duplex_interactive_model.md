@@ -138,7 +138,7 @@ One command starts everything: the profile's `services` are started in order and
 
 To use services you already run, drop their `services` entries and point the nodes' `base_url` at them; a command-line override such as `--session_nodes.llm.base_url http://127.0.0.1:9000/v1` changes one field without editing the file. The rest of this section lists every launch mode and what each profile needs started beforehand; [Configuration](#configuration), [Node Reference](#node-reference) and [Compatibility and Constraints](#compatibility-and-constraints) list every setting and the settings that cannot be combined.
 
-#### One command with a profile
+### One command with a profile
 
 ```bash
 sgl-omni serve --config examples/streaming_cascade/profiles/qwen3-asr-qwen3-tts-customvoice/launch.yaml --enable-realtime --port 8765
@@ -154,11 +154,11 @@ Relative paths in a service `command` and in a node's `reference_audio_path` res
 
 A service's port appears in three places that must agree: the `--port` inside its `command`, its `port`, and the `base_url` of the node that calls it. To move a service, change all three in the profile. If the server's own `--port` is taken, the server logs `Port <n> is already in use` and serves on a free port it names in `Using port <m> instead`; set `SGLANG_OMNI_STRICT_PORT=1` to fail instead.
 
-#### Services you run elsewhere
+### Services you run elsewhere
 
 Remove the service's entry from `services` and set the node's `base_url` and `model` to the running service. `openai_transcription`, `openai_chat` and `openai_speech` work with any OpenAI-compatible transcription, chat completions and speech endpoint; `api_key_env` names the environment variable holding its bearer token. A `services` entry is only for a service on this machine, since its readiness check requests `127.0.0.1`. The node still probes the service at startup, so a wrong `base_url` fails the start (see [Verifying a Deployment](#verifying-a-deployment)).
 
-#### A model inside the server as a stage
+### A model inside the server as a stage
 
 A node written `stages: [...]` runs a model inside this server instead of calling a service. Two stage routes exist: `vad`, the voice activity detector, and `asr`, Nemotron 3.5 streaming ASR. Any other stage name fails the load with `no stage group serves the stages [...]`.
 
@@ -181,11 +181,11 @@ session_nodes:
 
 `stages.asr.gpu` (or `--asr.gpu 1` on the command line) picks the GPU. Install the Nemotron dependencies as [Nemotron 3.5 ASR](../cookbook/nemotron3_5_asr.md) describes.
 
-#### Several GPUs
+### Several GPUs
 
 Each service picks its GPUs through `env`, as `qwen3-asr-qwen3.8-27b-customvoice` does with `env: {CUDA_VISIBLE_DEVICES: "0"}` for the language model and `"1"` for the two speech models; a stage picks its GPU with `gpu`. A service's memory share is the `--mem-fraction-static` inside its own `command`. The cascade server has no SGLang engine stage, so `sgl-omni serve --mem-fraction-static` on a cascade profile fails with `--mem-fraction-static requires a pipeline with at least one SGLang engine stage`.
 
-#### The forced-alignment worker
+### The forced-alignment worker
 
 An `alignment` node with `method: forced` sends each finished sentence and its audio to a worker that returns word boundaries. The worker cannot be a `services` entry: it answers `/health` and `/align` but not the `/v1/models` request the server waits for, and it needs the `qwen-asr` package, which pins a `transformers` release of its own, so it runs from a separate virtual environment. In that environment install `qwen-asr`, `fastapi` and `uvicorn`, plus `httpx`, `msgpack`, `msgspec`, `numpy` and `pydantic` for the modules it shares with the server, then start it from the repository root before `sgl-omni serve`:
 
@@ -203,7 +203,7 @@ PYTHONPATH=. python examples/streaming_cascade/alignment_worker.py --model Qwen/
 
 `curl http://127.0.0.1:8010/health` answers `{"status":"ready"}` once the model is loaded. To run a Qwen3-ASR profile without the worker, switch its aligner to the asr method on the command line: `--session_nodes.aligner.method asr --session_nodes.aligner.alignment_url ""`. The Nemotron profiles have no transcription endpoint and switch to the sentence method: `--session_nodes.aligner.method sentence --session_nodes.aligner.alignment_url ""`.
 
-#### Browser playground
+### Browser playground
 
 ```bash
 python playground/cascade/app.py --api-base http://127.0.0.1:8765 --port 8090
@@ -211,11 +211,11 @@ python playground/cascade/app.py --api-base http://127.0.0.1:8765 --port 8090
 
 It needs `aiohttp`, serves the page on `--host` (default `127.0.0.1`) and `--port` (default `8080`), and forwards `/v1/realtime` and `/v1/realtime/capabilities` to `--api-base` (default `http://127.0.0.1:8000`). The page sends only `output_modalities` in its `session.update`, so the profile's prompt and turn detection apply; when a reply is interrupted it sends `conversation.item.truncate` with the audio it played, and it marks the heard part of the reply when the server sends `sglang.response.progress`. Browsers grant the microphone only to `localhost` or HTTPS pages, so open the page on the same machine or forward its port.
 
-#### An OpenAI Realtime client or the Session API
+### An OpenAI Realtime client or the Session API
 
 Any OpenAI Realtime client connects to `/v1/realtime` with the session flow in [Voice Conversation](#voice-conversation). `/v1/session` serves the same Session without the realtime protocol. `examples/streaming_cascade/run.py` runs a profile in its own process instead of connecting to a server; it does not start the profile's `services`, so start them first.
 
-#### Profiles
+### Profiles
 
 Every profile is a `launch.yaml` under `examples/streaming_cascade/profiles/`.
 
@@ -287,7 +287,7 @@ python benchmarks/realtime_turn_latency.py --url ws://127.0.0.1:8765/v1/realtime
 
 A setting comes from one of three places: the profile file, read at launch; command-line overrides of the profile, also read at launch; and the settings a client sends for its own session.
 
-#### Profile file
+### Profile file
 
 | Field | Default | Effect |
 | --- | --- | --- |
@@ -331,7 +331,7 @@ The formats each kind consumes and produces:
 
 `session_publish` maps a node to the formats the client receives: `transcript` becomes `conversation.item.input_audio_transcription.*`, `text_delta` becomes `response.output_text.delta`, `pcm_f32le` becomes `response.output_audio.delta` (PCM16), and `session` carries speech boundaries, the response lifecycle and `sglang.response.progress`.
 
-#### Command-line overrides
+### Command-line overrides
 
 Any field of the profile can be overridden after `--config`, as `--<path> <value>` or `<path>=<value>`, one leaf value per flag. Paths start at the top of the profile, except stage settings, which start at the stage name:
 
@@ -347,7 +347,7 @@ sgl-omni serve --config examples/streaming_cascade/profiles/qwen3-asr-qwen3-tts-
 
 Services are addressed by `name` (`--services.tts.port`), not by position. An override may add an option the file leaves out, and is validated like the file: an option the node's kind does not have fails with `Extra inputs are not permitted`, and a whole group such as `--session_nodes.aligner x` fails with `addresses a settings group, not a single value`. Lists such as a service `command` or a node's `inputs`, and removing a node or a service, need an edit of the file.
 
-#### Session settings
+### Session settings
 
 A realtime client sends its settings in `session.update`. The first `session.update` opens the session; later ones may change only the fields marked hot below, and any other change is refused with `session field is frozen`.
 
@@ -381,7 +381,7 @@ What needs a restart and what does not:
 
 Every node of a kind has `kind` (required) and `timeout_s`. Options marked required have no default.
 
-#### `realtime_transcription`
+### `realtime_transcription`
 
 Streams each utterance over its own WebSocket to `<base_url>/v1/realtime?model=<model>` of an SGLang-Omni transcription server started with `--enable-realtime`, and reports partial and final transcripts. Its transcripts carry no language.
 
@@ -392,7 +392,7 @@ Streams each utterance over its own WebSocket to `<base_url>/v1/realtime?model=<
 | `api_key_env` | string | `OPENAI_API_KEY` | Environment variable whose value is sent as a bearer token; nothing is sent when it is unset. |
 | `timeout_s` | number > 0 | `120` | The limit for connecting and for one utterance's whole exchange. |
 
-#### `openai_transcription`
+### `openai_transcription`
 
 Sends each finished utterance as a 16 kHz WAV to `<base_url>/audio/transcriptions` and reports one final transcript.
 
@@ -405,7 +405,7 @@ Sends each finished utterance as a 16 kHz WAV to `<base_url>/audio/transcription
 | `api_key_env` | string | `OPENAI_API_KEY` | As above. |
 | `timeout_s` | number > 0 | `120` | The request timeout. |
 
-#### `running_transcript`
+### `running_transcript`
 
 Turns the running text of the `asr` stage into utterances: partial transcripts while it grows, and a final one once `tail_ms` of further audio has arrived after `speech.stopped` or a `commit`. Its transcripts carry no language.
 
@@ -413,7 +413,7 @@ Turns the running text of the `asr` stage into utterances: partial transcripts w
 | --- | --- | --- | --- |
 | `tail_ms` | number ≥ 0 | `400` | Audio after the end of speech that still belongs to the utterance. |
 
-#### `dialog`
+### `dialog`
 
 Keeps the conversation history, opens a turn for each final transcript and sends the history to the language model. An utterance that arrives during a reply waits for it to end; speech that starts during a reply interrupts it.
 
@@ -423,7 +423,7 @@ Keeps the conversation history, opens a turn for each final transcript and sends
 | `max_history_chars` | integer > 0 | `65536` | The bound on the history: a turn whose history plus utterance plus `max_text_chars` would exceed it fails the session. |
 | `max_text_chars` | integer > 0 | `16000` | The longest utterance transcript and the longest reply. |
 
-#### `openai_chat`
+### `openai_chat`
 
 Streams one chat completion from `<base_url>/chat/completions` per turn.
 
@@ -437,7 +437,7 @@ Streams one chat completion from `<base_url>/chat/completions` per turn.
 | `api_key_env` | string | `OPENAI_API_KEY` | As above. |
 | `timeout_s` | number > 0 | `120` | The request timeout. |
 
-#### `openai_speech`
+### `openai_speech`
 
 Cuts the reply text into sentences and sends one streaming request per sentence to `<base_url>/audio/speech` with `model`, `voice`, `input`, `response_format: pcm`, `stream: true`, `language` when `language` is set, and `references: [{audio_path, text}]` when `reference_audio_path` is set. A sentence ends after a word ending in `.`, `!`, `?`, `;` or `…` (closing quotes and brackets included), after `max_sentence_words` words, after Chinese end punctuation followed by more text, or at a line end.
 
@@ -455,7 +455,7 @@ Cuts the reply text into sentences and sends one streaming request per sentence 
 | `api_key_env` | string | `OPENAI_API_KEY` | As above. |
 | `timeout_s` | number > 0 | `120` | The request timeout. |
 
-#### `alignment`
+### `alignment`
 
 Reports how far into the reply text the reply audio has reached, as `reply.progress`, so the dialog can cut an interrupted reply where the listener stopped hearing it. It reads `["llm:text_delta", "tts:pcm_f32le", "tts:session", "dialog:session"]` in the profiles, and `input:session` too in the Qwen3-ASR profiles.
 
@@ -473,7 +473,7 @@ The dialog cuts an interrupted reply at the points `reply.progress` reports, up 
 
 `method: asr` keeps the sentence ends and, when a reply is cut, sends the audio of the sentence at the cut, from the sentence's start to the cut, as a WAV file in the reply's language to the `/audio/transcriptions` endpoint of the OpenAI-compatible service at `heard_asr_url` with `heard_asr_model`; the reply keeps the sentences before it and the longest prefix of that sentence's text the transcript says, with the punctuation that follows it. The cut is the client's `truncate` position and never past `reply.delivered`, the same cut the dialog makes, so the aligner reads `input:session` for the client's `truncate`. The match ignores case and punctuation, reads digits, English numbers up to twenty and ordinary Chinese numbers as the same number, and stops at the first word the transcript leaves out, repeats or says differently. When the request fails, exceeds `timeout_s` or the first words differ, the sentence counts as unheard. It needs no model beyond the profile's own recognizer. `method: forced` takes `heard_asr_url` and `heard_asr_model` too, and then recognizes the sentence at the cut only when no word end at or after the cut covers it, such as a sentence cut off before its audio was complete; `method: sentence` takes neither.
 
-#### Stage `vad`
+### Stage `vad`
 
 Declared as `vad: {stages: [vad], inputs: [input]}`; reports `speech.started` and `speech.stopped`. Its defaults apply to every session and a session's `turn_detection` overrides them; set them under `stages.vad.factory` or as `--vad.factory.<option>`.
 
@@ -485,7 +485,7 @@ Declared as `vad: {stages: [vad], inputs: [input]}`; reports `speech.started` an
 | `max_open_sessions` | integer ≥ 1 | `16` | Sessions the detector holds at once. |
 | `max_concurrency` | integer ≥ 1 | `4` | Sessions it processes at once. |
 
-#### Stage `turn_detection`
+### Stage `turn_detection`
 
 Declared as `turn_detection: {stages: [turn_detection], inputs: ["input:pcm16", "input:session", "vad:session"]}`; reports the turn's `speech.started` and `speech.stopped`, which the recognizer and the dialog read in place of the VAD's. A session's `turn_detection` overrides `eagerness`; set the options under `stages.turn_detection.factory` or as `--turn_detection.factory.<option>`.
 
@@ -496,13 +496,13 @@ Declared as `turn_detection: {stages: [turn_detection], inputs: ["input:pcm16", 
 | `max_open_sessions` | integer ≥ 1 | `16` | Sessions the node holds at once. |
 | `max_concurrency` | integer ≥ 1 | `4` | Sessions it processes at once. |
 
-#### Stage `asr`
+### Stage `asr`
 
 Declared as `asr: {stages: [asr], inputs: ["input:pcm16"]}`; runs Nemotron 3.5 streaming ASR on the GPU set by `stages.asr.gpu` (default 0) and produces the running `text` a `running_transcript` node reads.
 
 ### Compatibility and Constraints
 
-#### Rejected when the profile loads
+### Rejected when the profile loads
 
 Each rule is followed by the error it raises.
 
@@ -540,7 +540,7 @@ Each rule is followed by the error it raises.
 - Two `services` with one name or one port — `services must have distinct names and ports`.
 - An empty `model_path` — `Model path is required`.
 
-#### Rejected on the command line or at startup
+### Rejected on the command line or at startup
 
 - `--stages.<...>` — `the stages. prefix is implied on the command line; write --<...>`.
 - `--services.0.<...>` — `services is addressed by name, not by index`.
@@ -549,7 +549,7 @@ Each rule is followed by the error it raises.
 - A service that exits or does not answer `/v1/models` on its port — the service errors under [One command with a profile](#one-command-with-a-profile).
 - A node whose service does not answer its probe: `openai_transcription`, `openai_chat` and `openai_speech` request `<base_url>/models`, `openai_chat` then streams one token sampled with the node's settings, `realtime_transcription` requests `/v1/models` on the `http` form of its `base_url`, a forced `alignment` requests `<alignment_url>/health` and then aligns one second of silence, and an `alignment` with `heard_asr_url` requests `<heard_asr_url>/models` — `cannot reach <url>: ...` or `<url> answered <status>`, or the error of the chat token's completion, and the server stops.
 
-#### Rejected in a realtime session
+### Rejected in a realtime session
 
 - A sampling parameter other than `temperature` and `max_new_tokens_per_unit` — `unsupported sampling parameters: ...`.
 - `sglang.sampling` or another non-hot field changed after the first `session.update` — `session field is frozen`.
@@ -563,7 +563,7 @@ Each rule is followed by the error it raises.
 - A new session beyond the 16 that every cascade node holds at once — the first `session.update` is refused with `admission_rejected`.
 - A `session.update` that changes `instructions`, or a `configure` that changes a node, while the user is speaking, between `speech_started` and `speech_stopped` — the session fails with `cannot replace '<node>' while speech is in progress`.
 
-#### Rejected by the speech service
+### Rejected by the speech service
 
 The speech service validates each sentence request, and a rejected request fails the session.
 
@@ -573,7 +573,7 @@ The speech service validates each sentence request, and a rejected request fails
 - A `language` tag the service does not speak, including a language name the recognizer reported under `language: auto` — `language must be one of: ...`. Qwen3-TTS speaks Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish and Italian.
 - A speech service that does not stream 24 kHz PCM with an `X-Sample-Rate` header — `speech service sent no X-Sample-Rate header, so its PCM rate is unknown` or `speech service streams <rate> Hz, expected 24000`.
 
-#### Runtime limits
+### Runtime limits
 
 - A conversation whose history, next utterance and `max_text_chars` together exceed `max_history_chars` — `conversation exceeds max_history_chars; open a new session`, and the session fails. With the defaults this happens once the history passes about 49500 characters.
 - An utterance transcript or a reply longer than `max_text_chars` — `transcript exceeds max_text_chars` or `reply exceeds max_text_chars`.
@@ -582,7 +582,7 @@ The speech service validates each sentence request, and a rejected request fails
 
 Every failure ends the realtime session with an `error` event.
 
-#### Allowed, with consequences
+### Allowed, with consequences
 
 - Without an `alignment` node, the dialog's `reply.progress` control edge comes from `tts`, which reports sentence ends, so an interrupted reply is cut at the end of the last sentence heard in full.
 - `method: sentence`: the same sentence-level cut. With `forced`, the cut can fall between words of a finished sentence; a sentence cut off before its audio is complete counts as unheard in both methods unless `heard_asr_url` is set.

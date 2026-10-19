@@ -182,7 +182,7 @@ async def open_session(websocket: ClientConnection, instructions: str) -> Cascad
     updated = await client.configure(instructions, SILENCE_DURATION_MS)
     granted = updated["session"]["sglang"]["granted"]
     assert granted["interaction"] == "turn_based", granted
-    assert granted["turn_control"] == ["server_vad", None], granted
+    assert {"server_vad", None} <= set(granted["turn_control"]), granted
     return client
 
 

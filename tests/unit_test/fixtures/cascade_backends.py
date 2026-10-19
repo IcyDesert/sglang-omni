@@ -102,9 +102,21 @@ def backends(request, backend_requests):
                 return
             else:
                 pass
-            received_messages.append(request["messages"])
             backend_requests.append(request)
             self.send("text/event-stream")
+            if request["max_tokens"] == 1 and request["messages"] == [
+                {"role": "user", "content": "Hi"}
+            ]:
+                self.event({"delta": {"content": "Hi"}, "finish_reason": None})
+                finish_reason = {
+                    "failed_probe": "abort",
+                    "length_chat": "length",
+                }.get(scenario, "stop")
+                self.event({"delta": {}, "finish_reason": finish_reason})
+                self.wfile.write(b"data: [DONE]\n\n")
+                return
+            else:
+                received_messages.append(request["messages"])
             deltas = [{"content": text} for text in ("Hel", "lo ", "world.")]
             finish_reason = {"failed_chat": "abort", "length_chat": "length"}.get(
                 scenario, "stop"

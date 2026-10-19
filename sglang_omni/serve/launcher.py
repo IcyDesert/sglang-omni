@@ -62,6 +62,7 @@ from sglang_omni.serve.protocol import (
 )
 from sglang_omni.serve.realtime.manager import RealtimeDeployment
 from sglang_omni.serve.server_warmup import TranscriptionWarmupRequest
+from sglang_omni.serve.services import ServiceProcesses
 from sglang_omni.serve.stage_routes import (
     KEEP_ALIVE_S,
     StageRoutes,
@@ -69,8 +70,6 @@ from sglang_omni.serve.stage_routes import (
     export_server_port,
 )
 from sglang_omni.serve.transcriptions import TRANSCRIPTIONS_ENDPOINT
-
-from sglang_omni.serve.services import ServiceProcesses
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
     GpuDeviceInfo,
@@ -687,7 +686,9 @@ async def run_server(
                     pipeline_config.supports_uploaded_voice_references()
                 ),
                 custom_voice_config=pipeline_config.resolve_custom_voice_config(),
-                supports_audio_translation=(pipeline_config.supports_audio_translation()),
+                supports_audio_translation=(
+                    pipeline_config.supports_audio_translation()
+                ),
                 required_speech_reference_count=(
                     pipeline_config.required_speech_reference_count
                 ),
@@ -755,11 +756,15 @@ async def run_server(
                     app,
                     base_url=base_url,
                     requests=warmup_requests,
-                    timeout_s=float(os.environ.get("SGLANG_OMNI_WARMUP_TIMEOUT", "600")),
+                    timeout_s=float(
+                        os.environ.get("SGLANG_OMNI_WARMUP_TIMEOUT", "600")
+                    ),
                 )
             )
             try:
-                await serve_with_failure_watch(server, [mp_runner.wait_failed(), services.watch()])
+                await serve_with_failure_watch(
+                    server, [mp_runner.wait_failed(), services.watch()]
+                )
             finally:
                 warmup_task.cancel()
                 with suppress(asyncio.CancelledError):

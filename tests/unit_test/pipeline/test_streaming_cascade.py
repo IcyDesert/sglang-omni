@@ -247,8 +247,8 @@ async def test_configure_preserves_running_reply_and_updates_next_prompt(
         assert messages[0][0]["content"] != "Answer with one word."
         assert messages[1][0]["content"] == "Answer with one word."
         assert messages[1][-2]["content"] == "Hello world."
-        assert backend_requests[1]["temperature"] == 0.1
-        assert backend_requests[1]["max_tokens"] == 64
+        assert backend_requests[-1]["temperature"] == 0.1
+        assert backend_requests[-1]["max_tokens"] == 64
 
 
 @pytest.mark.asyncio

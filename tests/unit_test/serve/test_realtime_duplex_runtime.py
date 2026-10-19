@@ -369,6 +369,7 @@ async def test_update_after_the_deadline_is_rejected_without_admission(
     failures = [entry.event for entry in envelopes if isinstance(entry.event, Failure)]
     assert [failure.code for failure in failures] == ["session_update_timeout"]
 
+
 def test_an_audio_delta_is_sized_by_its_base64_audio_and_the_envelope() -> None:
     pcm = bytes(range(256)) * 7
     envelope = Envelope(event=AudioDelta("response", "item", pcm))

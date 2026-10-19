@@ -9,6 +9,7 @@ import pytest
 
 from sglang_omni.proto.session import SessionIdentity, TimedChunk
 from sglang_omni.scheduling import omni_scheduler
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.sglang_backend.ar_session import SessionUnit
 
@@ -17,6 +18,7 @@ def scheduler_with_unit(stages: tuple[str, ...]):
     scheduler = Mock(spec=OmniScheduler)
     scheduler.aborted_request_ids = set()
     scheduler.outbox = queue.Queue()
+    scheduler.first_emit_done = set()
     unit = SessionUnit(
         request_id="unit-1",
         session_identity=SessionIdentity("tts"),
@@ -25,12 +27,24 @@ def scheduler_with_unit(stages: tuple[str, ...]):
     )
     scheduler.session_bridge = Mock()
     scheduler.session_bridge.units_by_request_id = {"unit-1": unit}
-    scheduler.session_bridge.stream_messages = Mock(return_value=["from-bridge"])
+    scheduler.session_bridge.stream_messages = Mock(
+        return_value=[OutgoingMessage("unit-1", "stream", "from-bridge")]
+    )
     scheduler.active_session_unit = MethodType(
         OmniScheduler.active_session_unit, scheduler
     )
-    scheduler.stream_output_builder = Mock(return_value=["from-builder"])
-    scheduler.put_stream_messages = Mock()
+    scheduler.stream_output_builder = Mock(
+        return_value=[OutgoingMessage("unit-1", "stream", "from-builder")]
+    )
+    scheduler.stream_output_builder.flush.return_value = [
+        OutgoingMessage("unit-1", "stream", "flushed-builder")
+    ]
+    scheduler.stage_stream_messages = MethodType(
+        OmniScheduler.stage_stream_messages, scheduler
+    )
+    scheduler.put_stream_messages = MethodType(
+        OmniScheduler.put_stream_messages, scheduler
+    )
     sched_output = SimpleNamespace(
         requests=[SimpleNamespace(request_id="unit-1", data="data")]
     )
@@ -48,10 +62,14 @@ def test_a_session_stream_leaves_through_the_bridge_only_at_the_last_stage(
     monkeypatch.setattr(omni_scheduler, "_get_active_stage", lambda: "tts_engine")
     scheduler, sched_output, mr_output = scheduler_with_unit(stages)
     OmniScheduler.emit_stream_output(scheduler, sched_output, mr_output)
-    scheduler.put_stream_messages.assert_called_once_with("unit-1", [expected])
+    assert scheduler.outbox.get_nowait() == OutgoingMessage(
+        "unit-1", "stream", expected
+    )
+    assert scheduler.outbox.empty()
     OmniScheduler.flush_stream_output(scheduler, "unit-1", "data")
-    flushed = scheduler.put_stream_messages.call_args_list[-1].args
+    flushed = scheduler.outbox.get_nowait()
     if expected == "from-bridge":
-        assert flushed == ("unit-1", ["from-bridge"])
+        assert flushed == OutgoingMessage("unit-1", "stream", "from-bridge")
     else:
-        assert flushed == ("unit-1", scheduler.stream_output_builder.flush.return_value)
+        assert flushed == OutgoingMessage("unit-1", "stream", "flushed-builder")
+    assert scheduler.outbox.empty()

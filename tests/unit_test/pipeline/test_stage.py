@@ -20,7 +20,12 @@ from sglang_omni.pipeline.stage.input import AggregatedInput
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.stage_workers import StageLaunchConfig, construct_stage
-from sglang_omni.proto import DataReadyMessage, ShutdownMessage, StagePayload, SubmitMessage
+from sglang_omni.proto import (
+    DataReadyMessage,
+    ShutdownMessage,
+    StagePayload,
+    SubmitMessage,
+)
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
     SessionIdentity,
