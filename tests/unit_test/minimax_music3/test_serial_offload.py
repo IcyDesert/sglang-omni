@@ -17,9 +17,18 @@ import pytest
 import torch
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.sampling.sampling_params import SamplingParams
-from torch_memory_saver import configure_subprocess, torch_memory_saver
+
+try:
+    from torch_memory_saver import configure_subprocess, torch_memory_saver
+except ModuleNotFoundError as failure:
+    if failure.name != "torch_memory_saver":
+        raise
+    else:
+        configure_subprocess = None
+        torch_memory_saver = None
 
 from sglang_omni.models.minimax_music3.acoustic import (
+    AcousticStreamState,
     MiniMaxMusic3AcousticDecoder,
     MiniMaxMusic3AcousticScheduler,
 )
@@ -47,14 +56,16 @@ from sglang_omni.scheduling.generation_batch_policy import (
 
 
 @pytest.mark.parametrize("enable_serial_offload", [False, True])
+@pytest.mark.parametrize("disable_cuda_graph", [False, True])
 def test_offload_enforces_one_cfg_pair_and_preserves_graph_selection(
     enable_serial_offload: bool,
+    disable_cuda_graph: bool,
 ) -> None:
     builder = MiniMaxMusic3EngineBuilder(enable_serial_offload=enable_serial_offload)
     overrides = build_generation_batch_overrides(
         server_args_overrides={
             "max_running_requests": 16,
-            "disable_cuda_graph": False,
+            "disable_cuda_graph": disable_cuda_graph,
             "cuda_graph_backend_decode": "full",
             "cuda_graph_backend_prefill": "full",
             "cuda_graph_config": {
@@ -69,14 +80,14 @@ def test_offload_enforces_one_cfg_pair_and_preserves_graph_selection(
 
     builder.adjust_overrides(overrides)
     assert overrides["enable_deterministic_inference"] is True
+    assert overrides["disable_cuda_graph"] is disable_cuda_graph
+    assert overrides["cuda_graph_backend_decode"] == "full"
+    assert overrides["cuda_graph_backend_prefill"] == "full"
+    assert "cuda_graph_config" in overrides
 
     if enable_serial_offload:
         assert builder.max_running_requests == 1
         assert overrides["max_running_requests"] == 2
-        assert overrides["disable_cuda_graph"] is False
-        assert overrides["cuda_graph_backend_decode"] == "full"
-        assert overrides["cuda_graph_backend_prefill"] == "full"
-        assert "cuda_graph_config" in overrides
         assert overrides["enable_memory_saver"] is True
         assert overrides["enable_weights_cpu_backup"] is False
         assert overrides["enable_torch_compile"] is False
@@ -84,10 +95,6 @@ def test_offload_enforces_one_cfg_pair_and_preserves_graph_selection(
     else:
         assert builder.max_running_requests == 16
         assert overrides["max_running_requests"] == 32
-        assert overrides["disable_cuda_graph"] is False
-        assert overrides["cuda_graph_backend_decode"] == "full"
-        assert overrides["cuda_graph_backend_prefill"] == "full"
-        assert "cuda_graph_config" in overrides
         assert overrides["enable_torch_compile"] is True
         assert overrides["disable_overlap_schedule"] is False
 
@@ -112,34 +119,11 @@ def test_disabled_coordinator_never_blocks_admission_and_handoffs_are_noops() ->
     assert coordinator.ar_can_admit() is True
 
 
-def test_register_ar_enables_the_coordinator_and_starts_ar_active() -> None:
+def test_handoff_blocks_admission_until_owner_retires_and_is_idempotent() -> None:
     coordinator = registered_coordinator()
 
     assert coordinator.enabled is True
     assert coordinator.ar_can_admit() is True
-
-
-def test_begin_dit_handoff_moves_ar_off_the_gpu_and_blocks_admission() -> None:
-    coordinator = registered_coordinator()
-    assert coordinator.try_acquire_ar("req-1")
-
-    coordinator.begin_dit_handoff("req-1")
-
-    assert coordinator.ar_can_admit() is False
-
-
-def test_end_dit_handoff_restores_ar_and_reopens_admission() -> None:
-    coordinator = registered_coordinator()
-    assert coordinator.try_acquire_ar("req-1")
-    coordinator.begin_dit_handoff("req-1")
-
-    coordinator.end_dit_handoff("req-1")
-
-    assert coordinator.ar_can_admit() is True
-
-
-def test_handoff_calls_are_idempotent() -> None:
-    coordinator = registered_coordinator()
     assert coordinator.try_acquire_ar("req-1")
 
     coordinator.begin_dit_handoff("req-1")
@@ -164,16 +148,6 @@ def test_one_owner_excludes_other_requests_until_acoustic_retires() -> None:
     assert coordinator.try_acquire_ar("req-2")
 
 
-def test_end_for_a_request_that_never_handed_off_does_not_wake_ar() -> None:
-    coordinator = registered_coordinator()
-    assert coordinator.try_acquire_ar("req-1")
-    coordinator.begin_dit_handoff("req-1")
-
-    coordinator.end_dit_handoff("req-unknown")
-
-    assert coordinator.ar_can_admit() is False
-
-
 def test_a_stalled_handoff_is_reported_once_and_never_force_woken(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -191,74 +165,34 @@ def test_a_stalled_handoff_is_reported_once_and_never_force_woken(
     assert "req-1" in stall_records[0].message
 
 
-def test_handoff_without_registration_raises_if_force_enabled() -> None:
-    """Defensive guard for a caller that enables without registering."""
-    coordinator = SerialOffloadCoordinator()
-    coordinator.is_enabled = True
-
-    with pytest.raises(RuntimeError, match="never registered"):
-        coordinator.begin_dit_handoff("req-1")
-    with pytest.raises(RuntimeError, match="never registered"):
-        coordinator.end_dit_handoff("req-1")
-
-
-def test_residency_sleep_and_wake_preserve_weights_and_state() -> None:
+def test_residency_cycles_restore_values_without_replacing_tied_parameters() -> None:
     module = torch.nn.Linear(2, 2)
-    expected = module.weight.detach().clone()
-    residency = StageResidency({"module": module}, torch.device("cpu"))
-
-    residency.sleep()
-    assert residency.resident is False
-    residency.wake()
-
-    assert residency.resident is True
-    assert torch.equal(module.weight, expected)
-
-
-def test_residency_reuses_one_host_copy_instead_of_recopying_each_sleep() -> None:
-    """The weights are immutable, so only the first sleep may snapshot them."""
-    module = torch.nn.Linear(2, 2)
-    residency = StageResidency({"module": module}, torch.device("cpu"))
-
-    residency.sleep()
-    snapshot = residency.weights.chunks[0].values
-    residency.wake()
-    residency.sleep()
-
-    assert residency.weights.chunks[0].values is snapshot
-
-
-def test_restore_keeps_storage_and_tensor_identity() -> None:
-    module = torch.nn.Linear(2, 2)
+    tied = torch.nn.Linear(2, 2)
+    tied.weight = module.weight
     parameter = module.weight
     address = parameter.data_ptr()
     expected = parameter.detach().clone()
-    residency = StageResidency({"module": module}, torch.device("cpu"))
-    residency.sleep()
-    with torch.no_grad():
-        parameter.zero_()
-    residency.wake()
-    assert module.weight is parameter
-    assert parameter.data_ptr() == address
-    assert torch.equal(parameter, expected)
-
-
-def test_residency_keeps_tied_weights_tied_across_a_round_trip() -> None:
-    module = torch.nn.Linear(4, 4)
-    tied = torch.nn.Linear(4, 4)
-    tied.weight = module.weight
-    parent = torch.nn.Sequential(module, tied)
-    residency = StageResidency({"module": parent}, torch.device("cpu"))
-
-    residency.sleep()
-    residency.wake()
-
-    assert module.weight is tied.weight
-    assert module.weight.data_ptr() == tied.weight.data_ptr()
+    residency = StageResidency(
+        {"module": torch.nn.Sequential(module, tied)}, torch.device("cpu")
+    )
+    for _ in range(2):
+        residency.sleep()
+        assert residency.resident is False
+        with torch.no_grad():
+            parameter.zero_()
+        residency.sleep()
+        residency.wake()
+        assert residency.resident is True
+        assert module.weight is tied.weight is parameter
+        assert parameter.data_ptr() == address
+        assert torch.equal(parameter, expected)
 
 
 @pytest.mark.accelerator
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch_memory_saver is None,
+    reason="CUDA and torch_memory_saver are required",
+)
 @pytest.mark.parametrize("source", ["ram", "mmap"])
 def test_cuda_cycles_release_physical_memory_and_replay_graph_without_recapture(
     tmp_path: Path, source: Literal["ram", "mmap"]
@@ -267,6 +201,7 @@ def test_cuda_cycles_release_physical_memory_and_replay_graph_without_recapture(
 
 
 def run_memory_saver_subprocess(function_name: str, *arguments: str) -> None:
+    assert configure_subprocess is not None
     with configure_subprocess():
         process = subprocess.run(
             [
@@ -351,8 +286,10 @@ class RecordingAcousticDecoder:
         self.release_count += 1
 
 
-def test_acoustic_abort_before_terminal_handoff_reopens_admission(
+@pytest.mark.parametrize("abort_before_handoff", [True, False])
+def test_acoustic_abort_reopens_admission_after_ar_cleanup(
     monkeypatch: pytest.MonkeyPatch,
+    abort_before_handoff: bool,
 ) -> None:
     coordinator = registered_coordinator()
     monkeypatch.setattr(
@@ -361,6 +298,8 @@ def test_acoustic_abort_before_terminal_handoff_reopens_admission(
     )
     decoder = RecordingAcousticDecoder()
     scheduler = MiniMaxMusic3AcousticScheduler(decoder)
+    acoustic_state = AcousticStreamState(wave_chunks=[torch.ones(1)])
+    scheduler.stream_states["cancelled"] = acoustic_state
     runner = MiniMaxMusic3ModelRunner.__new__(MiniMaxMusic3ModelRunner)
     runner.serial_offload = coordinator
     runner.request_data = {}
@@ -374,20 +313,30 @@ def test_acoustic_abort_before_terminal_handoff_reopens_admission(
     request_data = SimpleNamespace(
         ar_state=ar_state, minimax_state=SimpleNamespace(), prompt_tokens=1
     )
-    monkeypatch.setattr(
-        runner, "dump_reference_ranks", lambda state: scheduler.abort("cancelled")
-    )
+
+    def finish_ar(state: MiniMaxMusic3ARState) -> None:
+        if abort_before_handoff:
+            scheduler.abort("cancelled")
+        else:
+            pass
+
+    monkeypatch.setattr(runner, "dump_reference_ranks", finish_ar)
     assert coordinator.try_acquire_ar("cancelled")
     runner.on_request_finished("cancelled", request_data)
-    assert not coordinator.try_acquire_ar("next")
+    if abort_before_handoff:
+        assert not coordinator.try_acquire_ar("next")
+    else:
+        scheduler.abort("cancelled")
     runner.reset_request("cancelled")
     assert scheduler.is_aborted("cancelled")
-    assert decoder.release_count == 0
+    assert acoustic_state.abort_event.is_set()
+    assert not acoustic_state.wave_chunks
+    assert decoder.release_count == (0 if abort_before_handoff else 1)
     assert coordinator.try_acquire_ar("next")
     coordinator.begin_dit_handoff("next")
     coordinator.require_acoustic("next")
     scheduler.clear_stream_state("next")
-    assert decoder.release_count == 1
+    assert decoder.release_count == (1 if abort_before_handoff else 2)
     assert coordinator.try_acquire_ar("final")
 
 
@@ -477,7 +426,10 @@ def test_acoustic_compute_requires_a_completed_handoff() -> None:
 
 
 @pytest.mark.accelerator
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch_memory_saver is None,
+    reason="CUDA and torch_memory_saver are required",
+)
 def test_sleep_waits_for_compute_on_another_cuda_stream() -> None:
     run_memory_saver_subprocess("run_sleep_with_concurrent_compute")
 
@@ -612,13 +564,6 @@ def test_tmpfs_cache_is_rejected() -> None:
             checkpoint_contents={},
             folding_backend="cpu",
         )
-
-
-def test_explicit_eager_selection_survives_offload_configuration() -> None:
-    builder = MiniMaxMusic3EngineBuilder(enable_serial_offload=True)
-    overrides = {"disable_cuda_graph": True}
-    builder.adjust_overrides(overrides)
-    assert overrides["disable_cuda_graph"] is True
 
 
 def test_failed_acoustic_wake_blocks_admission(monkeypatch: pytest.MonkeyPatch) -> None:

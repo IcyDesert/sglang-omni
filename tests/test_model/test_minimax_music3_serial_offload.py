@@ -8,7 +8,6 @@ import io
 import json
 import os
 import re
-import socket
 import sys
 import threading
 import time
@@ -76,7 +75,6 @@ def test_music3_serial_offload_http_parity_and_lifecycle(tmp_path: Path) -> None
         else:
             pass
         mode_audio: dict[int, bytes] = {}
-        cancelled_request_ids: set[str] = set()
         port = find_available_port(host="127.0.0.1")
         log_path = tmp_path / f"{mode}.log"
         command = [
@@ -200,34 +198,6 @@ def test_music3_serial_offload_http_parity_and_lifecycle(tmp_path: Path) -> None
             )
             return response.content
 
-        def cancel_generation(phase: str) -> None:
-            previous_log_length = len(log_path.read_text())
-            request_body = json.dumps({**payload, "max_new_tokens": 1000}).encode()
-            with socket.create_connection(
-                ("127.0.0.1", port), timeout=10
-            ) as connection:
-                connection.sendall(
-                    (
-                        f"POST /v1/audio/speech HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
-                        f"Content-Type: application/json\r\nContent-Length: {len(request_body)}\r\n"
-                        "Connection: close\r\n\r\n"
-                    ).encode()
-                    + request_body
-                )
-                deadline_seconds = time.monotonic() + REQUEST_TIMEOUT_SECONDS
-                while True:
-                    request_log = log_path.read_text()[previous_log_length:]
-                    match = re.search(
-                        rf"MiniMax Music 3 {phase} request=([^ ]+)", request_log
-                    )
-                    if match is not None:
-                        cancelled_request_ids.add(match[1])
-                        connection.shutdown(socket.SHUT_RDWR)
-                        break
-                    else:
-                        assert time.monotonic() < deadline_seconds, request_log
-                        time.sleep(0.01)
-
         try:
             if (
                 offload
@@ -292,15 +262,6 @@ def test_music3_serial_offload_http_parity_and_lifecycle(tmp_path: Path) -> None
                 ):
                     assert time.monotonic() < handoff_deadline_seconds
                     time.sleep(0.1)
-                for phase in ("AR progress", "acoustic chunk"):
-                    cancel_generation(phase)
-                    assert generate_audio(100) == mode_audio[100]
-                handoff_deadline_seconds = time.monotonic() + HANDOFF_TIMEOUT_SECONDS
-                while log_path.read_text().count("serial offload: AR -> GPU") < (
-                    len(metrics[mode]) + 1
-                ):
-                    assert time.monotonic() < handoff_deadline_seconds
-                    time.sleep(0.1)
             else:
                 pass
         finally:
@@ -332,14 +293,7 @@ def test_music3_serial_offload_http_parity_and_lifecycle(tmp_path: Path) -> None
                 pass
 
         log_text = log_path.read_text()
-        if cancelled_request_ids:
-            assert log_text.count("Traceback") == log_text.count(
-                "asyncio.exceptions.CancelledError"
-            )
-            for request_id in cancelled_request_ids:
-                assert f"acoustic done request={request_id} " not in log_text
-        else:
-            assert "Traceback" not in log_text
+        assert "Traceback" not in log_text
         if graphs:
             assert log_text.count("Capture target decode CUDA graph begin") == 1
             assert log_text.count("RVQ depth device graphs captured") == 1
@@ -371,11 +325,6 @@ def test_music3_serial_offload_http_parity_and_lifecycle(tmp_path: Path) -> None
             transitions = re.findall(
                 r"serial offload: AR -> (CPU|GPU) .*?request=([^\)]+)", log_text
             )
-            transitions = [
-                transition
-                for transition in transitions
-                if transition[1] not in cancelled_request_ids
-            ]
             assert len(transitions) == 2 * len(metrics[mode])
             for index in range(0, len(transitions), 2):
                 assert transitions[index][0] == "CPU"

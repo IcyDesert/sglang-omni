@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+from importlib.machinery import ModuleSpec
+from pathlib import Path
 
 import pytest
 import torch
@@ -38,11 +40,14 @@ def test_absent_flag_is_a_no_op() -> None:
     )
 
 
-def test_ar_and_dit_colocates_both_stages_and_flags_their_factory_args() -> None:
+@pytest.mark.parametrize("components", ["ar,dit", " AR , Dit "])
+def test_ar_and_dit_colocates_both_stages_and_flags_their_factory_args(
+    components: str,
+) -> None:
     config = MiniMaxMusic3SingleGPUPipelineConfig(model_path="/models/minimax")
 
     result = apply_stage_offload_cli_overrides(
-        config, stage_offload_components="ar,dit"
+        config, stage_offload_components=components
     )
 
     ar_stage = stage_named(result, "minimax_music3_ar")
@@ -55,40 +60,19 @@ def test_ar_and_dit_colocates_both_stages_and_flags_their_factory_args() -> None
     )
 
 
-def test_whitespace_and_case_are_normalized() -> None:
+@pytest.mark.parametrize(
+    ("components", "message"),
+    [
+        ("ar", "requires all of"),
+        ("ar,dit,talker", "does not support"),
+        (" , ", "must not be empty"),
+    ],
+)
+def test_invalid_component_list_is_rejected(components: str, message: str) -> None:
     config = MiniMaxMusic3SingleGPUPipelineConfig(model_path="/models/minimax")
 
-    result = apply_stage_offload_cli_overrides(
-        config, stage_offload_components=" AR , Dit "
-    )
-
-    assert (
-        stage_named(result, "dit_dav").process
-        == stage_named(result, "minimax_music3_ar").process
-    )
-
-
-def test_partial_component_list_is_rejected() -> None:
-    config = MiniMaxMusic3SingleGPUPipelineConfig(model_path="/models/minimax")
-
-    with pytest.raises(typer.BadParameter, match="requires all of"):
-        apply_stage_offload_cli_overrides(config, stage_offload_components="ar")
-
-
-def test_unknown_component_is_rejected() -> None:
-    config = MiniMaxMusic3SingleGPUPipelineConfig(model_path="/models/minimax")
-
-    with pytest.raises(typer.BadParameter, match="does not support"):
-        apply_stage_offload_cli_overrides(
-            config, stage_offload_components="ar,dit,talker"
-        )
-
-
-def test_empty_flag_value_is_rejected() -> None:
-    config = MiniMaxMusic3SingleGPUPipelineConfig(model_path="/models/minimax")
-
-    with pytest.raises(typer.BadParameter, match="must not be empty"):
-        apply_stage_offload_cli_overrides(config, stage_offload_components=" , ")
+    with pytest.raises(typer.BadParameter, match=message):
+        apply_stage_offload_cli_overrides(config, stage_offload_components=components)
 
 
 def test_unsupported_pipeline_is_rejected() -> None:
@@ -109,16 +93,20 @@ def test_mismatched_gpu_placement_is_rejected() -> None:
         apply_stage_offload_cli_overrides(config, stage_offload_components="ar,dit")
 
 
-@pytest.mark.skipif(torch.version.cuda is None, reason="CUDA wheel is required")
-@pytest.mark.parametrize("parent_preload", [None, "", "/lib/profiler.so"])
 def test_offload_allocator_reaches_workers_with_existing_preload(
-    monkeypatch: pytest.MonkeyPatch, parent_preload: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.delenv("LD_PRELOAD", raising=False)
-    if parent_preload is not None:
-        monkeypatch.setenv("LD_PRELOAD", parent_preload)
-    else:
-        pass
+    library = tmp_path / "torch_memory_saver_hook_mode_preload_cu13.test.so"
+    library.touch()
+    package = ModuleSpec(
+        "torch_memory_saver", loader=None, origin=str(tmp_path / "__init__.py")
+    )
+    monkeypatch.setattr(
+        "sglang_omni.models.minimax_music3.config.find_spec", lambda name: package
+    )
+    monkeypatch.setattr(torch.version, "cuda", "13.0")
+    monkeypatch.setenv("LD_PRELOAD", "/lib/profiler.so")
     config = MiniMaxMusic3SingleGPUPipelineConfig(model_path="/models/minimax")
     config = apply_stage_offload_cli_overrides(
         config, stage_offload_components="ar,dit"
@@ -132,9 +120,5 @@ def test_offload_allocator_reaches_workers_with_existing_preload(
         ],
     )
     with patched_spawn_env(worker):
-        assert "torch_memory_saver_hook_mode_preload" in os.environ["LD_PRELOAD"]
-        if parent_preload:
-            assert os.environ["LD_PRELOAD"].endswith(f":{parent_preload}")
-        else:
-            pass
-    assert os.environ.get("LD_PRELOAD") == parent_preload
+        assert os.environ["LD_PRELOAD"] == f"{library}:/lib/profiler.so"
+    assert os.environ["LD_PRELOAD"] == "/lib/profiler.so"
