@@ -754,7 +754,7 @@ def test_spoken_text_reads_numbers_in_the_sentence_language(
         ),
         pytest.param(
             "It takes 3-5 days.",
-            "It takes three - five days.",
+            "It takes three to five days.",
             id="range_separator",
         ),
         pytest.param(
@@ -781,6 +781,54 @@ async def test_openai_speech_preserves_multiple_leading_zeros(
     assert await spoken_requests(
         {"language": "English"}, [text_chunk(f"The code is {digits}.", 1, "English")]
     ) == [("English", f"The code is {words}.")]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("It takes 3-5 days.", "It takes three to five days."),
+        ("Wait 3 - 5 DAYS.", "Wait three to five DAYS."),
+        ("Wait 3\u20135 minutes.", "Wait three to five minutes."),
+        ("Walk 3.5-5 kilometers.", "Walk three point five to five kilometers."),
+        ("Pay 1,000-2,000 dollars.", "Pay one thousand to two thousand dollars."),
+        ("In 2024-2025 years.", "In twenty twenty four to twenty twenty five years."),
+        ("Compute 3-5 = -2.", "Compute three - five = - two."),
+        ("Version 2.0.1.", "Version two point zero . one."),
+        (
+            "Call 138-1234-5678.",
+            "Call one hundred thirty eight - one thousand two hundred thirty four - five thousand six hundred seventy eight.",
+        ),
+        ("Model X3-5 days.", "Model X three - five days."),
+        ("Code 007-009 days.", "Code zero zero seven - zero zero nine days."),
+    ],
+)
+def test_spoken_text_recognizes_quantity_ranges(text: str, expected: str) -> None:
+    spoken, origin = spoken_text(text, "English")
+    assert spoken == expected
+    assert len(origin) == len(spoken) and origin == sorted(origin)
+    assert origin[-1] == len(text) - 1
+
+
+def test_spoken_range_maps_each_endpoint_and_to_back_to_source() -> None:
+    spoken, origin = spoken_text("3-5 days.", "English")
+    assert spoken == "three to five days."
+    assert origin == [0] * len("three") + [1] * len(" to ") + [2] * len("five") + list(
+        range(3, 9)
+    )
+
+
+@pytest.mark.parametrize("language", ["Chinese", "Japanese"])
+def test_quantity_range_words_are_only_inserted_for_english(language: str) -> None:
+    spoken, origin = spoken_text("3-5 days.", language)
+    assert "to" not in spoken
+    assert "-" in spoken and len(origin) == len(spoken)
+
+
+@pytest.mark.asyncio
+async def test_openai_speech_reads_a_quantity_range_as_to() -> None:
+    assert await spoken_requests(
+        {"language": "English"}, [text_chunk("It takes 3-5 days.", 1, "English")]
+    ) == [("English", "It takes three to five days.")]
 
 
 @pytest.mark.asyncio

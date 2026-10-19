@@ -3,9 +3,19 @@
 
 import re
 
-# A digit run with optional thousands separators, an optional fraction and an optional ordinal suffix.
-NUMBER = re.compile(
-    r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:(?P<ordinal_suffix>st|nd|rd|th)\b)?"
+NUMERAL_PATTERN = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+QUANTITY_UNIT_PATTERN = (
+    r"seconds?|minutes?|hours?|days?|weeks?|months?|years?|"
+    r"millimeters?|millimetres?|centimeters?|centimetres?|meters?|metres?|"
+    r"kilometers?|kilometres?|miles?|inch(?:es)?|feet|grams?|kilograms?|pounds?|"
+    r"dollars?|euros?|percent|degrees?"
+)
+NUMBER = re.compile(rf"{NUMERAL_PATTERN}(?:(?P<ordinal_suffix>st|nd|rd|th)\b)?")
+ENGLISH_NUMBER = re.compile(
+    rf"(?<![\w.+\-\u2013])(?P<range_start>(?!0\d){NUMERAL_PATTERN})"
+    rf"\s*(?P<range_separator>[-\u2013])\s*"
+    rf"(?P<range_end>(?!0\d){NUMERAL_PATTERN})(?=\s+(?i:{QUANTITY_UNIT_PATTERN})\b)"
+    rf"|{NUMBER.pattern}"
 )
 ADJACENT_WORD = re.compile(r"\S*\w")
 GROUP_BEFORE = re.compile(r"\d \Z")
@@ -182,30 +192,46 @@ def number_words(
 def spoken_text(text: str, language: str) -> tuple[str, list[int]]:
     """The text with each number read out as words, and for each spoken character the original character it stands for.
 
-    A digit run one space away from another one is a group of a longer number, such as a phone number.
+    English quantity ranges use to; digit runs one space apart are groups of a longer number, such as a phone number.
     """
     spoken: list[str] = []
     origin: list[int] = []
     cursor = 0
-    for match in NUMBER.finditer(text):
+    number_pattern = ENGLISH_NUMBER if language == "English" else NUMBER
+    for match in number_pattern.finditer(text):
         before, after = text[: match.start()], text[match.end() :]
         is_grouped = bool(GROUP_BEFORE.search(before) or GROUP_AFTER.match(after))
-        ordinal_suffix = match.group("ordinal_suffix")
-        numeral = match.group()[: -len(ordinal_suffix) if ordinal_suffix else None]
-        words = number_words(numeral, language, is_grouped, ordinal_suffix)
+        if language == "English" and match.group("range_start") is not None:
+            start_words = number_words(
+                match.group("range_start"), language, False, None
+            )
+            end_words = number_words(match.group("range_end"), language, False, None)
+            words = f"{start_words} to {end_words}"
+            word_origin = (
+                [match.end("range_start") - 1] * len(start_words)
+                + [match.start("range_separator")] * len(" to ")
+                + [match.end("range_end") - 1] * len(end_words)
+            )
+        else:
+            ordinal_suffix = match.group("ordinal_suffix")
+            numeral = match.group()[: -len(ordinal_suffix) if ordinal_suffix else None]
+            words = number_words(numeral, language, is_grouped, ordinal_suffix)
+            word_origin = [match.end() - 1] * len(words)
         # Note (Junnan Li): Number words joined to their neighbours without a space would read as one token to the aligner.
         if before and not before[-1].isspace():
             words = f" {words}"
+            word_origin.insert(0, word_origin[0])
         else:
             pass
         if ADJACENT_WORD.match(after):
             words = f"{words} "
+            word_origin.append(word_origin[-1])
         else:
             pass
         spoken.append(text[cursor : match.start()])
         origin.extend(range(cursor, match.start()))
         spoken.append(words)
-        origin.extend([match.end() - 1] * len(words))
+        origin.extend(word_origin)
         cursor = match.end()
     spoken.append(text[cursor:])
     origin.extend(range(cursor, len(text)))

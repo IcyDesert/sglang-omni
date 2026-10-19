@@ -11,9 +11,16 @@ processor_module = pytest.importorskip("qwen_asr.inference.qwen3_forced_aligner"
 worker = pytest.importorskip("examples.streaming_cascade.alignment_worker")
 
 
-@pytest.mark.parametrize("text", ["Version 2.0.1.", "It takes 3-5 days."])
+@pytest.mark.parametrize(
+    "text, expected_ends",
+    [
+        ("Version 2.0.1.", [7, 11, 11, 11, 13]),
+        ("It takes 3-5 days.", [2, 8, 10, 11, 12, 17]),
+        ("Wait 3.5-5 hours.", [4, 8, 8, 8, 9, 10, 16]),
+    ],
+)
 def test_worker_maps_numbers_separated_by_punctuation(
-    text: str, monkeypatch: pytest.MonkeyPatch
+    text: str, expected_ends: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     processor = processor_module.Qwen3ForceAlignProcessor()
 
@@ -43,7 +50,7 @@ def test_worker_maps_numbers_separated_by_punctuation(
         )
     assert response.status_code == 200, response.text
     ends = [boundary["text_end_chars"] for boundary in response.json()["boundaries"]]
-    assert ends == sorted(ends) and ends[-1] == len(text) - 1
+    assert ends == expected_ends
 
 
 @pytest.mark.parametrize("language", ["Chinese", None])
