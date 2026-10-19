@@ -96,6 +96,12 @@ def backends(request, backend_requests):
 
         def chat(self, request: dict) -> None:
             assert request["model"] == CHAT_MODEL
+            if request.get("min_tokens", 0) > request["max_tokens"]:
+                self.send_response(400)
+                self.end_headers()
+                return
+            else:
+                pass
             received_messages.append(request["messages"])
             backend_requests.append(request)
             self.send("text/event-stream")

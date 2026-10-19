@@ -724,6 +724,28 @@ async def test_the_chat_probe_streams_one_token_sampled_with_the_node_settings(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("minimum_tokens", [0, 1, 16])
+@pytest.mark.parametrize("backends", ["length_chat"], indirect=True)
+async def test_the_chat_probe_preserves_the_real_request_minimum_tokens(
+    backends, backend_requests, minimum_tokens: int
+) -> None:
+    llm = backends[0].component_graph().node("llm").component.model_dump()
+    config = COMPONENTS.parse(
+        {
+            **llm,
+            "max_tokens": 32,
+            "extra_body": {"min_tokens": minimum_tokens, "top_p": 0.9},
+        }
+    )
+    await COMPONENTS.kind("openai_chat").probe(config)
+    [request] = backend_requests
+    assert request["max_tokens"] == 1 and request["min_tokens"] == 0
+    assert request["top_p"] == 0.9
+    assert config.max_tokens == 32
+    assert config.extra_body == {"min_tokens": minimum_tokens, "top_p": 0.9}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backends", ["failed_chat"], indirect=True)
 async def test_the_chat_probe_fails_the_start_when_the_service_cannot_complete(
     backends,

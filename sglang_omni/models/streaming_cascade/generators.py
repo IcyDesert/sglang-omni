@@ -163,7 +163,14 @@ async def probe_chat_service(config: OpenAIChatGeneratorConfig) -> None:
     """Require the service to list its models and to stream one token sampled with the node's settings."""
     await probe_openai_service(config)
     # Note (ruoyu): The chat service warms itself up with a greedy prefill, so a fresh deployment compiled its sampling kernel on the first real request and answered it 72 s late; one sampled token here moves that into startup.
-    generator = OpenAIChatGenerator(config.model_copy(update={"max_tokens": 1}))
+    warm_up_body = dict(config.extra_body)
+    if "min_tokens" in warm_up_body:
+        warm_up_body["min_tokens"] = 0
+    else:
+        pass
+    generator = OpenAIChatGenerator(
+        config.model_copy(update={"max_tokens": 1, "extra_body": warm_up_body})
+    )
     completions_url = f"{config.base_url.rstrip('/')}/chat/completions"
     try:
         async for _ in generator.complete(WARM_UP_MESSAGES):
