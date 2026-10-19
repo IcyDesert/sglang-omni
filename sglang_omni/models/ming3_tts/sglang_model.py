@@ -93,7 +93,9 @@ class Ming3DenseTTSConfig(Qwen2Config):
         )
 
 
-def install_speech_heads(module: nn.Module, config: Ming3TTSConfig | Ming3DenseTTSConfig) -> None:
+def install_speech_heads(
+    module: nn.Module, config: Ming3TTSConfig | Ming3DenseTTSConfig
+) -> None:
     """Attach the flow, stop, and speaker heads shared by both backbones."""
     latent_dim = int(config.tts_config["latent_dim"])
     flow_config = dict(config.flow_config)

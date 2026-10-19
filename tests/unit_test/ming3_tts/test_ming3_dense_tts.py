@@ -63,7 +63,8 @@ def test_tiny_architecture_still_resolves_to_the_ming3_pipeline() -> None:
 def test_dense_checkpoint_resolves_to_the_same_pipeline() -> None:
     assert try_resolve_ming3_dense_tts(DENSE_SNAPSHOT) == DENSE_ARCHITECTURE
     assert (
-        PIPELINE_CONFIG_REGISTRY.get_config(DENSE_ARCHITECTURE) is Ming3TTSPipelineConfig
+        PIPELINE_CONFIG_REGISTRY.get_config(DENSE_ARCHITECTURE)
+        is Ming3TTSPipelineConfig
     )
     assert resolve_config_cls_for_model_path(DENSE_SNAPSHOT) is Ming3TTSPipelineConfig
 

@@ -159,7 +159,9 @@ def encode_reference_latents(
     vae: AudioVAE, waveform: torch.Tensor, device: torch.device
 ) -> torch.Tensor:
     """Pad a prompt on the left and return its VAE latents, shape [steps, dim]."""
-    align = vae.encoder.hop_size * max(1, int(vae.encoder.patch_size)) * DENSE_PATCH_SIZE
+    align = (
+        vae.encoder.hop_size * max(1, int(vae.encoder.patch_size)) * DENSE_PATCH_SIZE
+    )
     samples = waveform.reshape(1, -1)
     remainder = int(samples.shape[-1] % align)
     if remainder:
@@ -235,11 +237,11 @@ def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
     checkpoint = Path(resolve_checkpoint(model_path))
     configuration = load_checkpoint_config(checkpoint)
     dense = is_dense_checkpoint(configuration)
-    speech_config = None if dense else SpeechConfig.model_validate(configuration["tts_config"])
-    sample_rate = int(audio_section(configuration)["sample_rate"])
-    speaker_embedding_dim = (
-        192 if dense else speech_config.speaker_embedding_dim
+    speech_config = (
+        None if dense else SpeechConfig.model_validate(configuration["tts_config"])
     )
+    sample_rate = int(audio_section(configuration)["sample_rate"])
+    speaker_embedding_dim = 192 if dense else speech_config.speaker_embedding_dim
     tokenizer = get_tokenizer(str(checkpoint), trust_remote_code=False)
     if dense:
         validate_dense_tokenizer(tokenizer)
@@ -374,9 +376,7 @@ def create_tts_engine_executor(
     overrides.update(
         tp_size=tp_size,
         trust_remote_code=False,
-        json_model_override_args=json.dumps(
-            {"architectures": [backbone_architecture]}
-        ),
+        json_model_override_args=json.dumps({"architectures": [backbone_architecture]}),
         disable_radix_cache=True,
         chunked_prefill_size=-1,
     )

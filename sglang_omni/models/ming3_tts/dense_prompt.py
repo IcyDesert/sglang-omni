@@ -112,7 +112,9 @@ def build_dense_speech_prompt(
     ]
     expected_speakers = 1 if include_speaker else 0
     if len(speaker_positions) != expected_speakers:
-        raise RuntimeError("dense Ming 3 TTS prompt has the wrong number of speaker slots")
+        raise RuntimeError(
+            "dense Ming 3 TTS prompt has the wrong number of speaker slots"
+        )
     else:
         pass
     if include_speaker and input_ids[speaker_positions[0]] != speaker_pad_id:
