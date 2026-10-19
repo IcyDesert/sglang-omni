@@ -1,12 +1,17 @@
-# Modified for SGLang; see this directory's README.md for upstream source.
+"""Image loading and native-resolution preprocessing."""
 
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 import torchvision.transforms as T
 from PIL import Image
+from pydantic import JsonValue
+
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 
 SYSTEM_MESSAGE_FOR_GEN = (
     "You are an image generation and editing assistant that accurately understands and executes "
@@ -33,17 +38,17 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def round_by_factor(number: float, factor: int) -> int:
-    """Returns the closest integer to `number` that is divisible by `factor`."""
+    """Returns the closest integer to number that is divisible by factor."""
     return round(number / factor) * factor
 
 
 def ceil_by_factor(number: float, factor: int) -> int:
-    """Returns the smallest integer >= `number` that is divisible by `factor`."""
+    """Returns the smallest integer >= number that is divisible by factor."""
     return math.ceil(number / factor) * factor
 
 
 def floor_by_factor(number: float, factor: int) -> int:
-    """Returns the largest integer <= `number` that is divisible by `factor`."""
+    """Returns the largest integer <= number that is divisible by factor."""
     return math.floor(number / factor) * factor
 
 
@@ -54,14 +59,13 @@ def smart_resize(
     min_pixels: int = 65536,
     max_pixels: int = 4194304,
 ) -> tuple[int, int]:
-    """Rescale so that H/W are divisible by `factor` and total pixels ∈ [min, max].
-
-    Copied from https://github.com/QwenLM/Qwen2.5-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py#L60
-    """
+    """Rescale so that H/W are divisible by factor and total pixels ∈ [min, max]."""
     if max(height, width) / min(height, width) > 200:
         raise ValueError(
             f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}"
         )
+    else:
+        pass
     h_bar = max(factor, round_by_factor(height, factor))
     w_bar = max(factor, round_by_factor(width, factor))
     if h_bar * w_bar > max_pixels:
@@ -72,6 +76,8 @@ def smart_resize(
         beta = math.sqrt(min_pixels / (height * width))
         h_bar = ceil_by_factor(height * beta, factor)
         w_bar = ceil_by_factor(width * beta, factor)
+    else:
+        pass
     return h_bar, w_bar
 
 
@@ -80,7 +86,7 @@ def dynamic_preprocess_native_resolution(
     size_factor: int = 32,
     min_pixels: int = 65536,
     max_pixels: int = 4194304,
-    **_kwargs,
+    **_kwargs: JsonValue,
 ) -> Image.Image:
     width, height = image.size
     resized_height, resized_width = smart_resize(
@@ -93,14 +99,16 @@ def dynamic_preprocess_native_resolution(
     return image.resize((resized_width, resized_height))
 
 
-def preprocess_pixel_values(pixel_values: torch.Tensor, patch_size: int = 16):
+def preprocess_pixel_values(
+    pixel_values: torch.Tensor, patch_size: int = 16
+) -> tuple[torch.Tensor, torch.Tensor]:
     c, h, w = pixel_values.shape
     grid_h = h // patch_size
     grid_w = w // patch_size
 
     flatten_pixel_values = (
         pixel_values.view(c, grid_h, patch_size, grid_w, patch_size)
-        .permute(1, 3, 0, 2, 4)  # [grid_h, grid_w, c, patch_size, patch_size]
+        .permute(1, 3, 0, 2, 4)
         .reshape(grid_h * grid_w, c * patch_size**2)
     )
 
@@ -108,29 +116,25 @@ def preprocess_pixel_values(pixel_values: torch.Tensor, patch_size: int = 16):
     return flatten_pixel_values, grid_hw
 
 
-def get_contrasting_background(image: Image.Image):
-    """Return a background color for RGBA->RGB conversion, or ``None`` to use default.
-
-    The original Neo_Unify implementation computed a contrasting background
-    from the alpha channel. For this open-source release we fall back to a
-    plain white background; callers that need the smarter behavior can override
-    this function.
-    """
-    del image
+def get_contrasting_background(image: Image.Image) -> tuple[int, int, int]:
+    """Return a background color for RGBA->RGB conversion, or None to use default."""
+    # note (Wes): Retain the image argument for callers; the background is fixed white.
     return (255, 255, 255)
 
 
 def load_image_native(
-    image,
+    image: Image.Image | str | Path,
     patch_size: int = 16,
     downsample_ratio: float = 0.5,
     min_pixels: int = 65536,
     max_pixels: int = 4194304,
     upscale: bool = False,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Load and preprocess an image: RGB convert, smart-resize, normalize, patchify."""
     if not isinstance(image, Image.Image):
         image = Image.open(image)
+    else:
+        pass
     if image.mode == "RGBA":
         bg_color = get_contrasting_background(image)
         if bg_color:
@@ -144,6 +148,8 @@ def load_image_native(
 
     if upscale:
         image = image.resize((image.width * 2, image.height * 2), Image.BILINEAR)
+    else:
+        pass
 
     transform = T.Compose(
         [

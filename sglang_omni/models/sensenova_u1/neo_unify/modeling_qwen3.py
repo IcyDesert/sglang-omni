@@ -1,1723 +1,202 @@
-# Modified for SGLang; see this directory's README.md for upstream source.
-
-import copy
-import os
-from typing import Callable, Optional, Union
+"""Modeling qwen3."""
 
 import torch
 import torch._dynamo
-import torch.nn.functional as F
-from sglang.srt.layers.layernorm import RMSNorm
 from torch import nn
 from transformers import Qwen3Config
-from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.masking_utils import create_causal_mask
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
     GenericForQuestionAnswering,
     GenericForSequenceClassification,
     GenericForTokenClassification,
-    GradientCheckpointingLayer,
 )
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
-from transformers.utils.deprecation import deprecate_kwarg
 
 from sglang_omni.models.sensenova_u1.cache_dit import (
     decoder_attention_type,
     decoder_layers,
 )
-
-from .transformers_compat import (
-    causal_mask_kwargs,
-    model_input_compat,
-    tied_weights_keys,
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    _ATTN_BACKEND as _ATTN_BACKEND,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import HAS_FLASH_ATTN
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    create_block_causal_mask as create_block_causal_mask,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    effective_attn_backend as effective_attn_backend,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    flash_attn_func as flash_attn_func,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import flash_or_sdpa
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    get_attn_backend as get_attn_backend,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    npu_fia_available as npu_fia_available,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    npu_swiglu_available as npu_swiglu_available,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    position_ids_from_indexes as position_ids_from_indexes,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import sdpa_attn_func
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    set_attn_backend as set_attn_backend,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    visualize_mask as visualize_mask,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_ops import (
+    AttentionForward as AttentionForward,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_ops import (
+    eager_attention_forward as eager_attention_forward,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_ops import (
+    repeat_kv as repeat_kv,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.qwen_attention import (
+    Qwen3Attention as Qwen3Attention,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.qwen_decoder import (
+    Qwen3DecoderLayer as Qwen3DecoderLayer,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.qwen_feed_forward import (
+    Qwen3MLP as Qwen3MLP,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.qwen_feed_forward import (
+    SenseNovaRMSNorm as _SenseNovaRMSNorm,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.qwen_feed_forward import (
+    make_qwen3_rms_norm as make_qwen3_rms_norm,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    _SENSENOVA_NPU_ROTARY_MUL_DISABLED as _SENSENOVA_NPU_ROTARY_MUL_DISABLED,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    SENSENOVA_NPU_FUSED_ROPE_ENV,
+    SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    PositionEmbeddings as PositionEmbeddings,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    Qwen3RotaryEmbedding as Qwen3RotaryEmbedding,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    RopeTable as RopeTable,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    apply_rotary_pos_emb as apply_rotary_pos_emb,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    can_use_sensenova_npu_fused_rope,
+    compute_default_rope_parameters,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    rotate_half as rotate_half,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
+    sensenova_npu_fused_rope_enabled,
+    sensenova_npu_rotary_mul,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.transformers_compat import (
+    causal_mask_kwargs as causal_mask_kwargs,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.transformers_compat import (
+    model_input_compat as model_input_compat,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.transformers_compat import (
+    tied_weights_keys as tied_weights_keys,
 )
 
-try:
-    from flash_attn import flash_attn_func  # type: ignore
-
-    _HAS_FLASH_ATTN = True
-except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash envs
-    flash_attn_func = None  # type: ignore
-    _HAS_FLASH_ATTN = False
-
-
-# Attention backend dispatch.
-#
-# Set via :func:`set_attn_backend`. Three modes are accepted:
-#   * ``"auto"``  - use flash-attn if available, otherwise SDPA (default).
-#   * ``"flash"`` - force flash-attn; raise if ``flash_attn`` is not installed.
-#   * ``"sdpa"``  - force torch SDPA (useful for reproducibility tests and
-#                    debugging, even when flash-attn is available).
-_VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
-_ATTN_BACKEND: str = "auto"
-
-_SENSENOVA_NPU_FUSED_ROPE_ENV = "SGLANG_SENSENOVA_NPU_FUSED_ROPE"
-_SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL = {"1", "true", "on", "rotary_mul", "mul"}
-_SENSENOVA_NPU_ROTARY_MUL_DISABLED = False
-
-
-def npu_fia_available() -> bool:
-    return hasattr(torch.ops.npu, "npu_fused_infer_attention_score")
-
-
-def npu_swiglu_available() -> bool:
-    return hasattr(torch.ops.npu, "npu_swiglu")
-
-
-def set_attn_backend(backend: str) -> str:
-    """Choose the attention kernel used by the Qwen3 layers at runtime.
-
-    Returns the backend string that was set. Raises ``ValueError`` for an
-    unknown name and ``RuntimeError`` if ``flash`` is requested but the
-    ``flash_attn`` package isn't importable.
-    """
-    global _ATTN_BACKEND
-    backend = backend.lower()
-    if backend not in _VALID_ATTN_BACKENDS:
-        raise ValueError(
-            f"Unknown attention backend {backend!r}. "
-            f"Expected one of {_VALID_ATTN_BACKENDS}."
-        )
-    if backend == "flash" and not _HAS_FLASH_ATTN:
-        raise RuntimeError(
-            "Requested attn_backend='flash' but `flash_attn` is not installed. "
-            "Install it (e.g. `uv pip install <flash_attn-*.whl>`) or use "
-            "'auto' / 'sdpa'."
-        )
-    _ATTN_BACKEND = backend
-    return _ATTN_BACKEND
-
-
-def get_attn_backend() -> str:
-    """Return the currently active attention backend name."""
-    return _ATTN_BACKEND
-
-
-def effective_attn_backend() -> str:
-    """Resolve ``'auto'`` to the kernel that will actually run."""
-    if _ATTN_BACKEND != "auto":
-        return _ATTN_BACKEND
-    return "flash" if _HAS_FLASH_ATTN else "sdpa"
-
-
-def _sdpa_attn_func(
-    q,
-    k,
-    v,
-    dropout_p: float = 0.0,
-    softmax_scale=None,
-    causal: bool = False,
-    attention_mask: Optional[torch.Tensor] = None,
-):
-    """Drop-in SDPA fallback for ``flash_attn_func``.
-
-    ``flash_attn_func`` expects q/k/v in layout ``[B, S, H, D]`` and returns
-    ``[B, S_q, H_q, D]``. ``torch.nn.functional.scaled_dot_product_attention``
-    expects ``[B, H, S, D]``; we transpose in and out.
-
-    ``flash_attn_func`` natively handles Grouped-Query Attention (GQA) where
-    ``H_q > H_kv``. Plain ``scaled_dot_product_attention`` only supports that
-    via the ``enable_gqa=True`` kwarg (torch >= 2.5). For broader compatibility
-    we just materialize the repeat manually when needed.
-    """
-    q_bhsd = q.transpose(1, 2)
-    k_bhsd = k.transpose(1, 2)
-    v_bhsd = v.transpose(1, 2)
-
-    h_q = q_bhsd.shape[1]
-    h_kv = k_bhsd.shape[1]
-    if h_q != h_kv:
-        if h_q % h_kv != 0:
-            raise ValueError(
-                f"Cannot broadcast key/value heads ({h_kv}) to query heads ({h_q}): not divisible."
-            )
-        n_rep = h_q // h_kv
-        k_bhsd = k_bhsd.repeat_interleave(n_rep, dim=1)
-        v_bhsd = v_bhsd.repeat_interleave(n_rep, dim=1)
-
-    # SDPA does not support an explicit `scale` argument on older torch
-    # versions; fall back to the manual path in that case.
-    try:
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q_bhsd,
-            k_bhsd,
-            v_bhsd,
-            attn_mask=attention_mask,
-            dropout_p=dropout_p,
-            is_causal=causal,
-            scale=softmax_scale,
-        )
-    except TypeError:
-        if softmax_scale is not None:
-            q_bhsd = q_bhsd * softmax_scale
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q_bhsd,
-                k_bhsd,
-                v_bhsd,
-                attn_mask=attention_mask,
-                dropout_p=dropout_p,
-                is_causal=causal,
-            )
-        else:
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q_bhsd,
-                k_bhsd,
-                v_bhsd,
-                attn_mask=attention_mask,
-                dropout_p=dropout_p,
-                is_causal=causal,
-            )
-    return out.transpose(1, 2).contiguous()
-
-
-def _flash_or_sdpa(
-    q,
-    k,
-    v,
-    dropout_p: float = 0.0,
-    softmax_scale=None,
-    causal: bool = False,
-    attention_mask: Optional[torch.Tensor] = None,
-    actual_seq_lengths_kv: Optional[list[int]] = None,
-    kv_padding_size: Optional[torch.Tensor] = None,
-    input_layout: str = "BSND",
-):
-    backend = effective_attn_backend()
-    if (
-        q.device.type == "npu"
-        and not causal
-        and dropout_p == 0.0
-        and actual_seq_lengths_kv is not None
-        and npu_fia_available()
-    ):
-        if input_layout == "BNSD":
-            q_bhsd, k_bhsd, v_bhsd = q, k, v
-            batch_size, num_heads, query_length, _ = q.shape
-            num_key_value_heads = k.shape[1]
-        elif input_layout == "BSND":
-            q_bhsd = q.transpose(1, 2).contiguous()
-            k_bhsd = k.transpose(1, 2).contiguous()
-            v_bhsd = v.transpose(1, 2).contiguous()
-            batch_size, query_length, num_heads, _ = q.shape
-            num_key_value_heads = k.shape[2]
-        else:
-            raise ValueError(f"Unsupported attention input layout: {input_layout}")
-        out, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            q_bhsd,
-            k_bhsd,
-            v_bhsd,
-            actual_seq_lengths=[query_length] * batch_size,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            kv_padding_size=kv_padding_size,
-            num_heads=num_heads,
-            num_key_value_heads=num_key_value_heads,
-            scale=q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale,
-            input_layout="BNSD",
-            sparse_mode=0,
-        )
-        return out.transpose(1, 2).contiguous()
-    if input_layout != "BSND":
-        raise RuntimeError("BNSD attention input requires the NPU FIA path")
-    if actual_seq_lengths_kv is not None:
-        batch_size, query_length = q.shape[:2]
-        padded_key_length = k.shape[1]
-        prefix_width = padded_key_length - query_length
-        if len(actual_seq_lengths_kv) != batch_size:
-            raise ValueError(
-                f"Expected {batch_size} KV lengths, got {len(actual_seq_lengths_kv)}"
-            )
-        if all(length == padded_key_length for length in actual_seq_lengths_kv):
-            return _flash_or_sdpa(
-                q,
-                k,
-                v,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                attention_mask=attention_mask,
-            )
-        outputs = []
-        for batch_index, total_length in enumerate(actual_seq_lengths_kv):
-            prefix_length = total_length - query_length
-            if prefix_length < 0 or prefix_length > prefix_width:
-                raise ValueError(
-                    f"KV length {total_length} is incompatible with query length "
-                    f"{query_length} and padded key length {padded_key_length}"
-                )
-            if total_length == padded_key_length:
-                compact_k = k[batch_index : batch_index + 1]
-                compact_v = v[batch_index : batch_index + 1]
-            else:
-                compact_k = torch.cat(
-                    (
-                        k[batch_index : batch_index + 1, :prefix_length],
-                        k[batch_index : batch_index + 1, prefix_width:],
-                    ),
-                    dim=1,
-                )
-                compact_v = torch.cat(
-                    (
-                        v[batch_index : batch_index + 1, :prefix_length],
-                        v[batch_index : batch_index + 1, prefix_width:],
-                    ),
-                    dim=1,
-                )
-            outputs.append(
-                _flash_or_sdpa(
-                    q[batch_index : batch_index + 1],
-                    compact_k,
-                    compact_v,
-                    dropout_p=dropout_p,
-                    softmax_scale=softmax_scale,
-                    causal=causal,
-                    attention_mask=attention_mask,
-                )
-            )
-        return torch.cat(outputs, dim=0)
-    # flash-attn ships CUDA kernels only. On XPU / CPU we transparently fall
-    # back to SDPA even if the user asked for ``flash`` — the alternative
-    # (crashing on first forward) is worse, and ``set_attn_backend('flash')``
-    # already guarded against the "package missing" case.
-    if backend == "flash" and q.device.type == "cuda" and attention_mask is None:
-        return flash_attn_func(
-            q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal
-        )
-    return _sdpa_attn_func(
-        q,
-        k,
-        v,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        attention_mask=attention_mask,
-    )
-
-
-def position_ids_from_indexes(indexes: torch.Tensor, coordinate: int) -> torch.Tensor:
-    """Return one coordinate as ``[batch, sequence]`` position IDs."""
-    if indexes.ndim == 2:
-        return indexes[coordinate].unsqueeze(0)
-    if indexes.ndim == 3:
-        return indexes[:, coordinate]
-    raise ValueError(f"indexes must have 2 or 3 dimensions, got {indexes.ndim}")
-
-
-def create_block_causal_mask(
-    index: torch.Tensor, key_valid_mask: Optional[torch.Tensor] = None
-):
-    """
-    index: (L) or (B, L)
-    key_valid_mask: optional (B, L), where True marks a real token
-    return: (B, 1, L, L) block-wise causal attention mask
-    """
-    if index.ndim == 1:
-        index = index.unsqueeze(0)
-    if index.ndim != 2:
-        raise ValueError(f"index must have 1 or 2 dimensions, got {index.ndim}")
-
-    batch_size, seq_len = index.shape
-    idx_i = index.unsqueeze(2)
-    idx_j = index.unsqueeze(1)
-
-    arange = torch.arange(seq_len, device=index.device)
-    mask = (idx_j == idx_i) | (arange.view(1, 1, -1) <= arange.view(1, -1, 1))
-    if key_valid_mask is not None:
-        if key_valid_mask.shape != (batch_size, seq_len):
-            raise ValueError(
-                "key_valid_mask must match the batched index shape; "
-                f"got {tuple(key_valid_mask.shape)} and {(batch_size, seq_len)}"
-            )
-        mask = mask & key_valid_mask.to(torch.bool).unsqueeze(1)
-
-    output = torch.zeros(mask.shape, dtype=torch.float32, device=index.device)
-    output.masked_fill_(~mask, float("-inf"))
-    return output.unsqueeze(1)
-
-
-def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
-    """
-    mask: (1,1, L, L)
-    """
-    submask = torch.where(mask[0, 0, :, :] == 0, torch.tensor(1.0), torch.tensor(0.0))
-    submask = mask[i:j, i:j].int().cpu().numpy()
-    for row in submask:
-        print(" ".join(map(str, row)))
-
-
-class _SenseNovaRMSNorm(RMSNorm):
-    """Use shared device dispatch while keeping CPU inputs on native kernels."""
-
-    def forward_npu(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        post_residual_addition: Optional[torch.Tensor] = None,
-        quant_linear: Optional[nn.Module] = None,
-    ):
-        if x.device.type != "npu":
-            return self.forward_native(
-                x,
-                residual,
-                post_residual_addition,
-                quant_linear,
-            )
-        return super().forward_npu(
-            x,
-            residual,
-            post_residual_addition,
-            quant_linear,
-        )
-
-    def forward_aiter(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        post_residual_addition: Optional[torch.Tensor] = None,
-        quant_linear: Optional[nn.Module] = None,
-    ):
-        if not x.is_cuda:
-            return self.forward_native(
-                x,
-                residual,
-                post_residual_addition,
-                quant_linear,
-            )
-        return super().forward_aiter(
-            x,
-            residual,
-            post_residual_addition,
-            quant_linear,
-        )
-
-
-def make_qwen3_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
-    return _SenseNovaRMSNorm(
-        hidden_size,
-        eps=eps,
-        cast_x_before_out_mul=True,
-    )
-
-
-class Qwen3MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-        self._npu_gate_up_weight = None
-
-    def _pack_npu_gate_up_weights(self) -> torch.Tensor:
-        reference = self.gate_proj.weight
-        packed = self._npu_gate_up_weight
-        if (
-            packed is not None
-            and packed.device == reference.device
-            and packed.dtype == reference.dtype
-            and packed.untyped_storage().data_ptr()
-            == reference.untyped_storage().data_ptr()
-        ):
-            return packed
-
-        with torch.no_grad():
-            packed = torch.cat(
-                [self.gate_proj.weight, self.up_proj.weight], dim=0
-            ).contiguous()
-            self.gate_proj.weight.set_(packed[: self.intermediate_size])
-            self.up_proj.weight.set_(packed[self.intermediate_size :])
-        self._npu_gate_up_weight = packed
-        return packed
-
-    def _use_npu_fused_mlp(self, x: torch.Tensor) -> bool:
-        if (
-            x.device.type != "npu"
-            or self.training
-            or torch.is_grad_enabled()
-            or x.dtype != torch.bfloat16
-            or self.gate_proj.weight.dtype != x.dtype
-            or self.config.hidden_act != "silu"
-        ):
-            return False
-        return npu_swiglu_available()
-
-    def forward(self, x):
-        if self._use_npu_fused_mlp(x):
-            gate_up = F.linear(x, self._pack_npu_gate_up_weights())
-            return self.down_proj(torch.ops.npu.npu_swiglu(gate_up))
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _sensenova_npu_fused_rope_enabled() -> bool:
-    mode = os.getenv(_SENSENOVA_NPU_FUSED_ROPE_ENV, "0").strip().lower()
-    return mode in _SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL
-
-
-def _can_use_sensenova_npu_fused_rope(q, k, cos, sin, unsqueeze_dim) -> bool:
-    return (
-        q.device.type == "npu"
-        and q.dtype in (torch.float16, torch.bfloat16)
-        and q.dtype == k.dtype == cos.dtype == sin.dtype
-        and q.device == k.device == cos.device == sin.device
-        and not torch.is_grad_enabled()
-        and not torch.compiler.is_compiling()
-        and unsqueeze_dim == 1
-        and q.ndim == k.ndim == 4
-        and q.numel() > 0
-        and k.numel() > 0
-        and q.shape[0] == k.shape[0]
-        and q.shape[2:] == k.shape[2:]
-        and q.shape[0] < 1000
-        and q.shape[1] < 1000
-        and k.shape[1] < 1000
-        and q.shape[-1] < 896
-        and q.shape[-1] % 2 == 0
-        and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
-    )
-
-
-def _sensenova_npu_rotary_mul(q, k, cos, sin):
-    global _SENSENOVA_NPU_ROTARY_MUL_DISABLED
-
-    if _SENSENOVA_NPU_ROTARY_MUL_DISABLED:
-        return None
-
-    try:
-        import torch_npu
-    except ImportError:
-        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
-        return None
-
-    if not hasattr(torch_npu, "npu_rotary_mul"):
-        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
-        return None
-
-    cos = cos.unsqueeze(1).contiguous()
-    sin = sin.unsqueeze(1).contiguous()
-    try:
-        return (
-            torch_npu.npu_rotary_mul(q, cos, sin, rotary_mode="half"),
-            torch_npu.npu_rotary_mul(k, cos, sin, rotary_mode="half"),
-        )
-    except (RuntimeError, TypeError):
-        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
-        return None
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    if _sensenova_npu_fused_rope_enabled() and _can_use_sensenova_npu_fused_rope(
-        q, k, cos, sin, unsqueeze_dim
-    ):
-        npu_output = _sensenova_npu_rotary_mul(q, k, cos, sin)
-        if npu_output is not None:
-            return npu_output
-
-    if (
-        q.is_cuda
-        and q.dtype is torch.bfloat16
-        and k.dtype is torch.bfloat16
-        and cos.dtype is torch.bfloat16
-        and sin.dtype is torch.bfloat16
-        and q.device == k.device == cos.device == sin.device
-        and not torch.is_grad_enabled()
-        and not torch.compiler.is_compiling()
-        and unsqueeze_dim == 1
-        and q.ndim == k.ndim == 4
-        and q.numel() > 0
-        and k.numel() > 0
-        and q.shape[2] >= 128
-        and q.shape[0] == k.shape[0]
-        and q.shape[2:] == k.shape[2:]
-        and q.shape[-1] in (32, 64)
-        and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
-    ):
-        from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
-            fused_rope_rotate_half_bitexact,
-        )
-
-        cos_rows = cos.reshape(-1, cos.shape[-1]).contiguous()
-        sin_rows = sin.reshape(-1, sin.shape[-1]).contiguous()
-        q_embed = fused_rope_rotate_half_bitexact(
-            q.transpose(1, 2).contiguous(), cos_rows, sin_rows
-        )
-        k_embed = fused_rope_rotate_half_bitexact(
-            k.transpose(1, 2).contiguous(), cos_rows, sin_rows
-        )
-        return q_embed.transpose(1, 2), k_embed.transpose(1, 2)
-
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query.dtype
-    )
-    attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training
-    )
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
-def _compute_default_rope_parameters(config, device=None, **_kwargs):
-    """Default RoPE frequencies, inlined to avoid breakage across transformers versions.
-
-    transformers <=4.x exposes this as ``ROPE_INIT_FUNCTIONS["default"]``, but
-    5.x dropped the ``"default"`` key from that table. Having a local copy keeps
-    ``Qwen3RotaryEmbedding`` working on both.
-    """
-    base = config.rope_theta
-    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-    head_dim = getattr(
-        config, "head_dim", config.hidden_size // config.num_attention_heads
-    )
-    dim = int(head_dim * partial_rotary_factor)
-    attention_factor = 1.0
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
-    )
-    return inv_freq, attention_factor
-
-
-class Qwen3RotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor  # fix linting for `register_buffer`
-
-    compute_default_rope_parameters = staticmethod(_compute_default_rope_parameters)
-
-    def __init__(self, config: Qwen3Config, device=None):
-        super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
-            )
-        else:
-            self.rope_type = "default"
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
-        if self.rope_type == "default" or self.rope_type is None:
-            base_rope_init_fn = _compute_default_rope_parameters
-        else:
-            base_rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
-        def _rope_init_fn_keep_freq_range(cfg: Qwen3Config, dev=None):
-            inv_freq, attention_scaling = base_rope_init_fn(cfg, dev)
-
-            cfg2 = copy.deepcopy(cfg)
-            head_dim = getattr(cfg2, "head_dim", None)
-            if head_dim is None:
-                head_dim = cfg2.hidden_size // cfg2.num_attention_heads
-                setattr(cfg2, "head_dim", head_dim)
-            cfg2.head_dim = int(head_dim) * 2
-
-            inv_freq_full, _ = base_rope_init_fn(cfg2, dev)
-            inv_freq = inv_freq_full[::2]
-
-            return inv_freq, attention_scaling
-
-        self.rope_init_fn = _rope_init_fn_keep_freq_range
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
-
-    @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None]
-            .float()
-            .expand(position_ids.shape[0], -1, 1)
-            .to(x.device)
-        )
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = (
-            x.device.type
-            if isinstance(x.device.type, str) and x.device.type != "mps"
-            else "cpu"
-        )
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (
-                inv_freq_expanded.float() @ position_ids_expanded.float()
-            ).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-RopeTable = tuple[torch.Tensor, torch.Tensor]
-PositionEmbeddings = tuple[RopeTable, RopeTable, RopeTable]
-
-
-class Qwen3Attention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: Qwen3Config, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
-
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.q_proj_mot_gen = nn.Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-
-        self.k_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.k_proj_mot_gen = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-
-        self.v_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj_mot_gen = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
-        self.o_proj_mot_gen = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
-
-        self.q_norm = make_qwen3_rms_norm(
-            self.head_dim // 2, eps=config.rms_norm_eps
-        )  # unlike olmo, only on the head dim!
-        self.q_norm_mot_gen = make_qwen3_rms_norm(
-            self.head_dim // 2, eps=config.rms_norm_eps
-        )
-        self.q_norm_hw = make_qwen3_rms_norm(
-            self.head_dim // 2, eps=config.rms_norm_eps
-        )
-        self.q_norm_hw_mot_gen = make_qwen3_rms_norm(
-            self.head_dim // 2, eps=config.rms_norm_eps
-        )
-
-        self.k_norm = make_qwen3_rms_norm(
-            self.head_dim // 2, eps=config.rms_norm_eps
-        )  # thus post q_norm does not need reshape
-        self.k_norm_mot_gen = make_qwen3_rms_norm(
-            self.head_dim // 2, eps=config.rms_norm_eps
-        )
-        self.k_norm_hw = make_qwen3_rms_norm(
-            self.head_dim // 2, eps=config.rms_norm_eps
-        )  # thus post q_norm does not need reshape
-        self.k_norm_hw_mot_gen = make_qwen3_rms_norm(
-            self.head_dim // 2, eps=config.rms_norm_eps
-        )
-
-        self.sliding_window = (
-            config.sliding_window
-            if config.layer_types[layer_idx] == "sliding_attention"
-            else None
-        )
-
-        t_config = copy.deepcopy(config)
-        t_config.head_dim = config.head_dim // 2
-        self.rotary_emb = Qwen3RotaryEmbedding(config=t_config)
-
-        hw_config = copy.deepcopy(config)
-        hw_config.head_dim = config.head_dim // 4
-        hw_config.rope_theta = config.rope_theta_hw
-        if isinstance(getattr(hw_config, "rope_parameters", None), dict):
-            hw_config.rope_parameters = {
-                **hw_config.rope_parameters,
-                "rope_theta": config.rope_theta_hw,
-            }
-        hw_config.max_position_embeddings = config.max_position_embeddings_hw
-        self.rotary_emb_hw = Qwen3RotaryEmbedding(config=hw_config)
-
-    def resolve_rope_tables(
-        self,
-        indexes: torch.LongTensor,
-        hidden_states: torch.Tensor,
-        position_embeddings: Optional[PositionEmbeddings] = None,
-    ) -> PositionEmbeddings:
-        if (
-            position_embeddings is None
-            or position_embeddings[0][0].dtype != hidden_states.dtype
-        ):
-            position_embeddings = (
-                self.rotary_emb(hidden_states, position_ids_from_indexes(indexes, 0)),
-                self.rotary_emb_hw(
-                    hidden_states, position_ids_from_indexes(indexes, 1)
-                ),
-                self.rotary_emb_hw(
-                    hidden_states, position_ids_from_indexes(indexes, 2)
-                ),
-            )
-        return position_embeddings
-
-    def forward_und(
-        self,
-        hidden_states: torch.Tensor,
-        indexes: Optional[torch.LongTensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[PositionEmbeddings] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        assert self.config._attn_implementation == "eager"
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
-        query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
-        query_states_t = self.q_norm(query_states_t).transpose(1, 2)
-        query_states_hw = self.q_norm_hw(query_states_hw).transpose(1, 2)
-        query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
-
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
-        key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
-        key_states_t = self.k_norm(key_states_t).transpose(1, 2)
-        key_states_hw = self.k_norm_hw(key_states_hw).transpose(1, 2)
-        key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
-
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self.resolve_rope_tables(
-            indexes, hidden_states, position_embeddings
-        )
-        query_states_t, key_states_t = apply_rotary_pos_emb(
-            query_states_t, key_states_t, cos_t, sin_t
-        )
-        query_states_h, key_states_h = apply_rotary_pos_emb(
-            query_states_h, key_states_h, cos_h, sin_h
-        )
-        query_states_w, key_states_w = apply_rotary_pos_emb(
-            query_states_w, key_states_w, cos_w, sin_w
-        )
-
-        query_states = torch.cat(
-            [query_states_t, query_states_h, query_states_w], dim=-1
-        )
-        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
-
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            # key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            update_cache = kwargs.get("update_cache", True)
-            if update_cache:
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs=None
-                )
-            else:
-                # only use the past key values but do not append the current one
-                layer = past_key_values.layers[self.layer_idx]
-                past_k, past_v = layer.keys, layer.values
-
-                if past_k is not None:
-                    key_states = torch.cat(
-                        [past_k, key_states], dim=2
-                    )  # concat on seq_len
-                    value_states = torch.cat([past_v, value_states], dim=2)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
-    # def forward_gen(
-    #     self,
-    #     hidden_states: torch.Tensor,
-    #     indexes: Optional[torch.LongTensor],
-    #     attention_mask: Optional[torch.Tensor],
-    #     past_key_values: Optional[Cache] = None,
-    #     cache_position: Optional[torch.LongTensor] = None,
-    #     **kwargs: Unpack[FlashAttentionKwargs],
-    # ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    #     assert self.config._attn_implementation == "eager"
-    #     input_shape = hidden_states.shape[:-1]
-    #     hidden_shape = (*input_shape, -1, self.head_dim)
-
-    #     query_states = self.q_proj_mot_gen(hidden_states).view(hidden_shape)
-    #     query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
-    #     query_states_t = self.q_norm_mot_gen(query_states_t).transpose(1, 2)
-    #     query_states_hw = self.q_norm_hw_mot_gen(query_states_hw).transpose(1, 2)
-    #     query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
-
-    #     key_states = self.k_proj_mot_gen(hidden_states).view(hidden_shape)
-    #     key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
-    #     key_states_t = self.k_norm_mot_gen(key_states_t).transpose(1, 2)
-    #     key_states_hw = self.k_norm_hw_mot_gen(key_states_hw).transpose(1, 2)
-    #     key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
-
-    #     value_states = self.v_proj_mot_gen(hidden_states).view(hidden_shape).transpose(1, 2)
-
-    #     cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
-    #     query_states_t, key_states_t = apply_rotary_pos_emb(query_states_t, key_states_t, cos_t, sin_t)
-
-    #     cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
-    #     query_states_h, key_states_h = apply_rotary_pos_emb(query_states_h, key_states_h, cos_h, sin_h)
-
-    #     cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
-    #     query_states_w, key_states_w = apply_rotary_pos_emb(query_states_w, key_states_w, cos_w, sin_w)
-
-    #     query_states = torch.cat([query_states_t, query_states_h, query_states_w], dim=-1)
-    #     key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
-
-    #     if past_key_values is not None:
-    #         # sin and cos are specific to RoPE models; cache_position needed for the static cache
-    #         # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-    #         # key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-    #         update_cache = kwargs.get("update_cache", True)
-    #         if update_cache:
-    #             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs=None)
-    #         else:
-    #             # only use the past key values but do not append the current one
-    #             layer = past_key_values.layers[self.layer_idx]
-    #             past_k, past_v = layer.keys, layer.values
-
-    #             if past_k is not None:
-    #                 key_states   = torch.cat([past_k, key_states], dim=2)   # concat on seq_len
-    #                 value_states = torch.cat([past_v, value_states], dim=2)
-
-    #     attention_interface: Callable = eager_attention_forward
-    #     if self.config._attn_implementation != "eager":
-    #         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-    #     attn_output, attn_weights = attention_interface(
-    #         self,
-    #         query_states,
-    #         key_states,
-    #         value_states,
-    #         attention_mask,
-    #         dropout=0.0 if not self.training else self.attention_dropout,
-    #         scaling=self.scaling,
-    #         sliding_window=self.sliding_window,  # diff with Llama
-    #         **kwargs,
-    #     )
-
-    #     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-    #     attn_output = self.o_proj_mot_gen(attn_output)
-    #     return attn_output, attn_weights
-
-    def forward_gen(
-        self,
-        hidden_states: torch.Tensor,
-        indexes: Optional[torch.LongTensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[PositionEmbeddings] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        # -----------------------------
-        # Build q / k / v for current tokens
-        # Internal layout before flash:
-        #   q/k/v: [B, H, S, D]
-        # Flash layout:
-        #   q/k/v: [B, S, H, D]
-        # -----------------------------
-        query_states = self.q_proj_mot_gen(hidden_states).view(hidden_shape)
-        query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
-        query_states_t = self.q_norm_mot_gen(query_states_t).transpose(
-            1, 2
-        )  # [B,H,S,D/2]
-        query_states_hw = self.q_norm_hw_mot_gen(query_states_hw).transpose(1, 2)
-        query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
-
-        key_states = self.k_proj_mot_gen(hidden_states).view(hidden_shape)
-        key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
-        key_states_t = self.k_norm_mot_gen(key_states_t).transpose(1, 2)  # [B,H,S,D/2]
-        key_states_hw = self.k_norm_hw_mot_gen(key_states_hw).transpose(1, 2)
-        key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
-
-        value_states = (
-            self.v_proj_mot_gen(hidden_states).view(hidden_shape).transpose(1, 2)
-        )  # [B,H,S,D]
-
-        # RoPE
-        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self.resolve_rope_tables(
-            indexes, hidden_states, position_embeddings
-        )
-        query_states_t, key_states_t = apply_rotary_pos_emb(
-            query_states_t, key_states_t, cos_t, sin_t
-        )
-        query_states_h, key_states_h = apply_rotary_pos_emb(
-            query_states_h, key_states_h, cos_h, sin_h
-        )
-        query_states_w, key_states_w = apply_rotary_pos_emb(
-            query_states_w, key_states_w, cos_w, sin_w
-        )
-
-        # concat along head_dim
-        # query/key current layout: [B, H, S, D]
-        query_states = torch.cat(
-            [query_states_t, query_states_h, query_states_w], dim=-1
-        )
-        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
-
-        update_cache = kwargs.get("update_cache", True)
-
-        # ------------------------------------------------------------------
-        # Flash path:
-        # Only use when there is no explicit dense mask.
-        # This is exactly the t2i denoising use case:
-        #   current image tokens attend to [prefix + current image tokens]
-        #   fully bidirectional inside current block => causal=False
-        # ------------------------------------------------------------------
-        key_padding_mask = (
-            attention_mask is not None
-            and attention_mask.ndim == 4
-            and (attention_mask.shape[-2] == 1 or attention_mask.dtype == torch.bool)
-        )
-        if attention_mask is None or key_padding_mask:
-            actual_seq_lengths_kv = None
-            kv_padding_size = None
-            input_layout = "BSND"
-            layer = (
-                past_key_values.layers[self.layer_idx]
-                if past_key_values is not None and not update_cache
-                else None
-            )
-            use_bnsd_cache = (
-                layer is not None
-                and getattr(layer, "flash_cache_layout", None) == "BNSD"
-                and getattr(layer, "flash_k_cache", None) is not None
-                and getattr(layer, "flash_v_cache", None) is not None
-            )
-
-            if use_bnsd_cache:
-                q = query_states
-                k_cur = key_states
-                v_cur = value_states
-                prefix_len = layer.flash_prefix_len
-                cur_len = k_cur.shape[2]
-                layer.flash_k_cache[:, :, prefix_len : prefix_len + cur_len].copy_(
-                    k_cur
-                )
-                layer.flash_v_cache[:, :, prefix_len : prefix_len + cur_len].copy_(
-                    v_cur
-                )
-                k = layer.flash_k_cache[:, :, : prefix_len + cur_len]
-                v = layer.flash_v_cache[:, :, : prefix_len + cur_len]
-                actual_seq_lengths_kv = layer.flash_actual_seq_lengths_kv
-                kv_padding_size = layer.flash_kv_padding_size
-                input_layout = "BNSD"
-            else:
-                q = query_states.transpose(1, 2).contiguous()
-                k_cur = key_states.transpose(1, 2).contiguous()
-                v_cur = value_states.transpose(1, 2).contiguous()
-
-                if past_key_values is not None:
-                    if update_cache:
-                        # Rare path, keep compatibility.
-                        # past_key_values.update expects [B,H,S,D]
-                        key_states, value_states = past_key_values.update(
-                            key_states, value_states, self.layer_idx, cache_kwargs=None
-                        )
-                        k = key_states.transpose(1, 2).contiguous()
-                        v = value_states.transpose(1, 2).contiguous()
-                    else:
-                        if (
-                            getattr(layer, "flash_k_cache", None) is not None
-                            and getattr(layer, "flash_v_cache", None) is not None
-                        ):
-                            prefix_len = layer.flash_prefix_len
-                            cur_len = k_cur.shape[1]
-                            layer.flash_k_cache[
-                                :, prefix_len : prefix_len + cur_len
-                            ].copy_(k_cur)
-                            layer.flash_v_cache[
-                                :, prefix_len : prefix_len + cur_len
-                            ].copy_(v_cur)
-                            k = layer.flash_k_cache[:, : prefix_len + cur_len]
-                            v = layer.flash_v_cache[:, : prefix_len + cur_len]
-                            actual_seq_lengths_kv = getattr(
-                                layer, "flash_actual_seq_lengths_kv", None
-                            )
-                            kv_padding_size = getattr(
-                                layer, "flash_kv_padding_size", None
-                            )
-                        else:
-                            # fallback if the cache was not prepared
-                            past_k, past_v = layer.keys, layer.values
-                            if past_k is not None:
-                                past_k = past_k.transpose(1, 2).contiguous()
-                                past_v = past_v.transpose(1, 2).contiguous()
-                                k = torch.cat([past_k, k_cur], dim=1)
-                                v = torch.cat([past_v, v_cur], dim=1)
-                            else:
-                                k = k_cur
-                                v = v_cur
-                else:
-                    k = k_cur
-                    v = v_cur
-
-            # sanity checks
-            assert q.ndim == 4 and k.ndim == 4 and v.ndim == 4
-            assert q.shape[0] == k.shape[0] == v.shape[0], (q.shape, k.shape, v.shape)
-            assert k.shape[1] == v.shape[1], (k.shape, v.shape)
-            assert k.shape[2] == v.shape[2], (k.shape, v.shape)
-            assert q.shape[3] == k.shape[3] == v.shape[3], (q.shape, k.shape, v.shape)
-
-            attn_output = _flash_or_sdpa(
-                q,
-                k,
-                v,
-                dropout_p=0.0 if not self.training else self.attention_dropout,
-                softmax_scale=self.scaling,
-                causal=False,
-                attention_mask=attention_mask,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                kv_padding_size=kv_padding_size,
-                input_layout=input_layout,
-            )  # [B, S_q, H_q, D]
-
-            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            attn_output = self.o_proj_mot_gen(attn_output)
-            return attn_output, None
-
-        # ------------------------------------------------------------------
-        # Original eager fallback path
-        # ------------------------------------------------------------------
-        if past_key_values is not None:
-            if update_cache:
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs=None
-                )
-            else:
-                layer = past_key_values.layers[self.layer_idx]
-                past_k, past_v = layer.keys, layer.values
-                if past_k is not None:
-                    key_states = torch.cat([past_k, key_states], dim=2)
-                    value_states = torch.cat([past_v, value_states], dim=2)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj_mot_gen(attn_output)
-        return attn_output, attn_weights
-
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
-        exist_non_image_gen_tokens: bool,
-        exist_image_gen_tokens: bool,
-        indexes: Optional[torch.LongTensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[PositionEmbeddings] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if exist_non_image_gen_tokens and not exist_image_gen_tokens:
-            return self.forward_und(
-                hidden_states,
-                indexes,
-                attention_mask,
-                past_key_values,
-                cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        if not exist_non_image_gen_tokens and exist_image_gen_tokens:
-            return self.forward_gen(
-                hidden_states,
-                indexes,
-                attention_mask,
-                past_key_values,
-                cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-        # Mixed und/gen path: mirrors forward_und / forward_gen per token type.
-        # (Fixed per issue #207: the time-dim qk-norm, the `.view(hidden_shape)` before
-        # chunking, and the transpose on the time chunk were previously missing.)
-        # Note: Remove this raise once fully tested.
-        raise NotImplementedError(
-            "The mixed und/gen forward path is not yet validated (issue #207): known "
-            "issues are fixed, but it has no parity test and no production caller. "
-            "Split the sequence at token-type boundaries and use forward_und / forward_gen."
-        )
-
-        assert self.config._attn_implementation == "eager"
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = hidden_states.new_zeros(
-            (*input_shape, self.config.num_attention_heads * self.head_dim)
-        )
-        if exist_non_image_gen_tokens:
-            query_states[~image_gen_indicators] = self.q_proj(
-                hidden_states[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            query_states[image_gen_indicators] = self.q_proj_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-        query_states = query_states.view(hidden_shape)  # [B, S, H, D]
-        query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
-
-        _query_states_t = query_states_t.new_zeros(query_states_t.shape)
-        if exist_non_image_gen_tokens:
-            _query_states_t[~image_gen_indicators] = self.q_norm(
-                query_states_t[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _query_states_t[image_gen_indicators] = self.q_norm_mot_gen(
-                query_states_t[image_gen_indicators]
-            )
-        query_states_t = _query_states_t.transpose(1, 2)  # [B, H, S, D/2]
-
-        _query_states_hw = query_states_hw.new_zeros(query_states_hw.shape)
-        if exist_non_image_gen_tokens:
-            _query_states_hw[~image_gen_indicators] = self.q_norm_hw(
-                query_states_hw[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _query_states_hw[image_gen_indicators] = self.q_norm_hw_mot_gen(
-                query_states_hw[image_gen_indicators]
-            )
-        query_states_hw = _query_states_hw.transpose(1, 2)
-        query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
-
-        key_states = hidden_states.new_zeros(
-            (*input_shape, self.config.num_key_value_heads * self.head_dim)
-        )
-        if exist_non_image_gen_tokens:
-            key_states[~image_gen_indicators] = self.k_proj(
-                hidden_states[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            key_states[image_gen_indicators] = self.k_proj_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-        key_states = key_states.view(hidden_shape)  # [B, S, H_kv, D]
-        key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
-
-        _key_states_t = key_states_t.new_zeros(key_states_t.shape)
-        if exist_non_image_gen_tokens:
-            _key_states_t[~image_gen_indicators] = self.k_norm(
-                key_states_t[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _key_states_t[image_gen_indicators] = self.k_norm_mot_gen(
-                key_states_t[image_gen_indicators]
-            )
-        key_states_t = _key_states_t.transpose(1, 2)  # [B, H_kv, S, D/2]
-
-        _key_states_hw = key_states_hw.new_zeros(key_states_hw.shape)
-        if exist_non_image_gen_tokens:
-            _key_states_hw[~image_gen_indicators] = self.k_norm_hw(
-                key_states_hw[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _key_states_hw[image_gen_indicators] = self.k_norm_hw_mot_gen(
-                key_states_hw[image_gen_indicators]
-            )
-        key_states_hw = _key_states_hw.transpose(1, 2)
-        key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
-
-        value_states = hidden_states.new_zeros(
-            (*input_shape, self.config.num_key_value_heads * self.head_dim)
-        )
-        if exist_non_image_gen_tokens:
-            value_states[~image_gen_indicators] = self.v_proj(
-                hidden_states[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            value_states[image_gen_indicators] = self.v_proj_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-        value_states = value_states.view(hidden_shape).transpose(1, 2)
-
-        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self.resolve_rope_tables(
-            indexes, hidden_states, position_embeddings
-        )
-        query_states_t, key_states_t = apply_rotary_pos_emb(
-            query_states_t, key_states_t, cos_t, sin_t
-        )
-        query_states_h, key_states_h = apply_rotary_pos_emb(
-            query_states_h, key_states_h, cos_h, sin_h
-        )
-        query_states_w, key_states_w = apply_rotary_pos_emb(
-            query_states_w, key_states_w, cos_w, sin_w
-        )
-
-        query_states = torch.cat(
-            [query_states_t, query_states_h, query_states_w], dim=-1
-        )
-        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
-
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            # key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            update_cache = kwargs.get("update_cache", True)
-            if update_cache:
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs=None
-                )
-            else:
-                # only use the past key values but do not append the current one
-                layer = past_key_values.layers[self.layer_idx]
-                past_k, past_v = layer.keys, layer.values
-
-                if past_k is not None:
-                    key_states = torch.cat(
-                        [past_k, key_states], dim=2
-                    )  # concat on seq_len
-                    value_states = torch.cat([past_v, value_states], dim=2)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-
-        _attn_output = attn_output.new_zeros((*input_shape, self.config.hidden_size))
-        if exist_non_image_gen_tokens:
-            _attn_output[~image_gen_indicators] = self.o_proj(
-                attn_output[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _attn_output[image_gen_indicators] = self.o_proj_mot_gen(
-                attn_output[image_gen_indicators]
-            )
-
-        attn_output = _attn_output
-        return attn_output, attn_weights
-
-
-class Qwen3DecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-
-        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
-
-        self.mlp = Qwen3MLP(config)
-        self.mlp_mot_gen = Qwen3MLP(config)
-        self.input_layernorm = make_qwen3_rms_norm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.input_layernorm_mot_gen = make_qwen3_rms_norm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = make_qwen3_rms_norm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm_mot_gen = make_qwen3_rms_norm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.attention_type = config.layer_types[layer_idx]
-
-    def forward_und(
-        self,
-        hidden_states: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
-        exist_non_image_gen_tokens: bool,
-        exist_image_gen_tokens: bool,
-        indexes: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[PositionEmbeddings] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            image_gen_indicators=image_gen_indicators,
-            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
-            exist_image_gen_tokens=exist_image_gen_tokens,
-            indexes=indexes,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
-
-    def forward_gen(
-        self,
-        hidden_states: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
-        exist_non_image_gen_tokens: bool,
-        exist_image_gen_tokens: bool,
-        indexes: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[PositionEmbeddings] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm_mot_gen(hidden_states)
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            image_gen_indicators=image_gen_indicators,
-            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
-            exist_image_gen_tokens=exist_image_gen_tokens,
-            indexes=indexes,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm_mot_gen(hidden_states)
-        hidden_states = self.mlp_mot_gen(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
-
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
-        exist_non_image_gen_tokens: bool,
-        exist_image_gen_tokens: bool,
-        indexes: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[PositionEmbeddings] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        if exist_non_image_gen_tokens and not exist_image_gen_tokens:
-            return self.forward_und(
-                hidden_states,
-                image_gen_indicators,
-                exist_non_image_gen_tokens,
-                exist_image_gen_tokens,
-                indexes,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                use_cache,
-                cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        if not exist_non_image_gen_tokens and exist_image_gen_tokens:
-            return self.forward_gen(
-                hidden_states,
-                image_gen_indicators,
-                exist_non_image_gen_tokens,
-                exist_image_gen_tokens,
-                indexes,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                use_cache,
-                cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-        # Mixed und/gen path — see the NOTE in Qwen3Attention.forward for caveats.
-        raise NotImplementedError(
-            "Mixed und/gen decoder-layer forward is not yet validated (issue #207). "
-            "Split the sequence at token-type boundaries and use forward_und / forward_gen."
-        )
-
-        residual = hidden_states
-
-        _hidden_states = hidden_states.new_zeros(hidden_states.shape)
-        if exist_non_image_gen_tokens:
-            _hidden_states[~image_gen_indicators] = self.input_layernorm(
-                hidden_states[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _hidden_states[image_gen_indicators] = self.input_layernorm_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-        hidden_states = _hidden_states
-
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            image_gen_indicators=image_gen_indicators,
-            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
-            exist_image_gen_tokens=exist_image_gen_tokens,
-            indexes=indexes,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-
-        _hidden_states = hidden_states.new_zeros(hidden_states.shape)
-        if exist_non_image_gen_tokens:
-            _hidden_states[~image_gen_indicators] = self.mlp(
-                self.post_attention_layernorm(hidden_states[~image_gen_indicators])
-            )
-
-        if exist_image_gen_tokens:
-            _hidden_states[image_gen_indicators] = self.mlp_mot_gen(
-                self.post_attention_layernorm_mot_gen(
-                    hidden_states[image_gen_indicators]
-                )
-            )
-
-        hidden_states = _hidden_states
-        hidden_states = residual + hidden_states
-        return hidden_states
+# note (Codex): Preserve legacy module exports for existing callers.
+_HAS_FLASH_ATTN = HAS_FLASH_ATTN
+_flash_or_sdpa = flash_or_sdpa
+_sdpa_attn_func = sdpa_attn_func
+_SENSENOVA_NPU_FUSED_ROPE_ENV = SENSENOVA_NPU_FUSED_ROPE_ENV
+_SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL = SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL
+_can_use_sensenova_npu_fused_rope = can_use_sensenova_npu_fused_rope
+_compute_default_rope_parameters = compute_default_rope_parameters
+_sensenova_npu_fused_rope_enabled = sensenova_npu_fused_rope_enabled
+_sensenova_npu_rotary_mul = sensenova_npu_rotary_mul
+
+
+# Modified for SGLang; see this directory's README.md for upstream source.
 
 
 class Qwen3PreTrainedModel(PreTrainedModel):
     config: Qwen3Config
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen3DecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
+    base_model_prefix: str = "model"
+    supports_gradient_checkpointing: bool = True
+    _no_split_modules: list[str] = ["Qwen3DecoderLayer"]
+    _skip_keys_device_placement: list[str] = ["past_key_values"]
+    _supports_flash_attn: bool = True
+    _supports_sdpa: bool = True
+    _supports_flex_attn: bool = True
 
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
-    _can_record_outputs = {
+    _can_compile_fullgraph: bool = True
+    _supports_attention_backend: bool = True
+    _can_record_outputs: dict[str, type[nn.Module]] = {
         "hidden_states": Qwen3DecoderLayer,
         "attentions": Qwen3Attention,
     }
 
 
 class Qwen3Model(Qwen3PreTrainedModel):
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config) -> None:
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
+        self.padding_idx: int | None = config.pad_token_id
+        self.vocab_size: int = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens: nn.Embedding = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
-        self.layers = nn.ModuleList(
+        self.layers: nn.ModuleList = nn.ModuleList(
             [
                 Qwen3DecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = make_qwen3_rms_norm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_mot_gen = make_qwen3_rms_norm(
+        self.norm: _SenseNovaRMSNorm = make_qwen3_rms_norm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.norm_mot_gen: _SenseNovaRMSNorm = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.gradient_checkpointing = False
-        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-        self.current_index = -1
+        self.gradient_checkpointing: bool = False
+        self.has_sliding_layers: bool = "sliding_attention" in self.config.layer_types
+        self.current_index: int = -1
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     @model_input_compat
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        image_gen_indicators: Optional[torch.Tensor] = None,
-        indexes: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        image_gen_indicators: torch.Tensor | None = None,
+        indexes: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         image_only: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        # assert position_ids is not None
-        # assert cache_position is not None
-        # assert past_key_values is not None
 
         if image_only:
             exist_non_image_gen_tokens = False
@@ -1726,10 +205,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             exist_non_image_gen_tokens = True
             exist_image_gen_tokens = False
         else:
-            # Normalize once before the decoder loop. Leaving these as CUDA
-            # scalar tensors makes every layer's Python branch read them back
-            # to the host, serializing the compute stream and defeating weight
-            # prefetch overlap.
             exist_non_image_gen_tokens = bool((~image_gen_indicators).any().item())
             exist_image_gen_tokens = bool(image_gen_indicators.any().item())
 
@@ -1737,12 +212,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
+        else:
+            pass
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        else:
+            pass
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
+        else:
+            pass
 
         if cache_position is None:
             past_seen_tokens = (
@@ -1753,13 +234,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 past_seen_tokens + inputs_embeds.shape[1],
                 device=inputs_embeds.device,
             )
+        else:
+            pass
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
+        else:
+            pass
 
-        # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
             if input_ids is not None:
                 mask_kwargs = causal_mask_kwargs(
                     create_causal_mask,
@@ -1770,7 +253,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     past_key_values=past_key_values,
                     position_ids=position_ids,
                 )
-                # Create the masks
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**mask_kwargs),
                 }
@@ -1787,11 +269,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 self.current_index = position_ids_from_indexes(indexes, 0).max()
         else:
             self.current_index = position_ids_from_indexes(indexes, 0).max()
-            # raise NotImplementedError('not isinstance(causal_mask_mapping := attention_mask, dict)')
-
-            # The sliding window alternating layers are not always activated depending on the config
-            # if self.has_sliding_layers:
-            #     causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
 
@@ -1801,8 +278,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             has_non_image_tokens=exist_non_image_gen_tokens,
             has_image_tokens=exist_image_gen_tokens,
         )
-        # Precompute shared RoPE tables. Attention layers rebuild them if
-        # normalization changes the activation dtype.
         position_embeddings = None
         if layers:
             native_layers = self.__dict__.get("sensenova_cache_dit_native_layers")
@@ -1810,6 +285,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
             position_embeddings = rope_layer.self_attn.resolve_rope_tables(
                 indexes, hidden_states
             )
+        else:
+            pass
 
         for decoder_layer in layers[: self.config.num_hidden_layers]:
             attention_type = decoder_attention_type(self, decoder_layer)
@@ -1850,55 +327,37 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = tied_weights_keys(
         "lm_head.weight", "model.embed_tokens.weight"
     )
-    _tp_plan = {"lm_head": "colwise_rep"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _tp_plan: dict[str, str] = {"lm_head": "colwise_rep"}
+    _pp_plan: dict[str, tuple[list[str], list[str]]] = {
+        "lm_head": (["hidden_states"], ["logits"])
+    }
 
-    def __init__(self, config):
+    def __init__(self, config: Qwen3Config) -> None:
         super().__init__(config)
-        self.model = Qwen3Model(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model: Qwen3Model = Qwen3Model(config)
+        self.vocab_size: int = config.vocab_size
+        self.lm_head: nn.Linear = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False
+        )
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     @can_return_tuple
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        indexes: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        input_ids: torch.LongTensor | None = None,
+        indexes: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, Qwen3ForCausalLM
-
-        >>> model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-8B")
-        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
+        """labels (torch.LongTensor of shape (batch_size, sequence_length), *optional*):"""
 
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -1913,7 +372,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = (
             slice(-logits_to_keep, None)
             if isinstance(logits_to_keep, int)
@@ -1929,6 +387,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 vocab_size=self.config.vocab_size,
                 **kwargs,
             )
+        else:
+            pass
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -1950,9 +410,7 @@ class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3PreTrained
 
 
 class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedModel):
-    base_model_prefix = (
-        "transformer"  # For BC, where `transformer` was used instead of `model`
-    )
+    base_model_prefix: str = "transformer"
 
 
 __all__ = [

@@ -1,50 +1,96 @@
 """Small compatibility seams for the supported Transformers 4/5 window."""
 
-# Modified for SGLang; see this directory's README.md for upstream source.
-
 from __future__ import annotations
 
 import inspect
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Protocol
 
 import torch
+import transformers
 from packaging.version import Version
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs
+
+# Modified for SGLang; see this directory's README.md for upstream source.
+
+
+class ModelForward(Protocol):
+    def __call__(
+        self,
+        model: PreTrainedModel,
+        input_ids: torch.Tensor | None = None,
+        image_gen_indicators: torch.Tensor | None = None,
+        indexes: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        image_only: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPast: ...
+
+
+class LegacyCausalMaskFactory(Protocol):
+    def __call__(
+        self,
+        config: PretrainedConfig,
+        input_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        cache_position: torch.Tensor,
+        past_key_values: Cache | None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | None: ...
+
+
+class CausalMaskFactory(Protocol):
+    def __call__(
+        self,
+        config: PretrainedConfig,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | None: ...
+
 
 try:
     from transformers.utils.generic import merge_with_config_defaults
     from transformers.utils.output_capturing import capture_outputs
 
-    def model_input_compat(func: Callable[..., Any]) -> Callable[..., Any]:
+    def model_input_compat(func: ModelForward) -> ModelForward:
         return merge_with_config_defaults(capture_outputs(func))
 
-except ImportError:  # Transformers 4.x
+except ImportError:
     from transformers.utils.generic import check_model_inputs
 
-    def model_input_compat(func: Callable[..., Any]) -> Callable[..., Any]:
+    def model_input_compat(func: ModelForward) -> ModelForward:
         return check_model_inputs(func)
 
 
 @lru_cache(maxsize=None)
-def _parameter_names(callable_: Callable[..., Any]) -> frozenset[str]:
-    return frozenset(inspect.signature(callable_).parameters)
+def _parameter_names(
+    mask_factory: CausalMaskFactory | LegacyCausalMaskFactory,
+) -> frozenset[str]:
+    return frozenset(inspect.signature(mask_factory).parameters)
 
 
 def causal_mask_kwargs(
-    mask_factory: Callable[..., Any],
+    mask_factory: CausalMaskFactory | LegacyCausalMaskFactory,
     *,
-    config: Any,
+    config: PretrainedConfig,
     inputs_embeds: torch.Tensor,
     attention_mask: torch.Tensor | None,
     cache_position: torch.Tensor,
-    past_key_values: Any,
+    past_key_values: Cache | None,
     position_ids: torch.Tensor,
-) -> dict[str, Any]:
-    """Build arguments accepted by the installed ``create_causal_mask``.
-
-    Transformers 4.57 uses ``input_embeds`` and ``cache_position`` while newer
-    5.x releases use ``inputs_embeds`` and derive the cache position internally.
-    """
+) -> dict[str, PretrainedConfig | torch.Tensor | Cache | None]:
+    """Build arguments accepted by the installed create_causal_mask."""
     parameters = _parameter_names(mask_factory)
     embedding_parameter = (
         "inputs_embeds" if "inputs_embeds" in parameters else "input_embeds"
@@ -66,9 +112,10 @@ def pretrained_dtype_kwargs(dtype: torch.dtype) -> dict[str, torch.dtype]:
 
 
 def tied_weights_keys(output_key: str, input_key: str) -> list[str] | dict[str, str]:
-    """Return the `_tied_weights_keys` shape expected by Transformers 4 or 5."""
-    import transformers
+    """Return the _tied_weights_keys shape expected by Transformers 4 or 5."""
 
     if Version(transformers.__version__).major >= 5:
         return {output_key: input_key}
+    else:
+        pass
     return [output_key]

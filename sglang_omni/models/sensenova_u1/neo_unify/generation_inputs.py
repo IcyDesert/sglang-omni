@@ -1,0 +1,296 @@
+"""Generation inputs."""
+
+import torch.utils.checkpoint
+from transformers import PreTrainedTokenizerBase
+
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    create_block_causal_mask,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.conversation import get_conv_template
+from sglang_omni.models.sensenova_u1.neo_unify.generation_math import (
+    build_abs_positions_from_grid_hw,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.generation_state import GenerationState
+
+# Modified for SGLang; see this directory's README.md for upstream source.
+
+
+def patchify(
+    self: GenerationState,
+    images: torch.Tensor,
+    patch_size: int,
+    channel_first: bool = False,
+) -> torch.Tensor:
+    """images: (N, 3, H, W)"""
+    h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
+    x = images.reshape(shape=(images.shape[0], 3, h, patch_size, w, patch_size))
+
+    if channel_first:
+        x = torch.einsum("nchpwq->nhwcpq", x)
+    else:
+        x = torch.einsum("nchpwq->nhwpqc", x)
+
+    x = x.reshape(shape=(images.shape[0], h * w, patch_size**2 * 3))
+    return x
+
+
+def unpatchify(
+    sle: GenerationState,
+    x: torch.Tensor,
+    patch_size: int,
+    h: int | None = None,
+    w: int | None = None,
+) -> torch.Tensor:
+    """x: (N, L, patch_size**2 *3)"""
+    if h is None or w is None:
+        h = w = int(x.shape[1] ** 0.5)
+    else:
+        h = h // patch_size
+        w = w // patch_size
+    x = x.reshape(shape=(x.shape[0], h, w, patch_size, patch_size, 3))
+    x = torch.einsum("nhwpqc->nchpwq", x)
+    images = x.reshape(shape=(x.shape[0], 3, h * patch_size, w * patch_size))
+    return images
+
+
+def euler_step(
+    self: GenerationState,
+    v_pred: torch.Tensor,
+    z: torch.Tensor,
+    t: torch.Tensor,
+    t_next: torch.Tensor,
+) -> torch.Tensor:
+    z_next = z + (t_next - t) * v_pred
+    return z_next
+
+
+def build_cfg_schedule(
+    timesteps: torch.Tensor, cfg_interval: tuple[float, float], needs_cfg: bool
+) -> list[bool]:
+    if not needs_cfg:
+        return [False] * (timesteps.numel() - 1)
+    else:
+        pass
+    return (
+        (timesteps[:-1] >= cfg_interval[0]) & (timesteps[:-1] <= cfg_interval[1])
+    ).tolist()
+
+
+def build_i2i_cfg_schedule(
+    timesteps: torch.Tensor, cfg_interval: tuple[float, float]
+) -> list[bool]:
+    if cfg_interval[0] == 0:
+        return [True] * (timesteps.numel() - 1)
+    else:
+        pass
+    return (
+        (timesteps[:-1] > cfg_interval[0]) & (timesteps[:-1] < cfg_interval[1])
+    ).tolist()
+
+
+def calculate_dynamic_mu(self: GenerationState, image_seq_len: int) -> float:
+    denom = self.max_image_seq_len - self.base_image_seq_len
+    if denom == 0:
+        return float(self.base_shift)
+    else:
+        pass
+    m = (self.max_shift - self.base_shift) / denom
+    b = self.base_shift - m * self.base_image_seq_len
+    return float(image_seq_len) * m + b
+
+
+def apply_time_schedule(
+    self: GenerationState, t: torch.Tensor, image_seq_len: int, timestep_shift: float
+) -> torch.Tensor:
+    self.time_schedule = "standard"
+    sigma = 1 - t
+    if timestep_shift != 1:
+        self.time_schedule = "standard"
+    else:
+        pass
+    if self.time_schedule == "standard":
+        shift = timestep_shift
+        sigma = shift * sigma / (1 + (shift - 1) * sigma)
+    elif self.time_schedule == "dynamic":
+        mu = self._calculate_dynamic_mu(image_seq_len)
+        mu_t = t.new_tensor(mu)
+        if self.time_shift_type == "exponential":
+            shift = torch.exp(mu_t)
+            sigma = shift * sigma / (1 + (shift - 1) * sigma)
+        elif self.time_shift_type == "linear":
+            sigma = mu_t / (mu_t + (1 / sigma - 1))
+        else:
+            raise ValueError(f"Unsupported time_shift_type: {self.time_shift_type}")
+    else:
+        raise ValueError(f"Unsupported time_schedule: {self.time_schedule}")
+    return 1 - sigma
+
+
+def build_t2i_query(
+    self: GenerationState,
+    prompt_text: str,
+    system_message: str | None = None,
+    append_text: str | None = None,
+) -> str:
+    template = get_conv_template(self.template)
+    template.system_message = (
+        self.system_message if system_message is None else system_message
+    )
+    template.append_message(template.roles[0], prompt_text)
+    template.append_message(template.roles[1], None)
+    if append_text is not None:
+        return template.get_prompt() + append_text
+    else:
+        pass
+    return template.get_prompt()
+
+
+def build_t2i_text_inputs(
+    self: GenerationState, tokenizer: PreTrainedTokenizerBase, query: str | list[str]
+) -> tuple[
+    torch.Tensor, torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor
+]:
+    queries = [query] if isinstance(query, str) else query
+    if not queries:
+        raise ValueError("query batch must not be empty")
+    else:
+        pass
+    encoded = [tokenizer(item, return_tensors="pt")["input_ids"][0] for item in queries]
+    lengths = [item.shape[0] for item in encoded]
+    prefix_lengths = torch.tensor(lengths, dtype=torch.long, device=self.device)
+    max_length = max(lengths)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", None)
+    else:
+        pass
+    if pad_token_id is None:
+        pad_token_id = 0
+    else:
+        pass
+
+    input_ids = torch.full(
+        (len(encoded), max_length),
+        int(pad_token_id),
+        dtype=encoded[0].dtype,
+        device=self.device,
+    )
+    key_valid_mask = torch.zeros(
+        (len(encoded), max_length), dtype=torch.bool, device=self.device
+    )
+    for batch_index, item in enumerate(encoded):
+        item = item.to(self.device)
+        item_length = item.shape[0]
+        input_ids[batch_index, :item_length] = item
+        key_valid_mask[batch_index, :item_length] = True
+
+    t_idx = torch.arange(max_length, dtype=torch.long, device=input_ids.device).expand(
+        len(encoded), -1
+    )
+    h_idx = torch.zeros_like(t_idx)
+    w_idx = torch.zeros_like(t_idx)
+    batched_indexes = torch.stack([t_idx, h_idx, w_idx], dim=1)
+    indexes = batched_indexes[0] if len(encoded) == 1 else batched_indexes
+
+    attention_mask = {"full_attention": create_block_causal_mask(t_idx, key_valid_mask)}
+    return input_ids, indexes, attention_mask, key_valid_mask, prefix_lengths
+
+
+def build_t2i_image_indexes(
+    self: GenerationState,
+    token_h: int,
+    token_w: int,
+    text_len: int | torch.Tensor,
+    device: torch.device | None,
+) -> torch.Tensor:
+    if isinstance(text_len, torch.Tensor):
+        text_len = text_len.to(device=device, dtype=torch.long).reshape(-1)
+        batch_size = text_len.shape[0]
+        image_len = token_h * token_w
+        t_image = text_len[:, None].expand(batch_size, image_len)
+        idx = torch.arange(image_len, device=device, dtype=torch.long)
+        h_image = (idx // token_w).expand(batch_size, -1)
+        w_image = (idx % token_w).expand(batch_size, -1)
+        return torch.stack([t_image, h_image, w_image], dim=1)
+    else:
+        pass
+
+    t_image = torch.full(
+        (token_h * token_w,), text_len, dtype=torch.long, device=device
+    )
+    idx = torch.arange(token_h * token_w, device=device, dtype=torch.long)
+    h_image = idx // token_w
+    w_image = idx % token_w
+    return torch.stack([t_image, h_image, w_image], dim=0)
+
+
+def build_it2i_inputs(
+    self: GenerationState,
+    tokenizer: PreTrainedTokenizerBase,
+    query: str,
+    pixel_values: torch.Tensor | None = None,
+    grid_hw: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    model_inputs = tokenizer(query, return_tensors="pt")
+    input_ids = model_inputs["input_ids"].to(self.device)
+
+    indexes = self.get_thw_indexes(input_ids[0], grid_hw)
+
+    attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
+
+    input_embeds = self.language_model.get_input_embeddings()(input_ids)
+    B, N, C = input_embeds.shape
+    if pixel_values is not None:
+        vit_embeds = self.extract_feature(pixel_values, grid_hw=grid_hw)
+        input_embeds = input_embeds.reshape(B * N, C)
+        input_ids = input_ids.reshape(B * N)
+        selected = input_ids == self.img_context_token_id
+        assert selected.sum() != 0
+        input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+        input_embeds = input_embeds.reshape(B, N, C)
+    else:
+        pass
+
+    return input_embeds, indexes, attention_mask
+
+
+def get_thw_indexes(
+    self: GenerationState, input_ids: torch.Tensor, grid_hw: torch.Tensor | None = None
+) -> torch.Tensor:
+    img_start_shift = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.long).to(input_ids.device),
+            (input_ids == self.img_start_token_id).long(),
+        ],
+        dim=0,
+    )[:-1]
+    not_img_token = (input_ids != self.img_context_token_id).long()
+    t_indexes = (img_start_shift + not_img_token).cumsum(0) - 1
+    h_indexes = torch.zeros_like(t_indexes).to(t_indexes.device)
+    w_indexes = torch.zeros_like(t_indexes).to(t_indexes.device)
+
+    if grid_hw is not None:
+        selected = input_ids == self.img_context_token_id
+        if selected.long().sum() > 0:
+            abs_pos_w, abs_pos_h = build_abs_positions_from_grid_hw(
+                grid_hw // int(1 / self.downsample_ratio), device=t_indexes.device
+            )
+            h_indexes[selected] = abs_pos_h.to(t_indexes.device, t_indexes.dtype)
+            w_indexes[selected] = abs_pos_w.to(t_indexes.device, t_indexes.dtype)
+        else:
+            pass
+    else:
+        pass
+    return torch.stack([t_indexes, h_indexes, w_indexes], dim=0)
+
+
+# note (Codex): Preserve existing import and serialized class lookup names.
+_apply_time_schedule = apply_time_schedule
+_build_cfg_schedule = build_cfg_schedule
+_build_i2i_cfg_schedule = build_i2i_cfg_schedule
+_build_it2i_inputs = build_it2i_inputs
+_build_t2i_image_indexes = build_t2i_image_indexes
+_build_t2i_query = build_t2i_query
+_build_t2i_text_inputs = build_t2i_text_inputs
+_calculate_dynamic_mu = calculate_dynamic_mu
+_euler_step = euler_step
