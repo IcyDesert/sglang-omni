@@ -303,6 +303,8 @@ def interleave_gen(
                 verbose,
             )
 
+            img_count += 1
+
             pred_img = image_prediction[0].unsqueeze(0).to(torch.bfloat16)
             raw_img = pred_img * 0.5 + 0.5
             img_mean = torch.tensor(

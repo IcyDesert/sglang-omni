@@ -251,6 +251,4 @@ def interleaved_text_image_denoise(
     clear_flash_kv_cache(past_key_values_tu_cfg)
     clear_flash_kv_cache(past_key_values_iu_cfg)
 
-    img_count += 1
-
     return device, gen_grid_hw, image_prediction

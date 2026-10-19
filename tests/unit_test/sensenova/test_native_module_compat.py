@@ -8,11 +8,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Protocol
+from unittest.mock import Mock
 
 import pytest
 import torch
 from transformers import PretrainedConfig, Qwen3Config
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class NativeModuleLoader(Protocol):
@@ -296,3 +298,58 @@ def test_vision_config_preserves_nested_ratio_round_trip(
     assert config.downsample_ratio == (0.5,)
     restored = configuration.NEOVisionConfig.from_dict(config.to_dict())
     assert restored.downsample_ratio == (0.5,)
+
+
+def test_interleaved_images_advance_sizes_and_stop_at_limit(
+    native_modules: NativeModuleLoader, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # note (Codex): Isolate orchestration from accelerator model type imports.
+    state_types = ModuleType(
+        "sglang_omni.models.sensenova_u1.neo_unify.generation_state"
+    )
+    state_types.GenerationState = Mock
+    monkeypatch.setitem(sys.modules, state_types.__name__, state_types)
+    generation = native_modules("interleaved_generation")
+    device = torch.device("cpu")
+    cache = Mock()
+    cache.get_seq_length.return_value = 0
+    model = Mock()
+    model.device = device
+    model.template = "neo1_0"
+    model.system_message = ""
+    model.patch_size = 1
+    model.downsample_ratio = 1.0
+    model._build_t2i_query.return_value = ""
+    model._build_it2i_inputs.return_value = (
+        torch.zeros(1, 1, 2),
+        torch.zeros(3, 1, dtype=torch.long),
+        None,
+    )
+    model.language_model.return_value = CausalLMOutputWithPast(
+        logits=torch.tensor([[[0.0, 1.0, 0.0, 0.0]]]), past_key_values=cache
+    )
+    model.language_model.get_input_embeddings.return_value = torch.nn.Embedding(
+        4, 2, dtype=torch.bfloat16
+    )
+    model.extract_feature.return_value = torch.zeros(4, 2, dtype=torch.bfloat16)
+    tokenizer = Mock()
+
+    def token_id(token: str) -> int:
+        return {"<img>": 1, "</img>": 2, "<IMG_CONTEXT>": 3}.get(token, 0)
+
+    tokenizer.convert_tokens_to_ids.side_effect = token_id
+    image_sizes = [(2 + index, 2) for index in range(10)]
+    denoise = Mock(
+        side_effect=[(device, torch.tensor([[2, 2]]), torch.zeros(1, 3, 2, 2))] * 10
+        + [AssertionError("Generation exceeded the existing image limit")]
+    )
+    monkeypatch.setattr(generation, "interleaved_text_image_denoise", denoise)
+
+    text, _ = generation.interleave_gen(
+        model, tokenizer, "Draw a sequence", image_size=image_sizes
+    )
+
+    assert text == "<image>" * 10
+    assert denoise.call_count == 10
+    selected_sizes = [call.args[6][call.args[8]] for call in denoise.call_args_list]
+    assert selected_sizes == image_sizes
