@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import AsyncIterator, TypedDict
+from typing import AsyncIterator, Protocol, TypedDict
 
 from sglang_omni.admission import AdminDroppedRequestError, QueueFullError
 from sglang_omni.config.topology import LogicalProcessPlan
@@ -39,6 +39,7 @@ from sglang_omni.proto import (
 )
 from sglang_omni.proto.admin import AdminResponse
 from sglang_omni.proto.session import DEFAULT_MAX_OUTPUT_LEAD_MS, SessionGraph
+from sglang_omni.scheduling.metrics_snapshot import SchedulerMetricEvent
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,22 @@ class StreamBacklog:
     undelivered_bytes: int
     # note (Haoling Pu): time of the last read, or when the backlog became non-empty.
     reader_idle_since_s: float
+
+
+class StreamMetrics(Protocol):
+    """Receives the scheduler and token metrics that stages stream."""
+
+    def observe_scheduler_event(
+        self, stage: str, scheduler_event: SchedulerMetricEvent
+    ) -> None: ...
+
+    def observe_tokens(
+        self,
+        request_id: str,
+        stage: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None: ...
 
 
 @dataclass
@@ -178,6 +195,8 @@ class Coordinator(SessionGraphRunner):
             pass
         self.session_route = session_route
         self.session_graph = session_graph
+        # The server sets this when it enables metrics.
+        self.request_metrics: StreamMetrics | None = None
         self.entry_stage = entry_stage
         self.terminal_stages: set[str] = (
             set(terminal_stages) if terminal_stages else set()
@@ -974,9 +993,7 @@ class Coordinator(SessionGraphRunner):
 
         # Single active terminal (original behavior) or no terminal_stages configured
         if len(expected_terminal_stages) <= 1:
-            if getattr(self, "request_metrics", None) is not None and isinstance(
-                msg.result, dict
-            ):
+            if self.request_metrics is not None and isinstance(msg.result, dict):
                 msg = replace(msg, result={**msg.result, "stage_name": from_stage})
             else:
                 pass
@@ -1031,14 +1048,15 @@ class Coordinator(SessionGraphRunner):
         """Handle a stream chunk from a stage."""
         request_id = msg.request_id
         if msg.modality == "metrics":
-            metrics = getattr(self, "request_metrics", None)
-            if metrics is not None:
+            if self.request_metrics is not None:
                 if "event" in msg.chunk:
-                    metrics.observe_scheduler_event(msg.from_stage, msg.chunk)
+                    self.request_metrics.observe_scheduler_event(
+                        msg.from_stage, msg.chunk
+                    )
                     return
                 else:
                     pass
-                metrics.observe_tokens(
+                self.request_metrics.observe_tokens(
                     request_id,
                     self.replica_topology.logical_name(msg.from_stage),
                     msg.chunk["prompt_tokens"],

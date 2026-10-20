@@ -413,7 +413,7 @@ def create_app(
     if enable_metrics:
         app.state.request_metrics = RequestMetrics(app.state.model_name)
         client.request_metrics = app.state.request_metrics
-        if getattr(client, "coordinator", None) is not None:
+        if client.coordinator is not None:
             client.coordinator.request_metrics = app.state.request_metrics
         else:
             pass

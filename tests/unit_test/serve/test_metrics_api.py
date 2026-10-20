@@ -27,6 +27,7 @@ from sglang_omni.serve.request_metrics import RequestMetrics
 
 class MetricsClient:
     request_metrics: RequestMetrics
+    coordinator: None = None
 
     async def admin(self, action: str, timeout_s: float) -> MetricsAdminResponse:
         return {
@@ -70,6 +71,8 @@ def test_scrape_and_registry_isolation() -> None:
 
 def test_failed_scheduler_scrape_is_not_successful() -> None:
     class FailedClient:
+        coordinator: None = None
+
         async def admin(self, action: str, timeout_s: float) -> MetricsAdminResponse:
             raise TimeoutError()
 
@@ -79,6 +82,8 @@ def test_failed_scheduler_scrape_is_not_successful() -> None:
 
 def test_backend_histogram_is_visible_on_http_scrape() -> None:
     class BackendClient:
+        coordinator: None = None
+
         async def admin(self, action: str, timeout_s: float) -> MetricsAdminResponse:
             return {
                 "success": True,

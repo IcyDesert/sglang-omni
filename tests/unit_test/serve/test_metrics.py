@@ -148,14 +148,14 @@ def test_finished_token_histograms_and_cache(cached: int | None) -> None:
 
     async def source() -> AsyncGenerator[GenerateChunk, None]:
         for count in (1, 4):
-            item = chunk(count)
-            item.usage.prompt_tokens_details = (
+            usage_chunk = chunk(count)
+            usage_chunk.usage.prompt_tokens_details = (
                 {"cached_tokens": cached} if cached is not None else None
             )
-            yield item
+            yield usage_chunk
 
     async def run() -> list[GenerateChunk]:
-        return [item async for item in metrics.generate(source(), False)]
+        return [usage_chunk async for usage_chunk in metrics.generate(source(), False)]
 
     asyncio.run(run())
     labels = {"model_name": "test"}
@@ -211,12 +211,14 @@ def test_cache_from_another_stage_is_not_combined_with_native_tokens() -> None:
 
     async def source() -> AsyncGenerator[GenerateChunk, None]:
         metrics.observe_tokens("r", "decode", 10, 4)
-        item = chunk(4, stage="other")
-        item.usage.prompt_tokens_details = {"cached_tokens": 4}
-        yield item
+        usage_chunk = chunk(4, stage="other")
+        usage_chunk.usage.prompt_tokens_details = {"cached_tokens": 4}
+        yield usage_chunk
 
     async def run() -> list[GenerateChunk]:
-        return [item async for item in metrics.generate(source(), False, "r")]
+        return [
+            usage_chunk async for usage_chunk in metrics.generate(source(), False, "r")
+        ]
 
     asyncio.run(run())
     assert (
@@ -244,7 +246,7 @@ def test_generate_keeps_latest_usage_without_summing(
         yield chunk(finish="stop")
 
     async def run() -> list[GenerateChunk]:
-        return [item async for item in metrics.generate(source(), True)]
+        return [usage_chunk async for usage_chunk in metrics.generate(source(), True)]
 
     assert len(asyncio.run(run())) == 4
     labels = {"model_name": "test", "is_streaming": "true"}
@@ -279,7 +281,9 @@ def test_backend_events_provide_ttft_for_both_request_modes(stream: bool) -> Non
         yield chunk(4, finish="stop")
 
     async def run() -> list[GenerateChunk]:
-        return [item async for item in metrics.generate(source(), stream, "r")]
+        return [
+            usage_chunk async for usage_chunk in metrics.generate(source(), stream, "r")
+        ]
 
     asyncio.run(run())
     labels = {"model_name": "test", "is_streaming": "true" if stream else "false"}
@@ -463,7 +467,7 @@ def test_modality_counts_use_waveform_and_final_image(aborted: bool) -> None:
         yield chunk(finish="abort" if aborted else "stop")
 
     async def run() -> list[GenerateChunk]:
-        return [item async for item in metrics.generate(source(), False)]
+        return [usage_chunk async for usage_chunk in metrics.generate(source(), False)]
 
     asyncio.run(run())
     assert metrics.registry.get_sample_value(
@@ -491,7 +495,7 @@ def test_umm_image_segments_count_toward_generated_images() -> None:
         )
 
     async def run() -> list[GenerateChunk]:
-        return [item async for item in metrics.generate(source(), False)]
+        return [usage_chunk async for usage_chunk in metrics.generate(source(), False)]
 
     asyncio.run(run())
     assert (

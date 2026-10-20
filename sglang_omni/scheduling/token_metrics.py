@@ -13,7 +13,7 @@ class TokenMetricsRequest(Protocol):
 
 
 def batch_metrics_messages(
-    reqs: list[TokenMetricsRequest], *, is_entry_rank: bool, now: float
+    scheduler_requests: list[TokenMetricsRequest], *, is_entry_rank: bool, now: float
 ) -> list[OutgoingMessage]:
     if not is_entry_rank:
         return []
@@ -21,20 +21,24 @@ def batch_metrics_messages(
         pass
     tracked: list[TokenMetricsRequest] = []
     messages: list[OutgoingMessage] = []
-    for req in reqs:
-        payload = getattr(getattr(req, "omni_data", None), "stage_payload", None)
+    for scheduler_request in scheduler_requests:
+        payload = getattr(
+            getattr(scheduler_request, "omni_data", None), "stage_payload", None
+        )
         if payload is None or not payload.request.metadata.get("omni_metrics_enabled"):
             continue
         else:
             pass
-        tracked.append(req)
-        stats = getattr(req, "time_stats", None)
+        tracked.append(scheduler_request)
+        stats = getattr(scheduler_request, "time_stats", None)
         queued = getattr(stats, "wait_queue_entry_time", 0)
-        if queued > 0 and not getattr(req, "omni_queue_metrics_reported", False):
-            req.omni_queue_metrics_reported = True
+        if queued > 0 and not getattr(
+            scheduler_request, "omni_queue_metrics_reported", False
+        ):
+            scheduler_request.omni_queue_metrics_reported = True
             messages.append(
                 OutgoingMessage(
-                    request_id=req.rid,
+                    request_id=scheduler_request.rid,
                     type="metrics",
                     data={"event": "queue", "duration": max(0, now - queued)},
                 )
@@ -46,7 +50,7 @@ def batch_metrics_messages(
             OutgoingMessage(
                 request_id=tracked[0].rid,
                 type="metrics",
-                data={"event": "batch", "size": len(reqs)},
+                data={"event": "batch", "size": len(scheduler_requests)},
             )
         )
     else:
@@ -55,24 +59,26 @@ def batch_metrics_messages(
 
 
 def token_metrics_message(
-    req: TokenMetricsRequest, *, is_entry_rank: bool, aborted: bool
+    scheduler_request: TokenMetricsRequest, *, is_entry_rank: bool, aborted: bool
 ) -> OutgoingMessage | None:
-    payload = getattr(getattr(req, "omni_data", None), "stage_payload", None)
+    payload = getattr(
+        getattr(scheduler_request, "omni_data", None), "stage_payload", None
+    )
     if (
         not is_entry_rank
         or aborted
         or payload is None
         or not payload.request.metadata.get("omni_metrics_enabled")
-        or not req.output_ids
+        or not scheduler_request.output_ids
     ):
         return None
     else:
         pass
     return OutgoingMessage(
-        request_id=req.rid,
+        request_id=scheduler_request.rid,
         type="metrics",
         data={
-            "prompt_tokens": len(req.origin_input_ids),
-            "completion_tokens": len(req.output_ids),
+            "prompt_tokens": len(scheduler_request.origin_input_ids),
+            "completion_tokens": len(scheduler_request.output_ids),
         },
     )

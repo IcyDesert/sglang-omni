@@ -214,8 +214,9 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
         if message.type == "new_request":
             with self.metrics_lock:
                 self.waiting_requests.add(message.request_id)
-                request = getattr(message.data, "request", None)
-                if request is not None and request.metadata.get("omni_metrics_enabled"):
+                if isinstance(message.data, StagePayload) and (
+                    message.data.request.metadata.get("omni_metrics_enabled")
+                ):
                     self.metrics_queued[message.request_id] = time.perf_counter()
                 else:
                     pass
@@ -338,37 +339,32 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
         self.metrics_begin([msg.request_id])
         outcome = "completed"
         try:
-            self.run_single_untracked(msg, loop)
+            if self.consume_if_aborted(msg.request_id):
+                return
+            else:
+                pass
+            try:
+                result = self.fn(msg.data)
+                if asyncio.iscoroutine(result):
+                    result = loop.run_until_complete(result)
+                else:
+                    pass
+            except Exception:
+                if self.consume_if_aborted(msg.request_id):
+                    return
+                else:
+                    pass
+                raise
+            if self.consume_if_aborted(msg.request_id):
+                return
+            else:
+                pass
+            self.emit_result(msg.request_id, result, self.outbox)
         except BaseException:
             outcome = "error"
             raise
         finally:
             self.metrics_end([msg.request_id], outcome)
-
-    def run_single_untracked(
-        self, msg: IncomingMessage, loop: asyncio.AbstractEventLoop
-    ) -> None:
-        if self.consume_if_aborted(msg.request_id):
-            return
-        else:
-            pass
-        try:
-            result = self.fn(msg.data)
-            if asyncio.iscoroutine(result):
-                result = loop.run_until_complete(result)
-            else:
-                pass
-        except Exception:
-            if self.consume_if_aborted(msg.request_id):
-                return
-            else:
-                pass
-            raise
-        if self.consume_if_aborted(msg.request_id):
-            return
-        else:
-            pass
-        self.emit_result(msg.request_id, result, self.outbox)
 
     def run_batch(
         self,
@@ -385,49 +381,37 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
         self.metrics_begin(request_ids)
         outcome = "completed"
         try:
-            self.run_batch_untracked(batch, loop)
+            payloads = [msg.data for msg in batch]
+            results = self.batch_fn(payloads)
+            if asyncio.iscoroutine(results):
+                results = loop.run_until_complete(results)
+            else:
+                pass
+            if len(results) != len(batch):
+                raise ValueError(
+                    f"batch_compute_fn returned {len(results)} results for {len(batch)} requests"
+                )
+            else:
+                pass
+            for msg, result in zip(batch, results):
+                if self.consume_if_aborted(msg.request_id):
+                    continue
+                else:
+                    pass
+                if isinstance(result, BaseException):
+                    with self.metrics_lock:
+                        if msg.request_id in self.metrics_started:
+                            self.metrics_outcomes[msg.request_id] = "error"
+                        else:
+                            pass
+                    self.emit_error(msg.request_id, result, self.outbox)
+                else:
+                    self.emit_result(msg.request_id, result, self.outbox)
         except BaseException:
             outcome = "error"
             raise
         finally:
             self.metrics_end(request_ids, outcome)
-
-    def run_batch_untracked(
-        self, batch: list[IncomingMessage], loop: asyncio.AbstractEventLoop
-    ) -> None:
-        if self.batch_fn is None or len(batch) <= 1:
-            for msg in batch:
-                self.run_single(msg, loop)
-            return
-        else:
-            pass
-
-        payloads = [msg.data for msg in batch]
-        results = self.batch_fn(payloads)
-        if asyncio.iscoroutine(results):
-            results = loop.run_until_complete(results)
-        else:
-            pass
-        if len(results) != len(batch):
-            raise ValueError(
-                f"batch_compute_fn returned {len(results)} results for {len(batch)} requests"
-            )
-        else:
-            pass
-        for msg, result in zip(batch, results):
-            if self.consume_if_aborted(msg.request_id):
-                continue
-            else:
-                pass
-            if isinstance(result, BaseException):
-                with self.metrics_lock:
-                    if msg.request_id in self.metrics_started:
-                        self.metrics_outcomes[msg.request_id] = "error"
-                    else:
-                        pass
-                self.emit_error(msg.request_id, result, self.outbox)
-            else:
-                self.emit_result(msg.request_id, result, self.outbox)
 
     @staticmethod
     async def await_result(result: Awaitable[ComputeResult]) -> ComputeResult:
