@@ -71,6 +71,7 @@ class PagedRelay(FakeRelay):
         source_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
+        source_buffer_page_indices: dict[str, tuple[int, ...]] | None = None,
         transfer_id: str | None = None,
     ) -> FakeOp:
         del source_pool_id, destination_ref, transfer_id
@@ -93,6 +94,8 @@ class PagedRelay(FakeRelay):
         destination_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_page_indices: tuple[int, ...],
+        source_buffer_page_indices: dict[str, tuple[int, ...]] | None = None,
+        destination_buffer_page_indices: dict[str, tuple[int, ...]] | None = None,
         request_id: str,
         transfer_id: str | None = None,
     ) -> FakeOp:
@@ -168,6 +171,8 @@ class BlockingPagedRelay(PagedRelay):
         destination_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_page_indices: tuple[int, ...],
+        source_buffer_page_indices: dict[str, tuple[int, ...]] | None = None,
+        destination_buffer_page_indices: dict[str, tuple[int, ...]] | None = None,
         request_id: str,
         transfer_id: str | None = None,
     ) -> FakeOp:
@@ -784,3 +789,22 @@ def test_kv_cleanup_aborts_reserved_destination() -> None:
     destination.cleanup("request")
 
     assert receiver.aborted == ["request"]
+
+
+def test_one_transfer_can_address_token_pages_and_request_state_separately():
+    pool = KVPool(
+        pool_id="hybrid",
+        layout_id="test",
+        page_size=1,
+        buffers=(
+            KVBufferRegion("tokens", torch.zeros(16, 4, dtype=torch.uint8), 4),
+            KVBufferRegion("state", torch.zeros(2, 8, dtype=torch.uint8), 8),
+        ),
+    )
+    pool.validate_page_indices((10, 11, 12), {"state": (1,)})
+    with pytest.raises(ValueError, match="state"):
+        pool.validate_page_indices((10, 11, 12))
+    with pytest.raises(ValueError, match="state"):
+        pool.validate_page_indices((10, 11, 12), {"state": (2,)})
+    with pytest.raises(ValueError, match="unknown"):
+        pool.validate_page_indices((10, 11, 12), {"other": (1,)})

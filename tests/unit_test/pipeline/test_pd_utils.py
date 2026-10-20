@@ -297,3 +297,69 @@ def test_continuation_allows_asr_refresh_without_retained_kv(
     restored = rebuilt_req(request)
     assert restored.session is None
     assert restored.omni_data.stage_payload.request.params == parameters
+
+
+@pytest.mark.parametrize("finish", ["commit", "abort", "invalid_destination"])
+def test_hybrid_reservation_owns_token_pages_and_state_until_terminal(finish):
+    token_allocator = KVAllocator()
+    state_allocator = KVAllocator()
+    state_allocator.next_slot = 1
+    admissions = queue.SimpleQueue()
+    receiver = DecodeKVReceiver(
+        pool_id="decode:kv",
+        allocator=token_allocator,
+        state_allocator=state_allocator,
+        state_buffer_names=("linear_state.0", "linear_state.1"),
+        admissions=admissions,
+        resume_schema="test-v1",
+    )
+    message = replace(
+        make_message(),
+        source_buffer_page_indices={"linear_state.0": (4,), "linear_state.1": (4,)},
+    )
+    destination = receiver.reserve(message)
+    assert destination.page_indices == (7, 8, 9)
+    assert destination.buffer_page_indices == {
+        "linear_state.0": (1,),
+        "linear_state.1": (1,),
+    }
+    assert admissions.empty()
+    assert not token_allocator.freed and not state_allocator.freed
+    if finish == "commit":
+        receiver.commit(message, destination)
+        admission = admissions.get_nowait()
+        assert admission.allocation.state_slots.tolist() == [1]
+        assert not token_allocator.freed and not state_allocator.freed
+        receiver.release_allocation(admission.allocation)
+    elif finish == "abort":
+        receiver.abort(message, destination, RuntimeError("copy failed"))
+    else:
+        with pytest.raises(RuntimeError, match="live reservation"):
+            receiver.commit(message, replace(destination, buffer_page_indices={}))
+    receiver.abort(message, destination, RuntimeError("duplicate cleanup"))
+    assert len(token_allocator.freed) == len(state_allocator.freed) == 1
+    assert token_allocator.freed[0].tolist() == [7, 8, 9]
+    assert state_allocator.freed[0].tolist() == [1]
+    assert not receiver.has_reservations()
+
+
+def test_hybrid_state_exhaustion_rolls_back_token_reservation():
+    token_allocator = KVAllocator()
+    state_allocator = Mock()
+    state_allocator.alloc.return_value = None
+    receiver = DecodeKVReceiver(
+        pool_id="decode:kv",
+        allocator=token_allocator,
+        state_allocator=state_allocator,
+        state_buffer_names=("linear_state.0",),
+        admissions=queue.SimpleQueue(),
+        resume_schema="test-v1",
+    )
+    message = replace(
+        make_message(), source_buffer_page_indices={"linear_state.0": (4,)}
+    )
+    with pytest.raises(RuntimeError, match="linear-state pool exhausted"):
+        receiver.reserve(message)
+    assert token_allocator.freed[0].tolist() == [7, 8, 9]
+    assert not receiver.has_reservations()
+    state_allocator.free.assert_not_called()
