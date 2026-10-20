@@ -54,6 +54,7 @@ from sglang_omni.preprocessing.resource_connector import export_media_policy
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.proto.messages import StreamMessage
+from sglang_omni.serve.metrics_registry import validate_metrics_environment
 from sglang_omni.serve.openai_api import ServerStatus, create_app
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -608,6 +609,7 @@ async def run_server(
     log_level: str = "info",
     client_kwargs: ClientOptions | None = None,
     enable_realtime: bool = False,
+    enable_metrics: bool = False,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -619,6 +621,10 @@ async def run_server(
     """
     export_media_policy(allowed_local_media_path, allowed_media_domains)
     # 0. Check port availability before loading models
+    if enable_metrics:
+        validate_metrics_environment()
+    else:
+        pass
     port = find_available_port(host, port)
     export_server_port(port)
 
@@ -675,6 +681,7 @@ async def run_server(
                 realtime_deployment = None
             app = create_app(
                 client,
+                enable_metrics=enable_metrics,
                 model_name=model_name or pipeline_config.name,
                 supports_image_api=pipeline_config.supports_image_api,
                 image_decode_mode=pipeline_config.image_decode_mode(),
@@ -838,6 +845,7 @@ def launch_server(
     log_level: str = "info",
     client_kwargs: ClientOptions | None = None,
     enable_realtime: bool = False,
+    enable_metrics: bool = False,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -885,6 +893,7 @@ def launch_server(
             log_level=log_level,
             client_kwargs=client_kwargs,
             enable_realtime=enable_realtime,
+            enable_metrics=enable_metrics,
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
