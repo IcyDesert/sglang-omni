@@ -68,7 +68,7 @@ class SenseNovaU1PipelineConfig(UMMPipelineConfig):
                 adapter="sglang_omni.models.sensenova_u1.umm.SenseNovaUMMAdapter",
                 phases={"generate": "generate"},
                 max_dispatches=1,
-                max_outputs=11,
+                max_outputs=10,
                 max_active=8,
                 max_retained_bytes=256 * 1024 * 1024,
                 timeout_s=600.0,
@@ -114,10 +114,8 @@ class SenseNovaU1PipelineConfig(UMMPipelineConfig):
 
         controller = resolve_stage_typed_kwargs(self.stage_named("orchestrator"))
         limits = DEFAULT_UMM_ADMISSION_LIMITS
-        if controller["max_outputs"] < limits.max_images + 1:
-            raise ValueError(
-                "orchestrator.max_outputs must cover max_images plus usage segment"
-            )
+        if controller["max_outputs"] < limits.max_images:
+            raise ValueError("orchestrator.max_outputs must cover max_images")
         elif not generate.factory.cooperative_cancellation:
             raise ValueError("SenseNova UMM requires cooperative_cancellation")
         else:

@@ -8,7 +8,6 @@ import inspect
 import logging
 import queue as _queue_mod
 import threading
-import time
 from collections.abc import Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Generic, TypeVar
@@ -136,23 +135,6 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
         self.aborted_futures: set[Future] = set()
         self.running = False
         self.abort_callback = abort_callback
-        self.metrics_queued: dict[str, float] = {}
-        self.metrics_active: set[str] = set()
-        self.metrics_aborted: set[str] = set()
-
-    def metrics_snapshot(self) -> dict[str, int]:
-        with self.lock:
-            with self.inbox.mutex:
-                queued = set(self.inbox.request_counts) | set(self.inbox.claimed_counts)
-            queued.difference_update(self.queued_aborts)
-            running = sum(future.running() for future in self.pending.values())
-            running += sum(future.running() for future in self.aborted_futures)
-            for request_id, future in self.pending.items():
-                if future.running() or future.done():
-                    queued.discard(request_id)
-                else:
-                    queued.add(request_id)
-            return {"num_running_reqs": running, "num_queue_reqs": len(queued)}
 
     def warm_up_serving_thread(self) -> None:
         pass
@@ -175,16 +157,11 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
                 with self.lock:
                     try:
                         if self.consume_reachable_tombstone(request_id):
-                            self.metrics_queued.pop(request_id, None)
                             continue
                         else:
                             pass
                         if self.dispatch_fn is not None:
                             future = self.dispatch_fn(msg.data)
-                        elif request_id in self.metrics_queued:
-                            future = self.executor.submit(
-                                self.run_one_tracked, request_id, msg.data
-                            )
                         else:
                             future = self.executor.submit(self.run_one, msg.data)
                         self.pending[request_id] = future
@@ -204,8 +181,6 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
             self.running = False
             self.capacity_freed.notify_all()
         self.inbox.put(IncomingMessage(request_id="", type="wakeup"))
-        with self.lock:
-            self.metrics_queued.clear()
 
     def enqueue(self, msg: IncomingMessage) -> None:
         """Promote speculative aborts atomically with enqueue (scheduler lock first)."""
@@ -220,24 +195,12 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
                 self.queued_aborts.add(msg.request_id)
             else:
                 pass
-            request = getattr(msg.data, "request", None)
-            if request is not None and request.metadata.get("omni_metrics_enabled"):
-                self.metrics_queued[msg.request_id] = time.perf_counter()
-            else:
-                pass
             self.inbox.put(msg)
 
     def abort(self, request_id: str) -> None:
         """Cancel running work or suppress it before dispatch."""
         with self.lock:
             future = self.pending.pop(request_id, None)
-            if future is not None and (
-                request_id in self.metrics_active or request_id in self.metrics_queued
-            ):
-                self.metrics_aborted.add(request_id)
-            else:
-                pass
-            self.metrics_queued.pop(request_id, None)
             if future is not None:
                 self.aborted_futures.add(future)
                 self.capacity_freed.notify()
@@ -310,54 +273,6 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
             pass
         return result
 
-    def run_one_tracked(self, request_id: str, payload: ComputeInput) -> ComputeResult:
-        started = time.perf_counter()
-        with self.lock:
-            queued = self.metrics_queued.pop(request_id, None)
-            self.metrics_active.add(request_id)
-        if queued is not None:
-            self.outbox.put(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="metrics",
-                    data={"event": "queue", "duration": started - queued},
-                )
-            )
-        else:
-            pass
-        self.outbox.put(
-            OutgoingMessage(
-                request_id=request_id,
-                type="metrics",
-                data={"event": "batch", "size": 1},
-            )
-        )
-        outcome = "completed"
-        try:
-            return self.run_one(payload)
-        except BaseException:
-            outcome = "error"
-            raise
-        finally:
-            with self.lock:
-                self.metrics_active.discard(request_id)
-                if request_id in self.metrics_aborted:
-                    self.metrics_aborted.discard(request_id)
-                    outcome = "aborted"
-                else:
-                    pass
-            self.outbox.put(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="metrics",
-                    data={
-                        "event": "execution",
-                        "duration": time.perf_counter() - started,
-                        "outcome": outcome,
-                    },
-                )
-            )
-
     def log_failure(self, request_id: str, exc: BaseException) -> None:
         """Log a failed request from inside the handler of ``exc``."""
         del exc
@@ -367,8 +282,6 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
 
     def finish(self, request_id: str, future: Future) -> None:
         with self.lock:
-            self.metrics_queued.pop(request_id, None)
-            self.metrics_aborted.discard(request_id)
             if self.pending.get(request_id) is future:
                 self.pending.pop(request_id, None)
                 self.capacity_freed.notify()

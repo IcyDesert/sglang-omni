@@ -400,14 +400,6 @@ def serve(
         Literal["debug", "info", "warning", "error", "critical"],
         typer.Option(help="Log level (default: info)."),
     ] = "info",
-    enable_metrics: Annotated[
-        bool,
-        typer.Option(
-            "--enable-metrics",
-            "--enable_metrics",
-            help="Expose SGLang-compatible metrics at /metrics.",
-        ),
-    ] = False,
     enable_realtime: Annotated[
         bool,
         typer.Option(
@@ -537,7 +529,6 @@ def serve(
         model_name=model_name,
         log_level=log_level,
         enable_realtime=enable_realtime,
-        enable_metrics=enable_metrics,
         allowed_local_media_path=validate_allowed_local_media_path(
             allowed_local_media_path
         ),

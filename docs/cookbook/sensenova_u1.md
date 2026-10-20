@@ -223,7 +223,7 @@ does not prove that model execution was batched.
   phase and remain unexposed. CUDA layerwise CPU offload is available through
   `generate.factory.dit_layerwise_offload`.
 - The UMM path uses fixed admission limits (`DEFAULT_UMM_ADMISSION_LIMITS`);
-  `max_outputs` defaults to 11 to cover up to 10 images plus the usage segment.
+  `max_outputs` defaults to 10 to cover up to 10 images.
 - Ascend I2I basic functionality and memory behavior have been validated on
   real hardware. Kernel-hit profiling and broader image-quality and performance
   characterization remain pending.
@@ -237,39 +237,18 @@ model generation remain out of scope for this pipeline; they are tracked as a
 later #2831 phase and depend on the UMM progress-streaming contract.
 
 The controller dispatches one `generate` phase and accepts image segments in
-generation order, followed by one optional `usage` segment. The phase returns
+generation order. The phase returns
 the original request, including its continuation metadata. It owns the model
 and device caches; the adapter owns only request translation and retained
 request bookkeeping. The output stage shares the controller process, as
 UMMPipelineConfig requires.
 
 Each image segment uses the shared inline-media fields: kind, MIME type, byte
-size, SHA-256 digest, and data URL. The usage segment has the shape:
-
-```json
-{
-  "type": "segment",
-  "kind": "usage",
-  "data": {
-    "image_usage": {
-      "input_tokens": 15,
-      "total_tokens": 15,
-      "input_tokens_details": {"text_tokens": 15, "image_tokens": 4096}
-    },
-    "stage_name": "generate"
-  }
-}
-```
-
-The Images endpoints extract `image_usage` from this segment. `/generate`
-clients see the usage segment in the segment list. For a streamed `/generate`
-request the controller strips segment data from the final result, so a
-streaming client must read usage from the streamed usage segment; the Images
-endpoints are non-streaming and always receive it in the final result. This is
-distinct from `adapter.usage(context)`, which reports retained memory bytes.
+size, SHA-256 digest, and data URL. The Images endpoints decode these segments
+from the final result; `/generate` clients receive them in the segment list.
 
 All five controller bounds are required. `max_outputs` must cover
-`max_images + 1` for the usage segment (the default is 11 for 10 images).
+`max_images` (the default is 10).
 Output count and input size are checked before generation; image dimensions
 and step count also have explicit model admission limits. The admission limits
 are fixed model constants (`DEFAULT_UMM_ADMISSION_LIMITS`), because the UMM
@@ -312,11 +291,11 @@ before its actual encoded image size is known.
 
 ### Validation Status
 
-CPU tests exercise the real adapter and controller, output ordering and usage,
+CPU tests exercise the real adapter and controller, output ordering,
 input/output budgets, deadlines, cleanup after late results, media integrity,
-and configuration construction. The current CPU/Gloo regression is 241 passed
-and 5 skipped; it includes T2I, multi-output, UMM routing/output, Images usage,
-metrics, TP configuration and cancellation, Cache-DiT, sampling, and usage.
+and configuration construction. The CPU/Gloo regression covers T2I,
+multi-output, UMM routing/output, TP configuration and cancellation, Cache-DiT,
+and sampling.
 A full SGLang run on an RTX 4090 host (Python 3.12, torch 2.13.0, SGLang
 0.5.21) produced 225 passed, 1 failed, and 43 subtests passed. The one failure
 is the bfloat16 case of `test_native_tp`; it also reproduces at the pre-change
@@ -324,11 +303,6 @@ commit `cd4b310fa`, so it is not introduced by the UMM migration. HTTP tests cov
 preservation of 400/503 rejection statuses. Their local CPU run loads the real
 SGLang utility module without the GPU-dependent package initializer; this does
 not validate a complete installed service.
-
-For serving metrics, pass `--enable-metrics`; `/metrics` is disabled by
-default. The UMM image count appears as
-`sglang_omni:generated_images_total` with the usage segment's `stage_name`
-label.
 
 The Gloo suite covers TP collectives and asymmetric cancellation followed by a
 successful request on the same process group. It does not validate NCCL/HCCL

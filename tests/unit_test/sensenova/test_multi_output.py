@@ -44,11 +44,6 @@ def test_native_outputs_and_seed_order(
     )
     request = payload(n)
     generate_image(request, model, tokenizer)
-    assert request.data["image_usage"] == {
-        "input_tokens": 3,
-        "total_tokens": 3,
-        "input_tokens_details": {"text_tokens": 3, "image_tokens": 0},
-    }
     model.t2i_generate.assert_called_once()
     assert model.t2i_generate.call_args.args[1] == "a cat"
     assert model.t2i_generate.call_args.kwargs["batch_size"] == n
@@ -79,10 +74,6 @@ def test_multi_output_requests_execute_separately(
     ]
     requests = [payload(2), payload(1)]
     assert generate_images(requests, model, tokenizer) == requests
-    assert [request.data["image_usage"]["input_tokens"] for request in requests] == [
-        3,
-        3,
-    ]
     assert [
         call.kwargs["batch_size"] for call in model.t2i_generate.call_args_list
     ] == [2, 1]

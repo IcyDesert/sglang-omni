@@ -52,16 +52,6 @@ from starlette.types import ASGIApp
 from starlette.types import Message as ASGIMessage
 from starlette.types import Receive, Scope, Send
 
-try:
-    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-except ModuleNotFoundError as error:
-    if error.name != "prometheus_client":
-        raise
-    else:
-        pass
-else:
-    pass
-
 from sglang_omni import __version__
 from sglang_omni.client import (
     Client,
@@ -79,10 +69,8 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
-from sglang_omni.client.image_media import InlineImage
 from sglang_omni.client.types import (
     UNKNOWN_FINISH_REASON,
-    GenerateChunk,
     UMMCompletionResult,
     UMMCompletionStreamChunk,
     UMMGenerateChunk,
@@ -101,7 +89,6 @@ from sglang_omni.http.admin_auth import (
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.proto.admin import AdminResponse
 from sglang_omni.serve.diarizations import register_diarizations
-from sglang_omni.serve.metrics import MetricsMiddleware
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -136,7 +123,6 @@ from sglang_omni.serve.protocol import (
 )
 from sglang_omni.serve.realtime.manager import RealtimeDeployment
 from sglang_omni.serve.realtime.schema import CapabilityResponse
-from sglang_omni.serve.request_metrics import RequestMetrics
 from sglang_omni.serve.speech_errors import (
     SpeechAPIError,
     bad_request,
@@ -266,7 +252,6 @@ def create_app(
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
     architectures: list[str] | None = None,
     audio_chunking: ResolvedAudioChunking | None = None,
-    enable_metrics: bool = False,
     interleaved_output: bool = False,
     image_api_registrar: ImageApiRegistrar | None = None,
 ) -> FastAPI:
@@ -401,29 +386,6 @@ def create_app(
         pass
     if image_api_registrar is not None:
         image_api_registrar(app)
-    else:
-        pass
-
-    if enable_metrics:
-        app.state.request_metrics = RequestMetrics(app.state.model_name)
-        client.request_metrics = app.state.request_metrics
-        if getattr(client, "coordinator", None) is not None:
-            client.coordinator.request_metrics = app.state.request_metrics
-        else:
-            pass
-        app.add_middleware(MetricsMiddleware, metrics=app.state.request_metrics)
-
-        @app.get("/metrics", include_in_schema=False)
-        async def metrics() -> Response:
-            try:
-                await app.state.request_metrics.refresh_scheduler(client)
-            except Exception:
-                return Response("Scheduler metrics unavailable\n", status_code=503)
-            return Response(
-                generate_latest(app.state.request_metrics.registry),
-                headers={"Content-Type": CONTENT_TYPE_LATEST},
-            )
-
     else:
         pass
 
@@ -1545,16 +1507,6 @@ async def image_result_with_disconnect_watch(
                 pass
         if result is None:
             raise RuntimeError("Pipeline returned no result")
-        else:
-            pass
-        if isinstance(result, UMMGenerateChunk):
-            images = [
-                InlineImage.model_validate(segment.data).encoded_image()
-                for segment in result.segments or []
-                if segment.kind == "image"
-            ]
-            result.images_b64 = images
-            result.image_b64 = images[0] if images else None
         else:
             pass
         return result

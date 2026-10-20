@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inline image validation and producer usage at UMM boundaries."""
+"""Inline image validation at UMM boundaries."""
 
 import base64
 import hashlib
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
-
-from sglang_omni.client.types import ImageUsageDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class InlineImage(BaseModel):
@@ -45,20 +43,3 @@ class InlineImage(BaseModel):
             raise ValueError("UMM image size or SHA-256 does not match its content")
         else:
             return encoded_image
-
-
-def parse_image_usage(value: object) -> ImageUsageDict | None:
-    if value is None:
-        return None
-    else:
-        usage = TypeAdapter(ImageUsageDict).validate_python(value, strict=True)
-    counts = [usage.get("input_tokens"), usage.get("total_tokens")]
-    details = usage.get("input_tokens_details")
-    if details is not None:
-        counts.extend((details["text_tokens"], details["image_tokens"]))
-    else:
-        pass
-    if any(count is not None and count < 0 for count in counts):
-        raise ValueError("Image usage token counts must be non-negative")
-    else:
-        return usage

@@ -364,23 +364,6 @@ class GenerateResponse(BaseModel):
     meta_info: GenerateMetaInfo
 
 
-class ImageGenerationRequest(BaseModel):
-    """SenseNova T2I request with native multi-output generation (base64 PNG)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    model: str | None = None
-    prompt: str = Field(min_length=1)
-    size: str = "2048x2048"
-    n: int = Field(default=1, ge=1, le=10)
-    response_format: Literal["b64_json"] = "b64_json"
-    seed: int = Field(default=42, ge=0)
-    num_inference_steps: int = Field(default=50, ge=1)
-    guidance_scale: float = Field(default=4.0, ge=0, allow_inf_nan=False)
-    enable_cache_dit: bool | None = None
-    cache_dit_params: dict[str, object] | None = None
-
-
 SUPPORTED_TTS_RESPONSE_FORMATS = frozenset({"wav", "mp3", "flac", "pcm", "aac", "opus"})
 SUPPORTED_TTS_LANGUAGES = frozenset(
     {

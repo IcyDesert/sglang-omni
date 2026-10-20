@@ -15,7 +15,6 @@ import logging
 import os
 import queue as _queue_mod
 import threading
-import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -196,7 +195,6 @@ class Stage:
         self.running = False
         self.aborted: set[str] = set()
         self.active_requests: set[str] = set()
-        self.metrics_started: dict[str, float] = {}
         self.stream_queue: StreamQueue | None = None
         self.stream_chunk_counters: dict[tuple[str, str], int] = {}
         self.first_stream_chunk_seen: set[str] = set()
@@ -1189,14 +1187,6 @@ class Stage:
                 return
         else:
             pass
-        if (
-            self.owns_external_io
-            and isinstance(payload, StagePayload)
-            and payload.request.metadata.get("omni_metrics_enabled")
-        ):
-            self.metrics_started.setdefault(request_id, time.perf_counter())
-        else:
-            pass
         _emit_event(
             request_id=request_id,
             stage=self.name,
@@ -1263,16 +1253,6 @@ class Stage:
 
     async def run_admin_operation(self, operation: AdminOperation) -> AdminResult:
         try:
-            if operation.action == "metrics":
-                snapshot = getattr(self.scheduler, "metrics_snapshot", None)
-                if snapshot is not None:
-                    return self.admin_result(
-                        operation, success=True, data=snapshot(), message="ok"
-                    )
-                else:
-                    pass
-            else:
-                pass
             handler = getattr(self.scheduler, "admin", None)
             if handler is None:
                 return self.admin_result(
@@ -1448,15 +1428,6 @@ class Stage:
                             self.launch_kv_transfer(out.data)
                         else:
                             self.discard_kv_transfer(out.data)
-                    elif out.type == "metrics":
-                        await self.control_plane.send_stream(
-                            StreamMessage(
-                                request_id=out.request_id,
-                                from_stage=self.name,
-                                chunk=out.data,
-                                modality="metrics",
-                            )
-                        )
                     elif out.request_id in self.active_requests:
                         if out.type == "result":
                             await self.route_result(out.request_id, out.data)
@@ -2450,7 +2421,6 @@ class Stage:
         await self.control_plane.send_stream(msg)
 
     async def send_failure(self, request_id: str, error: str) -> None:
-        self.finish_stage_metrics(request_id, "error")
         self.record_aborted_request_id(request_id)
         if not self.owns_external_io:
             self.clear_request_state(request_id)
@@ -2469,27 +2439,9 @@ class Stage:
         finally:
             self.clear_request_state(request_id)
 
-    def finish_stage_metrics(self, request_id: str, outcome: str) -> None:
-        started = self.metrics_started.pop(request_id, None)
-        if started is not None:
-            self.scheduler.outbox.put(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="metrics",
-                    data={
-                        "event": "stage",
-                        "duration": time.perf_counter() - started,
-                        "outcome": outcome,
-                    },
-                )
-            )
-        else:
-            pass
-
     def clear_request_state(
         self, request_id: str, *, keep_replica_bindings: bool = False
     ) -> None:
-        self.finish_stage_metrics(request_id, "completed")
         self.active_requests.discard(request_id)
         self.input_handler.cancel(request_id)
         if self.stream_queue is not None:
@@ -2564,7 +2516,6 @@ class Stage:
             pass
 
     def on_abort(self, request_id: str) -> None:
-        self.finish_stage_metrics(request_id, "aborted")
         self.record_aborted_request_id(request_id)
         self.comm.cleanup(request_id)
         self.clear_request_state(request_id)

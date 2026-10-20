@@ -20,7 +20,6 @@ from sglang_omni.client.audio import (
     encode_audio,
     to_numpy,
 )
-from sglang_omni.client.image_media import parse_image_usage
 from sglang_omni.client.types import (
     UNKNOWN_FINISH_REASON,
     AbortLevel,
@@ -124,7 +123,6 @@ class Client:
         self.coordinator = coordinator
         self.result_builder = result_builder or self.default_result_builder
         self.stream_builder = stream_builder or self.default_stream_builder
-        self.request_metrics = None
 
     async def open_session(
         self,
@@ -171,27 +169,8 @@ class Client:
         request: GenerateRequest,
         request_id: str | None = None,
     ) -> AsyncIterator[GenerateChunk]:
-        request_id = request_id or str(uuid.uuid4())
-        source = self.generate_uninstrumented(request, request_id)
-        if self.request_metrics is not None:
-            source = self.request_metrics.generate(source, request.stream, request_id)
-        else:
-            pass
-        async with aclosing(source):
-            async for chunk in source:
-                yield chunk
-
-    async def generate_uninstrumented(
-        self,
-        request: GenerateRequest,
-        request_id: str | None = None,
-    ) -> AsyncIterator[GenerateChunk]:
         req_id = request_id or str(uuid.uuid4())
         omni_request = self.build_omni_request(request)
-        if self.request_metrics is not None:
-            omni_request.metadata["omni_metrics_enabled"] = True
-        else:
-            pass
         if request.stream:
             coordinator_stream = self.coordinator.stream(req_id, omni_request)
             async with aclosing(coordinator_stream):
@@ -728,15 +707,6 @@ class Client:
             usage["engine_time_s"] = data.get("engine_time_s")
         else:
             pass
-        details = usage.get("prompt_tokens_details", data.get("prompt_tokens_details"))
-        if details is not None:
-            usage["prompt_tokens_details"] = details
-        else:
-            cached_tokens = usage.get("cached_tokens", data.get("cached_tokens"))
-            if cached_tokens is not None:
-                usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
-            else:
-                pass
         return UsageInfo.from_dict(usage)
 
     @staticmethod
@@ -790,12 +760,6 @@ class Client:
                 chunk = Client.default_result_builder(
                     request_id, result["decode"] or {}
                 )
-                if chunk.usage is not None:
-                    chunk.text_usage_stage = (result["decode"] or {}).get(
-                        "stage_name"
-                    ) or "decode"
-                else:
-                    pass
                 if audio_result is not None:
                     Client.set_audio_data(chunk, audio_result)
                     chunk.usage = chunk.usage or Client.build_usage_info(audio_result)
@@ -865,19 +829,6 @@ class Client:
             else:
                 pass
             Client.set_audio_data(chunk, result)
-            image_b64 = result.get("image_b64")
-            if isinstance(image_b64, str):
-                chunk.image_b64 = image_b64
-            else:
-                pass
-            images_b64 = result.get("images_b64")
-            if isinstance(images_b64, list) and all(
-                isinstance(item, str) for item in images_b64
-            ):
-                chunk.images_b64 = images_b64
-            else:
-                pass
-            chunk.image_usage = result.get("image_usage")
             if result.get("image") is not None:
                 chunk.image = result["image"]
                 chunk.modality = "image"
@@ -1092,21 +1043,12 @@ def extract_inputs(request: GenerateRequest) -> object:
 def umm_segment_chunk(chunk: GenerateChunk, data: dict[str, object]) -> GenerateChunk:
     """Carry one streamed segment of an interleaved (UMM) request."""
     segment = UMMSegment.from_dict(data)
-    stage_name = chunk.stage_name
-    if segment.kind == "usage" and isinstance(segment.data, dict):
-        raw_stage_name = segment.data.get("stage_name")
-        if isinstance(raw_stage_name, str):
-            stage_name = raw_stage_name
-        else:
-            pass
-    else:
-        pass
     return UMMGenerateChunk(
         request_id=chunk.request_id,
         index=segment.segment_index,
         text=segment.data if segment.kind == "text" else "",
         stage_id=chunk.stage_id,
-        stage_name=stage_name,
+        stage_name=chunk.stage_name,
         modality=segment.kind,
         segment=segment,
     )
@@ -1128,25 +1070,6 @@ def umm_result_chunk(request_id: str, result: dict[str, object]) -> GenerateChun
         raise ValueError("UMM final segments must be one ordered execution")
     else:
         pass
-    usage_segment = next(
-        (segment for segment in segments if segment.kind == "usage"), None
-    )
-    image_usage = None
-    stage_name = None
-    if usage_segment is None:
-        pass
-    elif usage_segment.data is None:
-        # A streamed final result already delivered the usage segment's data.
-        pass
-    elif not isinstance(usage_segment.data, dict):
-        raise ValueError("Invalid UMM usage segment")
-    else:
-        image_usage = parse_image_usage(usage_segment.data.get("image_usage"))
-        raw_stage_name = usage_segment.data.get("stage_name")
-        if isinstance(raw_stage_name, str):
-            stage_name = raw_stage_name
-        else:
-            pass
     finish_reason = result.get("finish_reason")
     return UMMGenerateChunk(
         request_id=request_id,
@@ -1158,8 +1081,6 @@ def umm_result_chunk(request_id: str, result: dict[str, object]) -> GenerateChun
         finish_reason=finish_reason if isinstance(finish_reason, str) else "stop",
         model_finish_reason="",
         modality="mixed",
-        image_usage=image_usage,
-        stage_name=stage_name,
         segments=segments,
     )
 
