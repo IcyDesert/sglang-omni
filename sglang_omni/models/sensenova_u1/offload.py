@@ -59,7 +59,7 @@ class LayerwiseOffloadConfig:
             return frozenset(range(self.resident_layers))
         else:
             pass
-        # note (Codex): Residency is the complement of evenly spaced streamed layers.
+        # note (Wes): Residency is the complement of evenly spaced streamed layers.
         streamed_count = num_layers - self.resident_layers
         streamed = {
             round(index * num_layers / streamed_count)
@@ -138,7 +138,7 @@ class SenseNovaLayerwiseOffload:
             id(module) for layer in self.layers for module in layer.modules()
         }
         owners: dict[int, int | None] = {}
-        # note (Codex): Shared weights cannot move independently between devices.
+        # note (Wes): Shared weights cannot move independently between devices.
         for index, layer in enumerate(self.layers):
             weights = []
             for module in layer.modules():
@@ -195,7 +195,7 @@ class SenseNovaLayerwiseOffload:
         )
         if config.pin_cpu_memory and self.device.type == "cuda":
             for weights in self.weights:
-                # note (Codex): Pinning needs an additional host copy during initialization.
+                # note (Wes): Pinning needs an additional host copy during initialization.
                 pinned: dict[
                     tuple[int, torch.Size, tuple[int, ...], torch.dtype], torch.Tensor
                 ] = {}
@@ -215,7 +215,7 @@ class SenseNovaLayerwiseOffload:
         else:
             pass
 
-        # note (Codex): Detaching layers prevents moving all weights to the GPU at once.
+        # note (Wes): Detaching layers prevents moving all weights to the GPU at once.
         parent_path, name = layers_path.rsplit(".", 1)
         parent = model.get_submodule(parent_path)
         setattr(parent, name, nn.ModuleList())
@@ -253,7 +253,7 @@ class SenseNovaLayerwiseOffload:
             return
         else:
             pass
-        # note (Codex): Track partial copies so failures release all allocated weights.
+        # note (Wes): Track partial copies so failures release all allocated weights.
         self.loaded.add(index)
         try:
             if self.copy_stream is None:
@@ -284,7 +284,7 @@ class SenseNovaLayerwiseOffload:
         )
         for weight in self.weights[index]:
             if stream is not None and weight.get().device.type == "cuda":
-                # note (Codex): Pending kernels must finish before storage is recycled.
+                # note (Wes): Pending kernels must finish before storage is recycled.
                 weight.get().record_stream(stream)
             else:
                 pass
@@ -293,7 +293,7 @@ class SenseNovaLayerwiseOffload:
         self.ready.pop(index, None)
 
     def before_forward(self, index: int) -> LayerPreHook:
-        # note (Codex): PyTorch requires module and input arguments even when unused.
+        # note (Wes): PyTorch requires module and input arguments even when unused.
         def hook(module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
             if not self.is_active:
                 raise RuntimeError("Run offloaded generation inside manager.request()")
@@ -313,7 +313,7 @@ class SenseNovaLayerwiseOffload:
         return hook
 
     def after_forward(self, index: int) -> LayerPostHook:
-        # note (Codex): PyTorch supplies None when an always-called hook follows failure.
+        # note (Wes): PyTorch supplies None when an always-called hook follows failure.
         def hook(
             module: nn.Module,
             inputs: tuple[torch.Tensor, ...],
@@ -345,7 +345,7 @@ class SenseNovaLayerwiseOffload:
                 yield
         finally:
             try:
-                # note (Codex): Failed requests may leave unused prefetched copies.
+                # note (Wes): Failed requests may leave unused prefetched copies.
                 if self.copy_stream is not None:
                     self.copy_stream.synchronize()
                 else:

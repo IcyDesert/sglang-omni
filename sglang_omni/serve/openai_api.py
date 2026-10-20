@@ -46,6 +46,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from PIL import Image
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.types import ASGIApp
@@ -1586,8 +1587,6 @@ async def image_result_with_disconnect_watch(
 
 async def read_image_edit_upload(image: UploadFile) -> bytes:
     """Read and validate one bounded reference-image upload."""
-    from PIL import Image
-
     try:
         image_bytes = await image.read(MAX_IMAGE_EDIT_UPLOAD_BYTES + 1)
     finally:

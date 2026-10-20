@@ -75,8 +75,7 @@ class TensorParallelScheduler(SimpleScheduler):
             else:
                 pass
         except BaseException as exc:
-            # note (AuFlow): Cleanup can block in a broken collective. Notify the
-            # stage first so the supervisor can shut down the entire TP group.
+            # note (AuFlow): Cleanup can block in a broken collective. Notify the stage first so the supervisor can shut down the entire TP group.
             self.wait_for_shutdown = False
             if self.failure_callback is not None:
                 self.failure_callback(exc)

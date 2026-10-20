@@ -303,7 +303,7 @@ def test_vision_config_preserves_nested_ratio_round_trip(
 def test_interleaved_images_advance_sizes_and_stop_at_limit(
     native_modules: NativeModuleLoader, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # note (Codex): Isolate orchestration from accelerator model type imports.
+    # note (Wes): Isolate orchestration from accelerator model type imports.
     state_types = ModuleType(
         "sglang_omni.models.sensenova_u1.neo_unify.generation_state"
     )

@@ -3,7 +3,7 @@
 
 For stages that just run a function (preprocessing, encoders, decode, code2wav).
 No KV cache. The default is one-at-a-time execution, with optional explicit
-batching through ``batch_compute_fn``.
+batching through batch_compute_fn.
 
 Same inbox/outbox interface as OmniScheduler so Stage doesn't need branching.
 """
@@ -43,7 +43,7 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
     Supports sync and async callables for ``new_request`` messages only.
     A batch_compute_fn may return a BaseException in an item's
     result slot to fail only that request while preserving the rest of the batch.
-    A ``batch_key_fn`` can keep incompatible requests in separate batches.
+    A batch_key_fn can keep incompatible requests in separate batches.
     Streaming stages should provide a dedicated scheduler implementation
     (for example ``Code2WavScheduler``) rather than rely on SimpleScheduler.
     """

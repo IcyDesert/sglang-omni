@@ -582,10 +582,10 @@ def test_stage_stop_warns_but_succeeds_on_a_stuck_scheduler_thread(
 
 @pytest.mark.parametrize("role", ["leader", "follower"])
 def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
-    from sglang_omni.scheduling.message import IncomingMessage
     from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
         TensorParallelScheduler,
     )
+    from sglang_omni.scheduling.message import IncomingMessage
 
     async def _run() -> None:
         cleanup_entered = threading.Event()
@@ -613,8 +613,7 @@ def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
                 await asyncio.wait_for(run_task, timeout=2)
             assert stage_obj.scheduler_crash_error is not None
             assert scheduler.wait_for_shutdown is False
-            # The stage can exit and trigger group shutdown while this rank's
-            # cleanup is still blocked on its compute thread.
+            # The stage can exit and trigger group shutdown while this rank's cleanup is still blocked on its compute thread.
             assert stage_obj.scheduler_thread.is_alive()
         finally:
             release_cleanup.set()
@@ -628,10 +627,10 @@ def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
 
 
 def test_stage_stop_waits_past_timeout_for_collective_cleanup(monkeypatch) -> None:
-    from sglang_omni.scheduling.message import IncomingMessage
     from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
         TensorParallelScheduler,
     )
+    from sglang_omni.scheduling.message import IncomingMessage
 
     async def _run() -> None:
         entered = threading.Event()
