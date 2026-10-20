@@ -63,6 +63,7 @@ class UsageInfo:
     completion_tokens: int | None = None
     total_tokens: int | None = None
     engine_time_s: float | None = None
+    prompt_tokens_details: dict[str, int] | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object] | None) -> "UsageInfo | None":
@@ -75,6 +76,7 @@ class UsageInfo:
             completion_tokens=data.get("completion_tokens"),
             total_tokens=data.get("total_tokens"),
             engine_time_s=data.get("engine_time_s"),
+            prompt_tokens_details=data.get("prompt_tokens_details"),
         )
 
     def to_dict(self) -> UsageInfoDict:
@@ -191,6 +193,7 @@ class GenerateChunk:
     audio_data: object = None
     media: list[dict[str, object]] | None = None
     sample_rate: int | None = None
+    text_usage_stage: str | None = None
     diarization: DiarizationResult | None = None
     image: str | None = None  # base64-encoded PNG from the terminal result
 

@@ -96,6 +96,11 @@ from sglang_omni.scheduling.message import (
     OutgoingMessage,
     put_messages,
 )
+from sglang_omni.scheduling.metrics_snapshot import (
+    SchedulerMetricsSnapshot,
+    backend_metrics_snapshot,
+    engine_metrics_snapshot,
+)
 from sglang_omni.scheduling.sglang_backend.ar_session import (
     ARSessionAdapter,
     ARSessionBridge,
@@ -103,6 +108,10 @@ from sglang_omni.scheduling.sglang_backend.ar_session import (
     is_close_request,
 )
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
+from sglang_omni.scheduling.token_metrics import (
+    batch_metrics_messages,
+    token_metrics_message,
+)
 from sglang_omni.scheduling.types import (
     ARRequestData,
     DeferredAdmission,
@@ -1119,18 +1128,18 @@ class OmniScheduler(Generic[RequestDataT]):
         elif bridge is None:
             raise ValueError("AR streaming sessions are not enabled for this stage")
         elif operation.operation != "append":
-            session_payload = bridge.apply_operation(payload, operation)
-            if payload.request_id in self.aborted_request_ids:
-                return False
-            else:
-                self.outbox.put(
-                    OutgoingMessage(
-                        request_id=payload.request_id,
-                        type="result",
-                        data=session_payload,
+            for session_payload in bridge.apply_operation(payload, operation):
+                if session_payload.request_id in self.aborted_request_ids:
+                    pass
+                else:
+                    self.outbox.put(
+                        OutgoingMessage(
+                            request_id=session_payload.request_id,
+                            type="result",
+                            data=session_payload,
+                        )
                     )
-                )
-                return False
+            return False
         else:
             unit = bridge.accept(payload, operation)
             chunk = unit.chunk
@@ -1247,11 +1256,24 @@ class OmniScheduler(Generic[RequestDataT]):
             pending_stream_done = ingress.done if ingress is not None else False
             payload.prefetched_stream_done = pending_stream_done
             session_unit = self.active_session_unit(req_id)
-            if session_unit is None and not self.is_request_build_ready(
+            if not self.is_request_build_ready(
                 payload,
                 pending_stream_done=pending_stream_done,
             ):
                 self.deferred_request_payloads[req_id] = payload
+                continue
+            else:
+                pass
+            result = self.complete_without_generation(payload, session_unit)
+            if result is not None:
+                self.pending_stream_ingress.pop(req_id, None)
+                if session_unit is not None:
+                    self.session_bridge.complete(req_id)
+                else:
+                    pass
+                self.outbox.put(
+                    OutgoingMessage(request_id=req_id, type="result", data=result)
+                )
                 continue
             else:
                 pass
@@ -1824,6 +1846,12 @@ class OmniScheduler(Generic[RequestDataT]):
         del request_id, chunk
         return True
 
+    def complete_without_generation(
+        self, payload: StagePayload, session_unit: SessionUnit | None
+    ) -> StagePayload | None:
+        """The result of a build-ready request its model cannot generate for, or None to build it."""
+        return None
+
     def is_request_build_ready(
         self,
         payload: StagePayload,
@@ -2085,6 +2113,10 @@ class OmniScheduler(Generic[RequestDataT]):
 
     def stamp_batch_launch(self, batch) -> None:
         """Mirror upstream per-forward bookkeeping for custom runner paths."""
+        for message in batch_metrics_messages(
+            batch.reqs, is_entry_rank=self.is_entry_rank, now=time.perf_counter()
+        ):
+            self.outbox.put(message)
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -2152,7 +2184,10 @@ class OmniScheduler(Generic[RequestDataT]):
                 pass
             req_output = mr_output.outputs[rid]
             session_unit = self.active_session_unit(rid)
-            if session_unit is not None:
+            if (
+                session_unit is not None
+                and _get_active_stage() == session_unit.stages[-1]
+            ):
                 assert bridge is not None
                 messages = bridge.stream_messages(rid, sched_req.data, req_output)
             elif self.stream_output_builder is not None:
@@ -2189,7 +2224,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     def flush_stream_output(self, request_id: str, req_data: ARRequestData) -> None:
         session_unit = self.active_session_unit(request_id)
-        if session_unit is not None:
+        if session_unit is not None and _get_active_stage() == session_unit.stages[-1]:
             bridge = self.session_bridge
             assert bridge is not None
             self.put_stream_messages(
@@ -2356,6 +2391,15 @@ class OmniScheduler(Generic[RequestDataT]):
                 continue
             else:
                 pass
+            telemetry = token_metrics_message(
+                req,
+                is_entry_rank=self.is_entry_rank,
+                aborted=isinstance(req.finished_reason, FINISH_ABORT),
+            )
+            if telemetry is not None:
+                self.outbox.put(telemetry)
+            else:
+                pass
             if not req.finished():
                 continue
             else:
@@ -2445,8 +2489,6 @@ class OmniScheduler(Generic[RequestDataT]):
                     terminal_error = callback_error
                 else:
                     pass
-                data.prefill_input_embeds = None
-                data.decode_input_embeds = None
                 # Note: (Jiaxin Deng) close the model-path interval before
                 # _close_completed_request, which discards the same rid that
                 # _emit_model_path_end_once dedups on. Emitting afterwards
@@ -2456,6 +2498,8 @@ class OmniScheduler(Generic[RequestDataT]):
                     status="error" if terminal_error is not None else "success",
                 )
                 abort_cleanup_needed = self.close_completed_request(req)
+                data.prefill_input_embeds = None
+                data.decode_input_embeds = None
 
             if abort_cleanup_needed:
                 self.run_abort_callback(rid)
@@ -2835,6 +2879,22 @@ class OmniScheduler(Generic[RequestDataT]):
             "message": f"unsupported admin action: {action}",
             "data": {"skipped": True, "unsupported": True},
         }
+
+    def metrics_snapshot(self) -> SchedulerMetricsSnapshot:
+        with self.request_admission_lock:
+            running = {
+                req.rid
+                for batch in (self.running_batch, self.cur_batch)
+                if batch is not None
+                for req in batch.reqs
+                if not req.finished()
+            }
+            return {
+                "num_running_reqs": len(running),
+                "num_queue_reqs": len(self.waiting_queue),
+                "engine_gauges": engine_metrics_snapshot(self),
+                "backend_metrics": backend_metrics_snapshot(self),
+            }
 
     def admin_model_info(self) -> AdminActionResult:
         info = self.model_worker.model_info()
@@ -3837,7 +3897,7 @@ class OmniScheduler(Generic[RequestDataT]):
         request_id = req.rid
         bridge = self.session_bridge
         if bridge is not None:
-            bridge.complete(request_id)
+            bridge.complete(request_id, req.omni_data)
         else:
             pass
         with self.request_admission_lock:

@@ -15,6 +15,7 @@ import logging
 import os
 import queue as _queue_mod
 import threading
+import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -60,7 +61,7 @@ from sglang_omni.proto import (
     SubmitMessage,
 )
 from sglang_omni.proto.request import RoutedPayloads
-from sglang_omni.proto.session import find_session_operation
+from sglang_omni.proto.session import SessionOperation, find_session_operation
 from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.message import (
     IncomingMessage,
@@ -195,6 +196,7 @@ class Stage:
         self.running = False
         self.aborted: set[str] = set()
         self.active_requests: set[str] = set()
+        self.metrics_started: dict[str, float] = {}
         self.stream_queue: StreamQueue | None = None
         self.stream_chunk_counters: dict[tuple[str, str], int] = {}
         self.first_stream_chunk_seen: set[str] = set()
@@ -1187,6 +1189,29 @@ class Stage:
                 return
         else:
             pass
+        session_operation = find_session_operation(payload.request.metadata)
+        if session_operation is not None:
+            # Note (Junnan Li): A preempted append dies here as the control arrives: its result here and anything it sends here later are dropped.
+            for preempted_request_id in session_operation.preempted_request_ids:
+                self.on_abort(preempted_request_id)
+        else:
+            pass
+        if (
+            session_operation is not None
+            and session_operation.operation == "append"
+            and self.owns_external_io
+        ):
+            await self.forward_session_append(request_id, payload, session_operation)
+        else:
+            pass
+        if (
+            self.owns_external_io
+            and isinstance(payload, StagePayload)
+            and payload.request.metadata.get("omni_metrics_enabled")
+        ):
+            self.metrics_started.setdefault(request_id, time.perf_counter())
+        else:
+            pass
         _emit_event(
             request_id=request_id,
             stage=self.name,
@@ -1206,6 +1231,30 @@ class Stage:
             enqueue(msg)
         else:
             self.scheduler.inbox.put(msg)
+
+    async def forward_session_append(
+        self,
+        request_id: str,
+        payload: StagePayload,
+        session_operation: SessionOperation,
+    ) -> None:
+        """A session unit's payload reaches an owner this stage streams to before the stream; the stream is this stage's whole output to it."""
+        owners = session_operation.stages
+        if self.name not in owners:
+            return
+        else:
+            index = owners.index(self.name)
+        if index + 1 < len(owners) and owners[index + 1] in self.stream_targets:
+            # Note (Junnan Li): Nothing of this request has streamed yet, so the payload cannot overtake a chunk and may go the local way.
+            await self.send_to_stage(
+                request_id,
+                owners[index + 1],
+                payload,
+                allow_local_object=True,
+                stream_targets_for_request=set(),
+            )
+        else:
+            pass
 
     async def on_admin(self, msg: AdminMessage) -> None:
         operation = msg.operation
@@ -1253,6 +1302,16 @@ class Stage:
 
     async def run_admin_operation(self, operation: AdminOperation) -> AdminResult:
         try:
+            if operation.action == "metrics":
+                snapshot = getattr(self.scheduler, "metrics_snapshot", None)
+                if snapshot is not None:
+                    return self.admin_result(
+                        operation, success=True, data=snapshot(), message="ok"
+                    )
+                else:
+                    pass
+            else:
+                pass
             handler = getattr(self.scheduler, "admin", None)
             if handler is None:
                 return self.admin_result(
@@ -1428,6 +1487,15 @@ class Stage:
                             self.launch_kv_transfer(out.data)
                         else:
                             self.discard_kv_transfer(out.data)
+                    elif out.type == "metrics":
+                        await self.control_plane.send_stream(
+                            StreamMessage(
+                                request_id=out.request_id,
+                                from_stage=self.name,
+                                chunk=out.data,
+                                modality="metrics",
+                            )
+                        )
                     elif out.request_id in self.active_requests:
                         if out.type == "result":
                             await self.route_result(out.request_id, out.data)
@@ -1698,21 +1766,30 @@ class Stage:
             return
         else:
             pass
-        if session_operation is not None:
+        actual = self.get_next(request_id, result)
+        is_forwarded_at_admission = False
+        if session_operation is None:
+            pass
+        else:
             owners = session_operation.stages
-            if self.name not in owners or self.stream_targets:
+            if self.name in owners:
+                index = owners.index(self.name)
+            else:
+                await self.send_failure(
+                    request_id, "session route must use fixed, linear payload edges"
+                )
+                return
+            if index + 1 < len(owners):
+                expected = self.logical_source(owners[index + 1])
+            else:
+                expected = None
+            if any(target != expected for target in self.stream_targets):
                 await self.send_failure(
                     request_id, "session route must use fixed, linear payload edges"
                 )
                 return
             else:
                 pass
-            index = owners.index(self.name)
-            if index + 1 < len(owners):
-                expected = self.logical_source(owners[index + 1])
-            else:
-                expected = None
-            actual = self.get_next(request_id, result)
             if isinstance(actual, list) and len(actual) == 1:
                 actual_target = actual[0]
             else:
@@ -1723,16 +1800,10 @@ class Stage:
                 )
                 return
             else:
-                pass
-        else:
-            pass
+                is_forwarded_at_admission = expected in self.stream_targets
         if on_submitted is not None:
             # Claim before any stream completion, so a refused result sends none.
-            next_stages = (
-                self.get_next(request_id, result)
-                if session_operation is None
-                else actual
-            )
+            next_stages = actual
             if not self.result_owner.claim_result(result, terminal=next_stages is None):
                 return
             else:
@@ -1761,14 +1832,12 @@ class Stage:
                 is_done=True,
             )
 
-        if on_submitted is None:
-            next_stages = (
-                self.get_next(request_id, result)
-                if session_operation is None
-                else actual
-            )
+        if is_forwarded_at_admission:
+            self.clear_request_state(request_id)
+            return
         else:
             pass
+        next_stages = actual
         routes_to_self = False
         keeps_state = False
         if next_stages is None:
@@ -2421,6 +2490,7 @@ class Stage:
         await self.control_plane.send_stream(msg)
 
     async def send_failure(self, request_id: str, error: str) -> None:
+        self.finish_stage_metrics(request_id, "error")
         self.record_aborted_request_id(request_id)
         if not self.owns_external_io:
             self.clear_request_state(request_id)
@@ -2439,9 +2509,27 @@ class Stage:
         finally:
             self.clear_request_state(request_id)
 
+    def finish_stage_metrics(self, request_id: str, outcome: str) -> None:
+        started = self.metrics_started.pop(request_id, None)
+        if started is not None:
+            self.scheduler.outbox.put(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="metrics",
+                    data={
+                        "event": "stage",
+                        "duration": time.perf_counter() - started,
+                        "outcome": outcome,
+                    },
+                )
+            )
+        else:
+            pass
+
     def clear_request_state(
         self, request_id: str, *, keep_replica_bindings: bool = False
     ) -> None:
+        self.finish_stage_metrics(request_id, "completed")
         self.active_requests.discard(request_id)
         self.input_handler.cancel(request_id)
         if self.stream_queue is not None:
@@ -2516,6 +2604,7 @@ class Stage:
             pass
 
     def on_abort(self, request_id: str) -> None:
+        self.finish_stage_metrics(request_id, "aborted")
         self.record_aborted_request_id(request_id)
         self.comm.cleanup(request_id)
         self.clear_request_state(request_id)
