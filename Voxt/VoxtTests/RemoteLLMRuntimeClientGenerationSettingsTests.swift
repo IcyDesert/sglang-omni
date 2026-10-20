@@ -2,6 +2,26 @@ import XCTest
 @testable import Voxt
 
 final class RemoteLLMRuntimeClientGenerationSettingsTests: XCTestCase {
+    func testOpenAIChatReasoningModelUsesChatTokenLimitAndEffortFields() throws {
+        let client = RemoteLLMRuntimeClient()
+        let configuration = RemoteProviderConfiguration(
+            providerID: "openAI", model: "gpt-5.2", endpoint: "https://api.openai.com/v1/responses", apiKey: "fixture",
+            openAIAPIFormat: OpenAIAPIFormat.chatCompletions.rawValue,
+            generationSettings: LLMGenerationSettings(maxOutputTokens: 8192, thinking: .init(mode: .effort, effort: "high", budgetTokens: nil, exposeReasoning: false))
+        )
+        let request = try client.makeCompletionRequest(
+            provider: .openAI,
+            runtimeConfiguration: RemoteModelConfigurationStore.runtimeConfiguration(for: configuration),
+            endpointValue: configuration.endpoint, model: configuration.model,
+            systemPrompt: "Clean text.", userPrompt: "raw", tuning: .init(maxTokens: 128, temperature: 0.2, topP: 0.9), streamingEnabled: false
+        )
+        let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/chat/completions")
+        XCTAssertEqual(payload["max_completion_tokens"] as? Int, 8192)
+        XCTAssertEqual(payload["reasoning_effort"] as? String, "high")
+        XCTAssertEqual(payload["messages"] as? [[String: String]], [["role": "system", "content": "Clean text."], ["role": "user", "content": "raw"]])
+        for field in ["max_tokens", "max_output_tokens", "input", "instructions", "reasoning", "temperature", "top_p"] { XCTAssertNil(payload[field], field) }
+    }
     func testOpenAICompatiblePayloadOmitsResponseFormatByDefault() {
         let client = RemoteLLMRuntimeClient()
 

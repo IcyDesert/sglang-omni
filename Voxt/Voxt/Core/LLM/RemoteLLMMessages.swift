@@ -110,12 +110,15 @@ extension RemoteLLMRuntimeClient {
             if configuration.codexFastModeEnabled {
                 payload["service_tier"] = "priority"
             }
-        } else if provider != .openAI || generationSettings.maxOutputTokens != nil {
+        } else if !configuration.usesCustomOpenAIEndpoint || generationSettings.maxOutputTokens != nil {
             payload["max_output_tokens"] = maxOutputTokens
         }
         if provider != .openAI && provider != .codex {
             payload["temperature"] = tuning.temperature
             payload["top_p"] = tuning.topP
+        } else if configuration.usesCustomOpenAIEndpoint {
+            if let temperature = generationSettings.temperature { payload["temperature"] = temperature }
+            if let topP = generationSettings.topP { payload["top_p"] = topP }
         }
 
         let trimmedSystemPrompt = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -263,8 +266,7 @@ extension RemoteLLMRuntimeClient {
             if settings.thinking.mode == .effort,
                let effort = settings.thinking.effort?.trimmingCharacters(in: .whitespacesAndNewlines),
                !effort.isEmpty {
-                if let host = URL(string: configuration.endpoint)?.host,
-                   host.lowercased() != "api.openai.com" {
+                if configuration.usesCustomOpenAIEndpoint {
                     return effort
                 }
                 if OpenAIReasoningEffort.apiValue(selection: effort, model: model) != nil {

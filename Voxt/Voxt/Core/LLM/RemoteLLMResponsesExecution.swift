@@ -29,7 +29,7 @@ extension RemoteLLMRuntimeClient {
         let model = configuration.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? provider.suggestedModel
             : configuration.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let endpointValue = responsesEndpointValue(provider: provider, endpoint: configuration.endpoint, model: model)
+        let endpointValue = responsesEndpointValue(provider: provider, endpoint: configuration.endpoint, model: model, apiFormat: configuration.openAIAPIFormatValue)
         let tuning = generationTuning(
             for: provider,
             inputTextLength: inputTextLength,
@@ -71,7 +71,8 @@ extension RemoteLLMRuntimeClient {
                         provider: provider,
                         usesResponsesAPI: true,
                         tuning: tuning,
-                        configuredMaxOutputTokens: configuration.effectiveGenerationSettings(provider: provider).maxOutputTokens
+                        configuredMaxOutputTokens: configuration.effectiveGenerationSettings(provider: provider).maxOutputTokens,
+                        endpoint: configuration.endpoint
                     )
                 )
                 return try await completeResponsesStreaming(
@@ -121,7 +122,8 @@ extension RemoteLLMRuntimeClient {
                 provider: provider,
                 usesResponsesAPI: true,
                 tuning: tuning,
-                configuredMaxOutputTokens: configuration.effectiveGenerationSettings(provider: provider).maxOutputTokens
+                configuredMaxOutputTokens: configuration.effectiveGenerationSettings(provider: provider).maxOutputTokens,
+                endpoint: configuration.endpoint
             )
         )
 

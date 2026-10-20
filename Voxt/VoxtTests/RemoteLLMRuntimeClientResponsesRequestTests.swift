@@ -2,6 +2,40 @@ import XCTest
 @testable import Voxt
 
 final class RemoteLLMRuntimeClientResponsesRequestTests: XCTestCase {
+    func testCustomResponsesPreservesExplicitSamplingFields() throws {
+        let request = try RemoteLLMRuntimeClient().makeResponsesRequest(
+            provider: .openAI, endpointValue: "https://inference.example/v1/responses", model: "custom-model",
+            systemPrompt: "", inputPayload: "raw",
+            configuration: RemoteProviderConfiguration(
+                providerID: "openAI", model: "custom-model", endpoint: "https://inference.example/v1/responses", apiKey: "fixture",
+                generationSettings: LLMGenerationSettings(temperature: 0.2, topP: 0.95)
+            ),
+            previousResponseID: nil, tuning: .init(maxTokens: 128, temperature: 0.2, topP: 0.9), textFormat: nil, streamingEnabled: false
+        )
+        let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(payload["temperature"] as? Double, 0.2)
+        XCTAssertEqual(payload["top_p"] as? Double, 0.95)
+        XCTAssertNil(payload["max_output_tokens"])
+    }
+    func testOfficialOpenAIResponsesPayloadKeepsExistingDefaults() throws {
+        let request = try RemoteLLMRuntimeClient().makeResponsesRequest(
+            provider: .openAI,
+            endpointValue: "https://api.openai.com/v1/responses",
+            model: "gpt-5.2",
+            systemPrompt: "Clean the transcription.",
+            inputPayload: "hello",
+            configuration: TestFactories.makeRemoteConfiguration(providerID: "openAI", model: "gpt-5.2"),
+            previousResponseID: nil,
+            tuning: .init(maxTokens: 128, temperature: 0.2, topP: 0.9),
+            textFormat: nil,
+            streamingEnabled: false
+        )
+        let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+        XCTAssertEqual(payload as NSDictionary, [
+            "model": "gpt-5.2", "stream": false, "max_output_tokens": 128,
+            "instructions": "Clean the transcription.", "input": "hello"
+        ] as NSDictionary)
+    }
     /// A short transcription exhausted its inferred output limit before the reasoning model emitted text.
     func testOpenAIResponsesLeavesDefaultOutputBudgetToServer() throws {
         let client = RemoteLLMRuntimeClient()
@@ -62,7 +96,8 @@ final class RemoteLLMRuntimeClientResponsesRequestTests: XCTestCase {
                 provider: .openAI,
                 usesResponsesAPI: true,
                 tuning: .init(maxTokens: 128, temperature: 0.2, topP: 0.9),
-                configuredMaxOutputTokens: 8192
+                configuredMaxOutputTokens: 8192,
+                endpoint: "https://inference.example/v1/responses"
             ), "8192")
         }
     }
