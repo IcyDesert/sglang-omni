@@ -78,8 +78,8 @@ class DotsTTSPipelineConfig(PipelineConfig):
         ),
     ]
 
-    def check_conflicts(self) -> None:
-        super().check_conflicts()
+    def check_local_conflicts(self) -> None:
+        super().check_local_conflicts()
         if any(stage.tp_size != 1 for stage in self.stages):
             raise ValueError("dots.tts currently supports tp_size=1 only")
         else:

@@ -123,8 +123,8 @@ class AudioSessionPipelineConfig(PipelineConfig):
             ],
         }
 
-    def check_conflicts(self) -> None:
-        super().check_conflicts()
+    def check_local_conflicts(self) -> None:
+        super().check_local_conflicts()
         self.session_graph()
 
     def model_configs(self) -> list[PipelineConfig]:

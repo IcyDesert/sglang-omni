@@ -12,6 +12,7 @@ from sglang_omni.config import (
     PipelineConfig,
     StageConfig,
 )
+from sglang_omni.config.base import ConfigModel
 
 PKG = "sglang_omni.models.minicpm_o.native_stages"
 DEFAULT_MAX_SESSIONS = 2
@@ -85,7 +86,7 @@ class MiniCPMODuplexSampling(BaseModel):
     talker_repetition_penalty: float = Field(default=1.05, ge=1)
 
 
-class MiniCPMODuplexVision(BaseModel):
+class MiniCPMODuplexVision(ConfigModel):
     """Per-unit image limits; each frame costs one overview tile plus its slices."""
 
     model_config = ConfigDict(extra="forbid")
@@ -95,7 +96,7 @@ class MiniCPMODuplexVision(BaseModel):
     max_slice_nums: int = Field(default=1, ge=1)
     max_slice_nums_limit: int = Field(default=9, ge=1, le=9)
 
-    def check_conflicts(self) -> None:
+    def check_local_conflicts(self) -> None:
         if self.max_slice_nums > self.max_slice_nums_limit:
             raise ValueError("max_slice_nums exceeds max_slice_nums_limit")
         elif self.max_slice_nums_limit > 1 and (
@@ -142,10 +143,6 @@ class MiniCPMODuplexPipelineConfig(PipelineConfig):
         "sglang_omni.models.minicpm_o.session_adapters.build_realtime_deployment"
     )
     is_realtime_only: ClassVar[bool] = True
-
-    def check_conflicts(self) -> None:
-        super().check_conflicts()
-        self.vision.check_conflicts()
 
     def stage_factory_kwargs(self, stage_name: str) -> dict[str, JsonValue]:
         request_slots = (

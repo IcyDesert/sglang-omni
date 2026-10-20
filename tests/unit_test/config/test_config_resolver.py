@@ -10,7 +10,9 @@ is covered at the bottom.
 from __future__ import annotations
 
 import pytest
+from pydantic import BaseModel
 
+from sglang_omni.config.base import ConfigModel
 from sglang_omni.config.compat import canonicalize_dotted_key
 from sglang_omni.config.patch import (
     ConfigPatch,
@@ -20,13 +22,58 @@ from sglang_omni.config.patch import (
 )
 from sglang_omni.config.path import ConfigPathError
 from sglang_omni.config.resolver import ConfigResolver, diff_configs
-from sglang_omni.config.schema import PipelineConfig
+from sglang_omni.config.schema import EngineArgs, PipelineConfig
 
 MEM_FRACTION = "stages.thinker.engine.mem_fraction_static"
 
 YAML = ConfigSource(SourceKind.YAML_FILE, "configs/omni.yaml")
 CLI = ConfigSource(SourceKind.CLI_DOTTED, "command line")
 MODEL = ConfigSource(SourceKind.MODEL_DEFAULT, "FakeOmniConfig")
+
+
+class EngineWrapper(BaseModel):
+    engine: EngineArgs
+
+
+class NestedConfig(ConfigModel):
+    children: (
+        EngineWrapper
+        | list[EngineWrapper]
+        | dict[str, tuple[EngineWrapper, ...]]
+        | None
+    )
+    reject_parent: bool = False
+
+    def check_local_conflicts(self) -> None:
+        if self.reject_parent:
+            raise ValueError("parent conflict")
+        else:
+            pass
+
+
+@pytest.mark.parametrize("container", ["direct", "list", "dict_tuple"])
+def test_conflicts_recurse_through_models_and_containers(container):
+    """Nested engine conflicts must be found without parent forwarding methods."""
+    engine = EngineArgs(kv_cache_bytes="2GiB", mem_fraction_static=0.7)
+    wrapper = EngineWrapper(engine=engine)
+    children = {
+        "direct": wrapper,
+        "list": [wrapper],
+        "dict_tuple": {"group": (wrapper,)},
+    }[container]
+    config = NestedConfig(children=children, reject_parent=True)
+    before = config.model_dump()
+    with pytest.raises(ValueError, match="engine.kv_cache_bytes"):
+        config.check_conflicts()
+    assert config.model_dump() == before
+
+    engine.mem_fraction_static = None
+    with pytest.raises(ValueError, match="parent conflict"):
+        config.check_conflicts()
+    config.reject_parent = False
+    config.check_conflicts()
+    config.children = None
+    config.check_conflicts()
 
 
 def patchset(*patches: ConfigPatch) -> ConfigPatchSet:

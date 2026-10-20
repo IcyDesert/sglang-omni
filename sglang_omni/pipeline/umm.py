@@ -844,8 +844,8 @@ class UMMPipelineConfig(PipelineConfig):
         ), "final configuration validation checks max_active"
         return max_active
 
-    def check_conflicts(self) -> None:
-        super().check_conflicts()
+    def check_local_conflicts(self) -> None:
+        super().check_local_conflicts()
         cls = type(self)
         controller_name = cls.umm_controller_stage
         output_name = cls.umm_output_stage

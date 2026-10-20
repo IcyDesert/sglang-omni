@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.main import IncEx
 from typing_extensions import Unpack
 
+from sglang_omni.config.base import ConfigModel
 from sglang_omni.proto.session import (
     DEFAULT_MAX_OUTPUT_LEAD_MS,
     ControlEdge,
@@ -147,7 +148,7 @@ class EndpointsConfig(BaseModel):
     base_path: str = "/tmp/sglang_omni"
 
 
-class EngineArgs(BaseModel):
+class EngineArgs(ConfigModel):
     """SGLang ServerArgs overrides for one engine stage.
 
     The commonly tuned keys are declared so they validate and show up in path
@@ -185,7 +186,7 @@ class EngineArgs(BaseModel):
         else:
             pass
 
-    def check_conflicts(self) -> None:
+    def check_local_conflicts(self) -> None:
         """Check capacity settings after all configuration sources are merged."""
         if self.kv_cache_bytes is not None and self.mem_fraction_static is not None:
             raise ValueError(
@@ -367,7 +368,7 @@ def normalize_route_prefixes(stage: str, prefixes: Iterable[str]) -> tuple[str, 
     return tuple(out)
 
 
-class StageConfig(BaseModel):
+class StageConfig(ConfigModel):
     """Single pipeline stage configuration.
 
     Stage settings are grouped by consumer: fields at the top level are read
@@ -486,7 +487,7 @@ class StageConfig(BaseModel):
         else:
             pass
 
-    def check_conflicts(self) -> None:
+    def check_local_conflicts(self) -> None:
         """Check stage relationships only after source overrides are complete."""
         if self.runtime_gpu_ids is not None:
             if not self.allow_child_processes or self.tp_size != 1:
@@ -529,10 +530,6 @@ class StageConfig(BaseModel):
             )
         else:
             pass
-        if self.engine is not None:
-            self.engine.check_conflicts()
-        else:
-            pass
         if self.gpu is None:
             if self.tp_size > 1:
                 raise ValueError(
@@ -572,7 +569,7 @@ def default_max_concurrent_long_audio_requests(
     return max(1, max_running_requests // (2 * max(int(max_concurrent_chunks), 1)))
 
 
-class AudioChunkingConfig(BaseModel):
+class AudioChunkingConfig(ConfigModel):
     """Operator-tunable scheduling policy for long-audio transcription.
 
     These are the knobs a deployment may set (YAML or dotted CLI overrides).
@@ -587,7 +584,7 @@ class AudioChunkingConfig(BaseModel):
     max_concurrent_chunks: int = Field(default=8, ge=1)
     max_concurrent_long_audio_requests: int | None = Field(default=None, ge=1)
 
-    def check_conflicts(self) -> None:
+    def check_local_conflicts(self) -> None:
         if (
             self.max_total_audio_s is not None
             and self.max_total_audio_s < self.max_audio_clip_s
@@ -714,7 +711,7 @@ class SessionNodeConfig(BaseModel):
     )
 
 
-class PipelineConfig(BaseModel):
+class PipelineConfig(ConfigModel):
     """Top-level pipeline configuration.
 
     Construction validates fields; call check_conflicts after the final resolve.
@@ -822,11 +819,8 @@ class PipelineConfig(BaseModel):
         else:
             pass
 
-    def check_conflicts(self) -> None:
+    def check_local_conflicts(self) -> None:
         """Validate the final configuration before inspection or launch."""
-        for stage in self.stages:
-            stage.check_conflicts()
-        self.audio_chunking.check_conflicts()
         self.validate_general()
         self.validate_processes()
 
