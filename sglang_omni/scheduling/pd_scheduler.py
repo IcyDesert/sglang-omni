@@ -219,6 +219,24 @@ class OmniPrefillScheduler(PDKVLifecycle):
                     req, transfer_id, self.pd_state_builder
                 )
                 source_page_indices = request_page_indices(self.req_to_token_pool, req)
+                source_buffer_page_indices = {}
+                if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+                    if req.kv.mamba_pool_idx is None:
+                        raise RuntimeError("hybrid Prefill request has no linear state")
+                    else:
+                        pass
+                    state_slot = int(
+                        self.req_to_token_pool.translate_mamba_indices(
+                            req.kv.mamba_pool_idx
+                        ).item()
+                    )
+                    source_buffer_page_indices = {
+                        buffer.name: (state_slot,)
+                        for buffer in self.kv_registrations[0][0].buffers
+                        if buffer.name.startswith("linear_state.")
+                    }
+                else:
+                    pass
                 metadata = {"decode_continuation": continuation.encode()}
             except Exception as exc:
                 terminal_error, _ = self.finalize_prefill_request(
@@ -245,17 +263,7 @@ class OmniPrefillScheduler(PDKVLifecycle):
                 source_pool_id=self.pd_pool_id,
                 target_pool_id=f"{self.pd_partner_stage}:kv",
                 source_page_indices=source_page_indices,
-                source_buffer_page_indices={
-                    buffer.name: (
-                        int(
-                            self.req_to_token_pool.translate_mamba_indices(
-                                req.kv.mamba_pool_idx
-                            ).item()
-                        ),
-                    )
-                    for buffer in self.kv_registrations[0][0].buffers
-                    if buffer.name.startswith("linear_state.")
-                },
+                source_buffer_page_indices=source_buffer_page_indices,
                 to_stage=self.pd_partner_stage,
                 metadata=metadata,
                 lease=self.lease_pd_kv(req),
