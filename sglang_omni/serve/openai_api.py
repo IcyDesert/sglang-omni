@@ -101,7 +101,7 @@ from sglang_omni.http.admin_auth import (
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.proto.admin import AdminResponse
 from sglang_omni.serve.diarizations import register_diarizations
-from sglang_omni.serve.image_api import ImageApiRegistrar
+from sglang_omni.serve.image_response import ImageApiRegistrar
 from sglang_omni.serve.metrics import MetricsMiddleware
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (

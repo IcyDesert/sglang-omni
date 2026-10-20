@@ -31,45 +31,48 @@ logger = logging.getLogger(__name__)
 
 
 def register_image_generations(app: FastAPI) -> None:
-    """Expose the native SenseNova T2I stage as a minimal Images API."""
+    """Expose SenseNova text-to-image generation as a minimal Images API."""
 
     @app.post("/v1/images/generations", response_model=ImageGenerationResponse)
     async def image_generations(
-        req: ImageGenerationRequest, request: Request
+        image_request: ImageGenerationRequest, request: Request
     ) -> ImageGenerationResponse:
-        if req.model is not None and req.model != app.state.model_name:
+        if (
+            image_request.model is not None
+            and image_request.model != app.state.model_name
+        ):
             raise HTTPException(status_code=400, detail="Unknown image model")
         else:
             pass
         try:
-            width, height = parse_image_size(req.size)
+            width, height = parse_image_size(image_request.size)
             params = {
                 "width": width,
                 "height": height,
-                "num_inference_steps": req.num_inference_steps,
-                "guidance_scale": req.guidance_scale,
-                "seed": req.seed,
-                "n": req.n,
+                "num_inference_steps": image_request.num_inference_steps,
+                "guidance_scale": image_request.guidance_scale,
+                "seed": image_request.seed,
+                "n": image_request.n,
             }
-            if req.enable_cache_dit is not None:
-                params["enable_cache_dit"] = req.enable_cache_dit
+            if image_request.enable_cache_dit is not None:
+                params["enable_cache_dit"] = image_request.enable_cache_dit
             else:
                 pass
-            if req.cache_dit_params is not None:
-                params["cache_dit_params"] = req.cache_dit_params
+            if image_request.cache_dit_params is not None:
+                params["cache_dit_params"] = image_request.cache_dit_params
             else:
                 pass
             SenseNovaU1Sampling.from_params(params)
-            if not req.prompt.strip():
+            if not image_request.prompt.strip():
                 raise ValueError("SenseNova-U1 requires a non-empty text prompt")
             else:
                 pass
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        gen_req = GenerateRequest(
+        generate_request = GenerateRequest(
             model=app.state.model_name,
-            prompt=req.prompt,
+            prompt=image_request.prompt,
             extra_params=params,
             output_modalities=["image"],
             stream=False,
@@ -77,30 +80,28 @@ def register_image_generations(app: FastAPI) -> None:
         request_id = str(uuid.uuid4())
         try:
             chunk = await image_result_with_disconnect_watch(
-                request, app.state.client, gen_req, request_id
+                request, app.state.client, generate_request, request_id
             )
-            images = chunk.images_b64 or (
+            encoded_outputs = chunk.images_b64 or (
                 [chunk.image_b64] if chunk.image_b64 is not None else []
             )
-            if len(images) != req.n:
+            if len(encoded_outputs) != image_request.n:
                 raise RuntimeError(
-                    f"SenseNova-U1 expected {req.n} images, got {len(images)}"
+                    f"SenseNova-U1 expected {image_request.n} images, "
+                    f"got {len(encoded_outputs)}"
                 )
             else:
                 pass
-            return build_image_response(images, chunk.image_usage)
+            return build_image_response(encoded_outputs, chunk.image_usage)
         except Exception as exc:
             logger.exception(f"Image generation failed for request {request_id}")
-            status_code = (
-                400
-                if isinstance(exc, ValueError)
-                else generation_error_status_code(exc)
-            )
-            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=generation_error_status_code(exc), detail=str(exc)
+            ) from exc
 
 
 def register_image_edits(app: FastAPI) -> None:
-    """Expose SenseNova's native I2I path."""
+    """Expose SenseNova image editing as a minimal Images API."""
 
     @app.post("/v1/images/edits", response_model=ImageGenerationResponse)
     async def image_edits(
@@ -154,9 +155,8 @@ def register_image_edits(app: FastAPI) -> None:
                 raise ValueError("SenseNova-U1 n must be an integer between 1 and 10")
             else:
                 pass
-            num_outputs = n
             params = {"n": 1, "size_explicit": size is not None}
-            if enable_cache_dit is not None and enable_cache_dit:
+            if enable_cache_dit:
                 normalized_cache_dit = enable_cache_dit.strip().lower()
                 if normalized_cache_dit in ("true", "1", "yes", "on"):
                     params["enable_cache_dit"] = True
@@ -190,39 +190,42 @@ def register_image_edits(app: FastAPI) -> None:
                     params[name] = value
                 else:
                     pass
-            options = SenseNovaU1ImageEditSampling.from_params(params)
+            edit_sampling = SenseNovaU1ImageEditSampling.from_params(params)
             params.update(
-                width=options.width,
-                height=options.height,
-                num_inference_steps=options.num_inference_steps,
-                guidance_scale=options.guidance_scale,
-                img_cfg_scale=options.img_cfg_scale,
-                seed=options.seed,
+                width=edit_sampling.width,
+                height=edit_sampling.height,
+                num_inference_steps=edit_sampling.num_inference_steps,
+                guidance_scale=edit_sampling.guidance_scale,
+                img_cfg_scale=edit_sampling.img_cfg_scale,
+                seed=edit_sampling.seed,
             )
             if not prompt.strip():
                 raise ValueError("SenseNova-U1 requires a non-empty image edit prompt")
             else:
                 pass
-            image_bytes = [await read_image_edit_upload(upload) for upload in uploads]
+            reference_images = [
+                await read_image_edit_upload(upload) for upload in uploads
+            ]
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        encoded_images = [
-            base64.b64encode(item).decode("ascii") for item in image_bytes
+        encoded_references = [
+            base64.b64encode(reference_image).decode("ascii")
+            for reference_image in reference_images
         ]
-        data = []
+        encoded_outputs = []
         image_usage = None
         parent_request_id = str(uuid.uuid4())
         try:
-            for output_index in range(num_outputs):
+            for output_index in range(n):
                 output_params = dict(params)
-                output_params["seed"] = options.seed + output_index
-                gen_req = GenerateRequest(
+                output_params["seed"] = edit_sampling.seed + output_index
+                generate_request = GenerateRequest(
                     model=app.state.model_name,
                     prompt={
                         "task": "image_edit",
                         "prompt": prompt,
-                        "image_b64": encoded_images,
+                        "image_b64": encoded_references,
                     },
                     extra_params=output_params,
                     output_modalities=["image"],
@@ -230,7 +233,7 @@ def register_image_edits(app: FastAPI) -> None:
                 )
                 request_id = f"{parent_request_id}:{output_index}"
                 chunk = await image_result_with_disconnect_watch(
-                    request, app.state.client, gen_req, request_id
+                    request, app.state.client, generate_request, request_id
                 )
                 if chunk.image_b64 is None:
                     raise RuntimeError("SenseNova-U1 generated no image")
@@ -240,22 +243,13 @@ def register_image_edits(app: FastAPI) -> None:
                     image_usage = chunk.image_usage
                 else:
                     pass
-                data.append(chunk.image_b64)
+                encoded_outputs.append(chunk.image_b64)
         except Exception as exc:
             logger.exception(f"Image edit failed for request {parent_request_id}")
-            status_code = (
-                400
-                if isinstance(exc, ValueError)
-                else generation_error_status_code(exc)
-            )
-            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-        if len(data) != num_outputs:
             raise HTTPException(
-                status_code=500, detail="SenseNova-U1 returned no result"
-            )
-        else:
-            pass
-        return build_image_response(data, image_usage)
+                status_code=generation_error_status_code(exc), detail=str(exc)
+            ) from exc
+        return build_image_response(encoded_outputs, image_usage)
 
 
 def register_images_api(app: FastAPI) -> None:

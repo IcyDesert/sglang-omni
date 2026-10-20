@@ -76,6 +76,15 @@ def test_request_id_conflicts_are_bad_requests() -> None:
         assert is_bad_request_error(RuntimeError(message))
 
 
+def test_sensenova_reference_oom_is_bad_request() -> None:
+    """Stage errors reach the endpoint as RuntimeError, so the message decides."""
+    error = RuntimeError(
+        "SenseNova-U1 I2I with 3 reference images exceeds GPU memory; "
+        "reduce references or lower generate.factory.dit_layerwise_resident_layers"
+    )
+    assert is_bad_request_error(error)
+
+
 def test_an_unrelated_failure_stays_internal() -> None:
     for message in (
         "CUDA out of memory",

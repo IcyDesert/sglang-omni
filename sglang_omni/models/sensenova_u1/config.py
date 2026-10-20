@@ -8,11 +8,7 @@ from typing import Annotated, ClassVar, Literal
 from pydantic import Field
 
 from sglang_omni.config.runtime import resolve_stage_typed_kwargs
-from sglang_omni.config.schema import (
-    FactoryArgs,
-    FactoryDefault,
-    StageConfig,
-)
+from sglang_omni.config.schema import FactoryArgs, FactoryDefault, StageConfig
 from sglang_omni.models.sensenova_u1.admission import DEFAULT_UMM_ADMISSION_LIMITS
 from sglang_omni.pipeline.umm import (
     CONTROLLER_FACTORY_PATH,
@@ -54,7 +50,7 @@ class SenseNovaGenerationStageConfig(StageConfig):
 
 class SenseNovaU1PipelineConfig(UMMPipelineConfig):
     architecture: ClassVar[str] = "NEOChatModel"
-    images_api: ClassVar[str] = (
+    image_api_registrar: ClassVar[str] = (
         "sglang_omni.models.sensenova_u1.images_api.register_images_api"
     )
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {

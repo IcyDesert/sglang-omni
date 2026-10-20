@@ -670,9 +670,9 @@ async def run_server(
             ] * num_replicas
         cl_kwargs = client_kwargs or {}
         client = Client(coordinator, **cl_kwargs)
-        images_api = type(pipeline_config).images_api
+        registrar_path = type(pipeline_config).image_api_registrar
         image_api_registrar = (
-            import_string(images_api) if images_api is not None else None
+            import_string(registrar_path) if registrar_path is not None else None
         )
         deployment_factory = type(pipeline_config).realtime_deployment_factory
         if enable_realtime and deployment_factory is not None:

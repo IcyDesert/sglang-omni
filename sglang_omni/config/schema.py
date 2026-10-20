@@ -674,7 +674,8 @@ class PipelineConfig(BaseModel):
     requires_model_capabilities: ClassVar[bool] = False
     freeze_api_gc_on_startup: ClassVar[bool] = False
     supports_image_api: ClassVar[bool] = False
-    images_api: ClassVar[str | None] = None
+    # Import path of the function that mounts this model's Images API routes; None mounts none.
+    image_api_registrar: ClassVar[str | None] = None
     tensor_parallel_disable_custom_all_reduce_stages: ClassVar[tuple[str, ...]] = ()
     required_speech_reference_count: ClassVar[int | None] = None
     speech_reference_text_required: ClassVar[bool] = False

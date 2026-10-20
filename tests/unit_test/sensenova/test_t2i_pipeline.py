@@ -18,12 +18,12 @@ from sglang_omni.config import FactoryArgs, ProcessConfig
 from sglang_omni.config.manager import resolve_config_cls_for_model_path
 from sglang_omni.config.topology import compile_logical_processes
 from sglang_omni.models.sensenova_u1.config import SenseNovaU1PipelineConfig
-from sglang_omni.models.sensenova_u1.images_api import register_images_api
 from sglang_omni.models.sensenova_u1.generation import (
     generate_image,
     generate_images,
     text_to_image_options,
 )
+from sglang_omni.models.sensenova_u1.images_api import register_images_api
 from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
 from sglang_omni.models.sensenova_u1.stages import (
     image_generation_batch_key,
@@ -32,6 +32,7 @@ from sglang_omni.models.sensenova_u1.stages import (
 from sglang_omni.pipeline.replicas import expand_replica_stages
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.serve.openai_api import create_app, image_result_with_disconnect_watch
+from sglang_omni.utils.imports import import_string
 
 
 @pytest.mark.asyncio
@@ -622,7 +623,11 @@ class MultipleOutputImageEditClient:
 
 def test_image_api_exposes_image_only_for_sensenova():
     app = create_app(
-        ImageClient(), model_name="sensenova", image_api_registrar=register_images_api
+        ImageClient(),
+        model_name="sensenova",
+        image_api_registrar=import_string(
+            SenseNovaU1PipelineConfig.image_api_registrar
+        ),
     )
     client = TestClient(app)
     response = client.post(
