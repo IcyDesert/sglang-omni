@@ -146,6 +146,12 @@ extension RemoteLLMRuntimeClient {
             if settings.maxOutputTokens == nil { payload.removeValue(forKey: "max_tokens") }
             if settings.temperature == nil { payload.removeValue(forKey: "temperature") }
             if settings.topP == nil { payload.removeValue(forKey: "top_p") }
+            if let verbosity = OpenAITextVerbosity.apiValue(
+                selection: configuration.openAITextVerbosity,
+                model: configuration.model
+            ) {
+                payload["verbosity"] = verbosity
+            }
             if settings.thinking.mode == .effort,
                let effort = settings.thinking.effort?.trimmingCharacters(in: .whitespacesAndNewlines),
                !effort.isEmpty,

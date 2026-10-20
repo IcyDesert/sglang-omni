@@ -2,6 +2,45 @@ import XCTest
 @testable import Voxt
 
 final class RemoteLLMRuntimeClientGenerationSettingsTests: XCTestCase {
+    func testOpenAIChatRequestsPreserveSupportedVerbosityForStreamingAndNonStreaming() throws {
+        let client = RemoteLLMRuntimeClient()
+        let cases: [(model: String, selection: String, expected: String?)] = [
+            ("gpt-5.2", "low", "low"),
+            ("gpt-5.2", "medium", "medium"),
+            ("gpt-5.2", "high", "high"),
+            ("gpt-5.2", "automatic", nil),
+            ("gpt-5.2", "invalid", nil),
+            ("gpt-4o", "high", nil),
+            ("custom-reasoning-model", "high", nil)
+        ]
+        for testCase in cases {
+            for streaming in [false, true] {
+                let configuration = RemoteProviderConfiguration(
+                    providerID: RemoteLLMProvider.openAI.rawValue,
+                    model: testCase.model,
+                    endpoint: "https://api.openai.com/v1/chat/completions",
+                    apiKey: "fixture",
+                    openAIAPIFormat: OpenAIAPIFormat.chatCompletions.rawValue,
+                    openAITextVerbosity: testCase.selection
+                )
+                let request = try client.makeCompletionRequest(
+                    provider: .openAI,
+                    runtimeConfiguration: RemoteModelConfigurationStore.runtimeConfiguration(for: configuration),
+                    endpointValue: configuration.endpoint,
+                    model: configuration.model,
+                    systemPrompt: "Clean text.",
+                    userPrompt: "raw",
+                    tuning: .init(maxTokens: 128, temperature: 0.2, topP: 0.9),
+                    streamingEnabled: streaming
+                )
+                let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+                XCTAssertEqual(payload["verbosity"] as? String, testCase.expected, "\(testCase.model), \(testCase.selection), stream=\(streaming)")
+                XCTAssertNil(payload["text"])
+                XCTAssertEqual(payload["stream"] as? Bool, streaming)
+            }
+        }
+    }
+
     func testOpenAIChatReasoningModelUsesChatTokenLimitAndEffortFields() throws {
         let client = RemoteLLMRuntimeClient()
         let configuration = RemoteProviderConfiguration(
