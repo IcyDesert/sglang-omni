@@ -2,7 +2,34 @@
 """Read host-side SGLang scheduler statistics without device synchronization."""
 
 import time
-from typing import Protocol, TypedDict
+from typing import Literal, Protocol, TypedDict
+
+
+class QueueMetricEvent(TypedDict):
+    event: Literal["queue"]
+    duration: float
+
+
+class BatchMetricEvent(TypedDict):
+    event: Literal["batch"]
+    size: int
+
+
+class ExecutionMetricEvent(TypedDict):
+    event: Literal["execution"]
+    duration: float
+    outcome: Literal["completed", "aborted", "error"]
+
+
+class StageMetricEvent(TypedDict):
+    event: Literal["stage"]
+    duration: float
+    outcome: Literal["completed", "aborted", "error"]
+
+
+SchedulerMetricEvent = (
+    QueueMetricEvent | BatchMetricEvent | ExecutionMetricEvent | StageMetricEvent
+)
 
 
 class MetricsSnapshotSource(Protocol):
@@ -91,8 +118,7 @@ def engine_metrics_snapshot(
             values["gen_throughput"] = throughput(time.perf_counter())
         else:
             pass
-        # Prefix-cache statistics are maintained by the backend, not inferred
-        # from completed HTTP usage or the current contents of the KV pool.
+        # Prefix-cache statistics are maintained by the backend, not inferred from completed HTTP usage or the current contents of the KV pool.
         if getattr(scheduler, "enable_metrics", False):
             values["cache_hit_rate"] = reporter.stats.cache_hit_rate
         else:

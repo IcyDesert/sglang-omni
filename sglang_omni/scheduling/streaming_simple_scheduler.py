@@ -462,17 +462,6 @@ class StreamingSimpleScheduler:
         with self.metrics_lock:
             self.metrics_waiting.difference_update(request_ids)
             self.metrics_running.update(request_ids)
-        try:
-            self.handle_new_request_batch_untracked(batch, loop)
-        finally:
-            with self.metrics_lock:
-                self.metrics_running.difference_update(request_ids)
-
-    def handle_new_request_batch_untracked(
-        self,
-        batch: list[IncomingMessage],
-        loop: asyncio.AbstractEventLoop | None = None,
-    ) -> None:
         owns_loop = loop is None
         if loop is None:
             loop = asyncio.new_event_loop()
@@ -485,6 +474,8 @@ class StreamingSimpleScheduler:
                 loop.close()
             else:
                 pass
+            with self.metrics_lock:
+                self.metrics_running.difference_update(request_ids)
 
     def handle_new_request_batch_with_loop(
         self,
@@ -656,53 +647,47 @@ class StreamingSimpleScheduler:
         with self.metrics_lock:
             self.metrics_running.add(request_id)
         try:
-            self.handle_stream_chunk_untracked(request_id, item)
+            item = self.validate_stream_chunk_item(request_id, item)
+            with self.state_lock:
+                for out in self.on_stream_chunk(request_id, item):
+                    if not self.is_aborted(request_id):
+                        self.outbox.put(out)
+                    else:
+                        pass
         finally:
             with self.metrics_lock:
                 self.metrics_running.discard(request_id)
-
-    def handle_stream_chunk_untracked(self, request_id: str, item: object) -> None:
-        item = self.validate_stream_chunk_item(request_id, item)
-        with self.state_lock:
-            for out in self.on_stream_chunk(request_id, item):
-                if not self.is_aborted(request_id):
-                    self.outbox.put(out)
-                else:
-                    pass
 
     def handle_stream_chunk_batch(self, batch: list[IncomingMessage]) -> None:
         request_ids = {message.request_id for message in batch}
         with self.metrics_lock:
             self.metrics_running.update(request_ids)
         try:
-            self.handle_stream_chunk_batch_untracked(batch)
+            items: list[tuple[str, StreamItem]] = []
+            for msg in batch:
+                if self.is_aborted(msg.request_id):
+                    continue
+                else:
+                    pass
+                try:
+                    item = self.validate_stream_chunk_item(msg.request_id, msg.data)
+                except Exception as exc:
+                    self.emit_error(msg.request_id, exc)
+                    self.abort(msg.request_id)
+                    continue
+                items.append((msg.request_id, item))
+            items = [
+                (request_id, item)
+                for request_id, item in items
+                if not self.is_aborted(request_id)
+            ]
+            if items:
+                self.on_stream_chunk_batch(items)
+            else:
+                pass
         finally:
             with self.metrics_lock:
                 self.metrics_running.difference_update(request_ids)
-
-    def handle_stream_chunk_batch_untracked(self, batch: list[IncomingMessage]) -> None:
-        items: list[tuple[str, StreamItem]] = []
-        for msg in batch:
-            if self.is_aborted(msg.request_id):
-                continue
-            else:
-                pass
-            try:
-                item = self.validate_stream_chunk_item(msg.request_id, msg.data)
-            except Exception as exc:
-                self.emit_error(msg.request_id, exc)
-                self.abort(msg.request_id)
-                continue
-            items.append((msg.request_id, item))
-        items = [
-            (request_id, item)
-            for request_id, item in items
-            if not self.is_aborted(request_id)
-        ]
-        if items:
-            self.on_stream_chunk_batch(items)
-        else:
-            pass
 
     def handle_stream_done(self, request_id: str) -> None:
         with self.state_lock:

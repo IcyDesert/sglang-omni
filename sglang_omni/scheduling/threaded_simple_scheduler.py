@@ -13,6 +13,7 @@ from collections.abc import Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Generic, TypeVar
 
+from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -220,8 +221,9 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
                 self.queued_aborts.add(msg.request_id)
             else:
                 pass
-            request = getattr(msg.data, "request", None)
-            if request is not None and request.metadata.get("omni_metrics_enabled"):
+            if isinstance(msg.data, StagePayload) and (
+                msg.data.request.metadata.get("omni_metrics_enabled")
+            ):
                 self.metrics_queued[msg.request_id] = time.perf_counter()
             else:
                 pass

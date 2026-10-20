@@ -9,19 +9,18 @@ from typing import Literal
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from sglang_omni.scheduling.metrics_snapshot import (
+    BatchMetricEvent,
+    ExecutionMetricEvent,
+    QueueMetricEvent,
+    SchedulerMetricEvent,
+    StageMetricEvent,
+)
 from sglang_omni.serve.metrics_registry import (
     BackendMetricsCollector,
     validate_metrics_environment,
 )
-from sglang_omni.serve.request_metrics import (
-    BatchMetricEvent,
-    ExecutionMetricEvent,
-    QueueMetricEvent,
-    RequestMetrics,
-    SchedulerMetricEvent,
-    StageMetricEvent,
-    TokenObservation,
-)
+from sglang_omni.serve.request_metrics import RequestMetrics, TokenObservation
 
 __all__ = [
     "BackendMetricsCollector",

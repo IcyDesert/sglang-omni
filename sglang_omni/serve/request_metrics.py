@@ -8,40 +8,13 @@ import time
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from dataclasses import dataclass
-from typing import Literal, TypedDict
 
 import sglang_omni.serve.metrics_registry as metrics_registry
 from sglang_omni.client.client import Client
 from sglang_omni.client.types import GenerateChunk, UMMGenerateChunk, UsageInfo
+from sglang_omni.scheduling.metrics_snapshot import SchedulerMetricEvent
 
 SCHEDULER_METRICS_TIMEOUT_S = 5.0
-
-
-class QueueMetricEvent(TypedDict):
-    event: Literal["queue"]
-    duration: float
-
-
-class BatchMetricEvent(TypedDict):
-    event: Literal["batch"]
-    size: int
-
-
-class ExecutionMetricEvent(TypedDict):
-    event: Literal["execution"]
-    duration: float
-    outcome: Literal["completed", "aborted", "error"]
-
-
-class StageMetricEvent(TypedDict):
-    event: Literal["stage"]
-    duration: float
-    outcome: Literal["completed", "aborted", "error"]
-
-
-SchedulerMetricEvent = (
-    QueueMetricEvent | BatchMetricEvent | ExecutionMetricEvent | StageMetricEvent
-)
 
 
 @dataclass
@@ -167,7 +140,7 @@ class RequestMetrics:
                 async for chunk in source:
                     observed_at_s = time.perf_counter()
                     finished_at_s = observed_at_s
-                    # note (Codex): Audio token counts must not inflate text usage.
+                    # note (syd520zy): Audio token counts must not inflate text usage.
                     usage_stage = chunk.text_usage_stage or chunk.stage_name
                     if chunk.modality == "text" or chunk.text_usage_stage is not None:
                         if not selected_text_stage and chunk.usage is not None:
@@ -241,7 +214,7 @@ class RequestMetrics:
                     self.audio_seconds.labels(self.model_name, stage).inc(seconds)
                 for stage, count in image_counts.items():
                     self.images.labels(self.model_name, stage).inc(count)
-            # note (Codex): Cache details and token counts must share a text stage.
+            # note (syd520zy): Cache details and token counts must share a text stage.
             details = (
                 usage.prompt_tokens_details
                 if usage is not None
@@ -270,7 +243,7 @@ class RequestMetrics:
                 pass
 
     async def refresh_scheduler(self, client: Client) -> None:
-        # note (Codex): Leader snapshots avoid double-counting TP worker metrics.
+        # note (syd520zy): Leader snapshots avoid double-counting TP worker metrics.
         async with self.scrape_lock:
             response = await asyncio.wait_for(
                 client.admin("metrics", timeout_s=SCHEDULER_METRICS_TIMEOUT_S),
@@ -319,7 +292,7 @@ class RequestMetrics:
         else:
             pass
         histogram = self.itl.labels(self.model_name)
-        # note (Codex): Weighted updates avoid acquiring one lock per token.
+        # note (syd520zy): Weighted updates avoid acquiring one lock per token.
         histogram._sum.inc(
             interval_s
         )  # noqa: leading-underscore - Prometheus weighted histogram update
