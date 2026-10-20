@@ -6,7 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from sglang_omni.client.image_media import InlineImage
+from sglang_omni.client.image_media import InlineImage, parse_image_usage
+from sglang_omni.client.types import ImageUsageDict
 from sglang_omni.models.sensenova_u1.admission import (
     ADMISSION_METADATA_KEY,
     DEFAULT_UMM_ADMISSION_LIMITS,
@@ -29,6 +30,7 @@ class SenseNovaImageResult(BaseModel):
     modality: Literal["image"]
     image_b64: str | None = None
     images_b64: list[str] | None = None
+    image_usage: ImageUsageDict | None = None
 
 
 @dataclass(kw_only=True)
@@ -82,12 +84,22 @@ class SenseNovaUMMAdapter:
         else:
             pass
         execution.reserved_output_bytes = 0
-        return UMMStep(
-            outputs=tuple(
-                UMMOutput("image", InlineImage.from_png(encoded_image).model_dump())
-                for encoded_image in images
-            )
+        outputs = tuple(
+            UMMOutput("image", InlineImage.from_png(encoded_image).model_dump())
+            for encoded_image in images
         )
+        image_usage = parse_image_usage(generation.image_usage)
+        if image_usage is not None:
+            outputs = (
+                *outputs,
+                UMMOutput(
+                    "usage",
+                    {"image_usage": image_usage, "stage_name": "generate"},
+                ),
+            )
+        else:
+            pass
+        return UMMStep(outputs=outputs)
 
     def usage(self, context: UMMContext) -> int:
         execution = self.executions.get(context.execution_id)

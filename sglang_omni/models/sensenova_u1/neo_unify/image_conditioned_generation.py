@@ -42,6 +42,7 @@ def it2i_generate(
     think_mode: bool = False,
     seed: int = 0,
     max_think_tokens: int = 1024,
+    usage: dict[str, int] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, str]:
     if getattr(self, "sensenova_compact_mode", False):
         raise RuntimeError(
@@ -126,6 +127,14 @@ def it2i_generate(
             )
         else:
             pass
+
+    if usage is not None:
+        usage["image_tokens"] = sum(
+            int(grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio**2)
+            for i in range(grid_hw.shape[0])
+        )
+    else:
+        pass
 
     input_embeds_condition, indexes_condition, attention_mask_condition_prefix = (
         self.build_it2i_inputs(tokenizer, query_condition, pixel_values, grid_hw)

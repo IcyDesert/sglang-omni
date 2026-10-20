@@ -503,6 +503,43 @@ def test_umm_image_segments_count_toward_generated_images() -> None:
     )
 
 
+def test_streamed_umm_usage_stage_labels_final_images() -> None:
+    metrics = RequestMetrics("test")
+
+    async def source() -> AsyncGenerator[GenerateChunk, None]:
+        yield UMMGenerateChunk(
+            request_id="r",
+            stage_name="generate",
+            segment=UMMSegment("execution", 0, "usage", {"stage_name": "generate"}),
+        )
+        yield UMMGenerateChunk(
+            request_id="r",
+            segments=[
+                UMMSegment("execution", 0, "image", {"kind": "image"}),
+                UMMSegment("execution", 1, "usage", None),
+            ],
+        )
+
+    async def run() -> list[GenerateChunk]:
+        return [item async for item in metrics.generate(source(), True)]
+
+    asyncio.run(run())
+    assert (
+        metrics.registry.get_sample_value(
+            "sglang_omni:generated_images_total",
+            {"model_name": "test", "stage": "generate"},
+        )
+        == 1
+    )
+    assert (
+        metrics.registry.get_sample_value(
+            "sglang_omni:generated_images_total",
+            {"model_name": "test", "stage": "unknown"},
+        )
+        is None
+    )
+
+
 def test_backend_export_preserves_types_and_excludes_duplicate_owned_names() -> None:
     metrics = RequestMetrics("test")
     metrics.backend.snapshots = [

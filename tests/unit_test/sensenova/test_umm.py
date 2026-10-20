@@ -40,7 +40,7 @@ pytest_plugins = ["tests.unit_test.fixtures.sensenova_umm"]
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("image_count", [1, 3])
-def test_outputs_survive_controller_completion(
+def test_outputs_and_usage_survive_controller_completion(
     controller: UMMController,
     encoded_images: list[str],
     streaming: bool,
@@ -50,27 +50,51 @@ def test_outputs_survive_controller_completion(
     phase = controller.transition(StagePayload("request", request, None))
     assert phase is not None
     assert phase.request.params["stream"] is False
-    phase.data = {"modality": "image", "images_b64": encoded_images[:image_count]}
+    phase.data = {
+        "modality": "image",
+        "images_b64": encoded_images[:image_count],
+        "image_usage": {"input_tokens": 3, "total_tokens": 3},
+    }
     result = controller.transition(phase)
     assert result is not None
     completion = Client.default_result_builder("request", result.data)
     assert isinstance(completion, UMMGenerateChunk)
+    if streaming:
+        assert completion.image_usage is None
+        assert completion.stage_name is None
+    else:
+        assert completion.image_usage == {"input_tokens": 3, "total_tokens": 3}
+        assert completion.stage_name == "generate"
     assert completion.segments is not None
     assert [segment.segment_index for segment in completion.segments] == list(
-        range(image_count)
+        range(image_count + 1)
     )
-    assert [segment.kind for segment in completion.segments] == ["image"] * image_count
+    assert [segment.kind for segment in completion.segments] == [
+        *(["image"] * image_count),
+        "usage",
+    ]
+    image_segments = [
+        segment for segment in completion.segments if segment.kind == "image"
+    ]
     if streaming:
-        segments = [controller.outbox.get_nowait().data for _ in range(image_count)]
+        segments = [controller.outbox.get_nowait().data for _ in range(image_count + 1)]
         assert all(segment.data is None for segment in completion.segments)
         assert [
             InlineImage.model_validate(segment["data"]).encoded_image()
             for segment in segments
+            if segment["kind"] == "image"
         ] == encoded_images[:image_count]
+        usage_segment = next(
+            segment for segment in segments if segment["kind"] == "usage"
+        )
+        assert usage_segment["data"]["image_usage"] == {
+            "input_tokens": 3,
+            "total_tokens": 3,
+        }
     else:
         assert [
             InlineImage.model_validate(segment.data).encoded_image()
-            for segment in completion.segments
+            for segment in image_segments
         ] == encoded_images[:image_count]
     assert not controller.contexts
     assert not controller.adapter.executions
@@ -87,6 +111,22 @@ def test_bad_result_releases_adapter_state(
     with pytest.raises(ValueError, match="output count"):
         controller.transition(phase)
     assert not controller.contexts
+    assert not controller.adapter.executions
+
+
+def test_usage_segment_counts_toward_output_budget(
+    controller: UMMController, encoded_image: str
+) -> None:
+    controller.limits = replace(controller.limits, max_outputs=1)
+    phase = controller.transition(StagePayload("request", OmniRequest("prompt"), None))
+    assert phase is not None
+    phase.data = {
+        "modality": "image",
+        "image_b64": encoded_image,
+        "image_usage": {"input_tokens": 3, "total_tokens": 3},
+    }
+    with pytest.raises(RuntimeError, match="max_outputs"):
+        controller.transition(phase)
     assert not controller.adapter.executions
 
 

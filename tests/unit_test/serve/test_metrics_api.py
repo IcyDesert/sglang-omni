@@ -1,12 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
+import base64
 import importlib
+import io
 import sys
+from collections.abc import AsyncGenerator
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import sglang_omni.serve.metrics_registry as metrics_module
 import sglang_omni.serve.openai_api as api_module
+from sglang_omni.client.client import Client
+from sglang_omni.client.image_media import InlineImage
+from sglang_omni.client.types import (
+    GenerateChunk,
+    GenerateRequest,
+    UMMGenerateChunk,
+    UMMSegment,
+)
+from sglang_omni.models.sensenova_u1.images_api import register_images_api
 from sglang_omni.scheduling.metrics_snapshot import MetricsAdminResponse
 from sglang_omni.serve.openai_api import create_app
 from sglang_omni.serve.request_metrics import RequestMetrics
@@ -113,6 +126,130 @@ def test_unmatched_paths_do_not_become_labels() -> None:
     text = client.get("/metrics").text
     assert 'route="unmatched"' in text
     assert "private-id" not in text
+
+
+@pytest.mark.parametrize("editing", [False, True])
+@pytest.mark.parametrize("fail_after_image", [False, True])
+def test_images_finish_iteration_before_recording_success(
+    editing: bool, fail_after_image: bool
+) -> None:
+    image = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(image, format="PNG")
+    encoded = base64.b64encode(image.getvalue()).decode("ascii")
+
+    class ImageClient(Client, MetricsClient):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.exhausted = False
+
+        async def generate_uninstrumented(
+            self, request: GenerateRequest, request_id: str
+        ) -> AsyncGenerator[GenerateChunk, None]:
+            yield UMMGenerateChunk(
+                request_id=request_id,
+                stage_name="generate",
+                modality="mixed",
+                segments=[
+                    UMMSegment(
+                        "execution",
+                        0,
+                        "image",
+                        InlineImage.from_png(encoded).model_dump(),
+                    )
+                ],
+                image_usage={
+                    "input_tokens": 3,
+                    "total_tokens": 3,
+                    "input_tokens_details": {
+                        "text_tokens": 3,
+                        "image_tokens": 4 if editing else 0,
+                    },
+                },
+                finish_reason="stop",
+            )
+            if fail_after_image:
+                raise RuntimeError("Image backend failed during completion")
+            self.exhausted = True
+
+    backend = ImageClient()
+    app = create_app(
+        backend,
+        model_name="test",
+        image_api_registrar=register_images_api,
+        enable_metrics=True,
+    )
+    with TestClient(app) as client:
+        if editing:
+            image = io.BytesIO()
+            Image.new("RGB", (32, 32)).save(image, format="PNG")
+            response = client.post(
+                "/v1/images/edits",
+                data={"model": "test", "prompt": "Make the background blue"},
+                files={"image": ("reference.png", image.getvalue(), "image/png")},
+            )
+        else:
+            response = client.post(
+                "/v1/images/generations",
+                json={"model": "test", "prompt": "A red mug", "size": "512x512"},
+            )
+        assert response.status_code == (500 if fail_after_image else 200)
+        metrics = app.state.request_metrics
+        labels = {"model_name": "test", "is_streaming": "false"}
+        assert (
+            metrics.registry.get_sample_value(
+                "sglang:num_aborted_requests_total", {"model_name": "test"}
+            )
+            or 0
+        ) == 0
+        if fail_after_image:
+            assert (
+                metrics.registry.get_sample_value(
+                    "sglang_omni:failed_requests_total", {"model_name": "test"}
+                )
+                == 1
+            )
+            assert (
+                metrics.registry.get_sample_value(
+                    "sglang:e2e_request_latency_seconds_count", labels
+                )
+                is None
+            )
+        else:
+            assert backend.exhausted
+            assert response.json()["data"] == [
+                {"b64_json": encoded, "output_format": "png"}
+            ]
+            assert response.json()["usage"]["input_tokens"] == 3
+            assert response.json()["usage"]["input_tokens_details"]["image_tokens"] == (
+                4 if editing else 0
+            )
+            assert (
+                metrics.registry.get_sample_value(
+                    "sglang:e2e_request_latency_seconds_count", labels
+                )
+                == 1
+            )
+            assert (
+                metrics.registry.get_sample_value("sglang:num_requests_total", labels)
+                == 1
+            )
+            assert (
+                metrics.registry.get_sample_value(
+                    "sglang_omni:generated_images_total",
+                    {"model_name": "test", "stage": "generate"},
+                )
+                == 1
+            )
+            assert (
+                metrics.registry.get_sample_value("sglang:prompt_tokens_total", labels)
+                is None
+            )
+            assert (
+                metrics.registry.get_sample_value(
+                    "sglang:generation_tokens_total", labels
+                )
+                is None
+            )
 
 
 @pytest.mark.parametrize("enabled", [False, True])

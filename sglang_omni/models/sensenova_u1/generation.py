@@ -26,6 +26,7 @@ from sglang_omni.models.sensenova_u1.sampling import (
     cache_dit_batch_key,
     image_guidance_branch_count,
 )
+from sglang_omni.models.sensenova_u1.usage import build_image_usage
 from sglang_omni.proto.request import StagePayload
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,11 @@ def generate_image(
             return generate_image_edit(payload, model, tokenizer)
         else:
             pass
-        return generate_text_to_image(payload, model, tokenizer)
+        result = generate_text_to_image(payload, model, tokenizer)
+        result.data["image_usage"] = build_image_usage(
+            payload.request.inputs, tokenizer
+        )
+        return result
     except Exception:
         unmount_cache_dit_after_failure(model)
         raise
@@ -115,6 +120,13 @@ def generate_images(
             raise RuntimeError("SenseNova-U1 failed to produce every batched result")
         else:
             completed_results.append(result)
+    for result in completed_results:
+        if "image_usage" not in result.data:
+            result.data["image_usage"] = build_image_usage(
+                result.request.inputs, tokenizer
+            )
+        else:
+            pass
     return completed_results
 
 
@@ -288,6 +300,7 @@ def generate_image_edit(
         pass
     options = SenseNovaU1ImageEditSampling.from_params(generation_params(payload))
     references = prepare_reference_images(inputs.get("image_b64"), options)
+    token_usage = {}
     width, height = resolve_edit_output_size(references, options)
     validate_output_dimensions(payload.request, width, height)
     prepare_cache_dit(
@@ -305,6 +318,7 @@ def generate_image_edit(
                 tokenizer,
                 prompt,
                 references,
+                usage=token_usage,
                 batch_size=1,
                 seed=options.seed,
                 image_size=(width, height),
@@ -326,7 +340,11 @@ def generate_image_edit(
         ) from error
     else:
         pass
-    return encode_image(payload, images, width, height)
+    result = encode_image(payload, images, width, height)
+    result.data["image_usage"] = build_image_usage(
+        prompt, tokenizer, token_usage.get("image_tokens", 0)
+    )
+    return result
 
 
 def unmount_cache_dit_after_failure(model: NEOChatModel) -> None:

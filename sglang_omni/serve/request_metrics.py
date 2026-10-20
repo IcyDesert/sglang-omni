@@ -157,6 +157,7 @@ class RequestMetrics:
             pass
         text_stage: str | None = None
         selected_text_stage = False
+        usage_stage_name: str | None = None
         finished_at_s: float | None = None
         usage: UsageInfo | None = None
         aborted = False
@@ -185,7 +186,25 @@ class RequestMetrics:
                     else:
                         pass
                     aborted = aborted or chunk.finish_reason == "abort"
+                    if (
+                        isinstance(chunk, UMMGenerateChunk)
+                        and chunk.segment is not None
+                        and chunk.segment.kind == "usage"
+                        and chunk.stage_name is not None
+                    ):
+                        usage_stage_name = chunk.stage_name
+                    else:
+                        pass
                     stage = chunk.stage_name or "unknown"
+                    if (
+                        isinstance(chunk, UMMGenerateChunk)
+                        and chunk.stage_name is None
+                        and chunk.segments
+                        and usage_stage_name is not None
+                    ):
+                        stage = usage_stage_name
+                    else:
+                        pass
                     audio = chunk.audio_data
                     sample_rate = chunk.sample_rate
                     if (

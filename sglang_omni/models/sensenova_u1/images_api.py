@@ -6,7 +6,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import time
 import uuid
 from typing import Literal
 
@@ -19,6 +18,10 @@ from sglang_omni.models.sensenova_u1.admission import REFERENCE_MEMORY_ERROR_PRE
 from sglang_omni.models.sensenova_u1.sampling import (
     SenseNovaU1ImageEditSampling,
     SenseNovaU1Sampling,
+)
+from sglang_omni.serve.image_response import (
+    ImageGenerationResponse,
+    build_image_response,
 )
 from sglang_omni.serve.openai_api import (
     image_result_with_disconnect_watch,
@@ -45,22 +48,6 @@ class ImageGenerationRequest(BaseModel):
     guidance_scale: float = Field(default=4.0, ge=0, allow_inf_nan=False)
     enable_cache_dit: bool | None = None
     cache_dit_params: dict[str, object] | None = None
-
-
-class ImageGenerationData(BaseModel):
-    b64_json: str
-
-
-class ImageGenerationResponse(BaseModel):
-    created: int
-    data: list[ImageGenerationData]
-
-
-def build_image_response(encoded_images: list[str]) -> ImageGenerationResponse:
-    return ImageGenerationResponse(
-        created=int(time.time()),
-        data=[ImageGenerationData(b64_json=image) for image in encoded_images],
-    )
 
 
 def umm_images(chunk: GenerateChunk) -> list[str]:
@@ -143,7 +130,7 @@ def register_image_generations(app: FastAPI) -> None:
                 )
             else:
                 pass
-            return build_image_response(encoded_outputs)
+            return build_image_response(encoded_outputs, chunk.image_usage)
         except Exception as exc:
             logger.exception(f"Image generation failed for request {request_id}")
             raise HTTPException(
@@ -265,6 +252,7 @@ def register_image_edits(app: FastAPI) -> None:
             for reference_image in reference_images
         ]
         encoded_outputs = []
+        image_usage = None
         parent_request_id = str(uuid.uuid4())
         try:
             for output_index in range(n):
@@ -290,13 +278,17 @@ def register_image_edits(app: FastAPI) -> None:
                     raise RuntimeError("SenseNova-U1 generated no image")
                 else:
                     pass
+                if output_index == 0:
+                    image_usage = chunk.image_usage
+                else:
+                    pass
                 encoded_outputs.extend(images)
         except Exception as exc:
             logger.exception(f"Image edit failed for request {parent_request_id}")
             raise HTTPException(
                 status_code=image_error_status_code(exc), detail=str(exc)
             ) from exc
-        return build_image_response(encoded_outputs)
+        return build_image_response(encoded_outputs, image_usage)
 
 
 def register_images_api(app: FastAPI) -> None:
