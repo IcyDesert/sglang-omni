@@ -11,6 +11,7 @@ import uuid
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 
 from sglang_omni.client.types import GenerateRequest
+from sglang_omni.models.sensenova_u1.admission import REFERENCE_MEMORY_ERROR_PREFIX
 from sglang_omni.models.sensenova_u1.sampling import (
     SenseNovaU1ImageEditSampling,
     SenseNovaU1Sampling,
@@ -28,6 +29,14 @@ from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import ImageGenerationRequest
 
 logger = logging.getLogger(__name__)
+
+
+def image_error_status_code(exc: BaseException) -> int:
+    """Report references that exceed GPU memory as a client error."""
+    if REFERENCE_MEMORY_ERROR_PREFIX in str(exc):
+        return 400
+    else:
+        return generation_error_status_code(exc)
 
 
 def register_image_generations(app: FastAPI) -> None:
@@ -96,7 +105,7 @@ def register_image_generations(app: FastAPI) -> None:
         except Exception as exc:
             logger.exception(f"Image generation failed for request {request_id}")
             raise HTTPException(
-                status_code=generation_error_status_code(exc), detail=str(exc)
+                status_code=image_error_status_code(exc), detail=str(exc)
             ) from exc
 
 
@@ -247,7 +256,7 @@ def register_image_edits(app: FastAPI) -> None:
         except Exception as exc:
             logger.exception(f"Image edit failed for request {parent_request_id}")
             raise HTTPException(
-                status_code=generation_error_status_code(exc), detail=str(exc)
+                status_code=image_error_status_code(exc), detail=str(exc)
             ) from exc
         return build_image_response(encoded_outputs, image_usage)
 

@@ -20,6 +20,8 @@ ADMISSION_METADATA_KEY = "sensenova_admission_limits"
 PNG_BYTES_PER_PIXEL_BOUND = 4
 PNG_CONTAINER_BYTES_BOUND = 65536
 IMAGE_SEGMENT_METADATA_BYTES_BOUND = 1024
+# Starts the I2I error for references that exceed GPU memory, which the Images API reports as a client error.
+REFERENCE_MEMORY_ERROR_PREFIX = "SenseNova-U1 I2I with "
 
 
 class SenseNovaAdmissionLimits(BaseModel):

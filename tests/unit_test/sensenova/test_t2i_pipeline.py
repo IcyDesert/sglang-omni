@@ -690,6 +690,43 @@ def test_image_edit_api_accepts_one_reference_image():
     assert image.size == (64, 32)
 
 
+@pytest.mark.parametrize(
+    ("stage_error", "expected_status"),
+    [
+        (
+            "SenseNova-U1 I2I with 3 reference images exceeds GPU memory; "
+            "reduce references or lower generate.factory.dit_layerwise_resident_layers",
+            400,
+        ),
+        ("SenseNova-U1 generation crashed", 500),
+    ],
+)
+def test_image_edit_api_maps_stage_errors(stage_error: str, expected_status: int):
+    """I2I references that exhausted GPU memory returned 500 once stage errors arrived as RuntimeError."""
+
+    class FailingClient:
+        async def generate(self, request, request_id):
+            raise RuntimeError(stage_error)
+            yield
+
+    client = TestClient(
+        create_app(
+            FailingClient(),
+            model_name="sensenova",
+            image_api_registrar=register_images_api,
+        )
+    )
+    reference = io.BytesIO()
+    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    response = client.post(
+        "/v1/images/edits",
+        files={"image": ("reference.png", reference.getvalue(), "image/png")},
+        data={"prompt": "make the background blue"},
+    )
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == stage_error
+
+
 @pytest.mark.parametrize(("raw", "expected"), [("true", True), ("false", False)])
 def test_image_edit_api_parses_cache_flag(raw: str, expected: bool) -> None:
     class CacheFlagClient:

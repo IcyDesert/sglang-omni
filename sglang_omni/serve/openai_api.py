@@ -32,7 +32,7 @@ import uuid
 from contextlib import aclosing, suppress
 from dataclasses import asdict, replace
 from enum import Enum
-from typing import AsyncGenerator, AsyncIterator, Literal
+from typing import AsyncGenerator, AsyncIterator, Literal, Protocol
 
 from fastapi import (
     Depends,
@@ -101,7 +101,6 @@ from sglang_omni.http.admin_auth import (
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.proto.admin import AdminResponse
 from sglang_omni.serve.diarizations import register_diarizations
-from sglang_omni.serve.image_response import ImageApiRegistrar
 from sglang_omni.serve.metrics import MetricsMiddleware
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (
@@ -232,6 +231,12 @@ class VoiceUploadBodyLimitMiddleware:
             await self.app(scope, limited_receive, send)
         except RequestBodyTooLarge:
             await send_voice_upload_too_large(send, self.max_bytes)
+
+
+class ImageApiRegistrar(Protocol):
+    """Register a model's Images API routes on an initialized app."""
+
+    def __call__(self, app: FastAPI) -> None: ...
 
 
 def create_app(

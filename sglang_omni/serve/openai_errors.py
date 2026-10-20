@@ -62,7 +62,6 @@ _BAD_REQUEST_MARKERS = (
     "; packaged voices:",
     "Native generation request ",
     "Native chat request rejected: ",
-    "SenseNova-U1 I2I with ",
     "Invalid UMM request: ",
 )
 _BAD_REQUEST_PATTERNS = (

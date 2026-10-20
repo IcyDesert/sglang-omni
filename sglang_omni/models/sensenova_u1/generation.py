@@ -9,7 +9,10 @@ import torch
 from pydantic import JsonValue
 from transformers import PreTrainedTokenizerBase
 
-from sglang_omni.models.sensenova_u1.admission import validate_output_dimensions
+from sglang_omni.models.sensenova_u1.admission import (
+    REFERENCE_MEMORY_ERROR_PREFIX,
+    validate_output_dimensions,
+)
 from sglang_omni.models.sensenova_u1.cache_dit import SenseNovaCacheDit
 from sglang_omni.models.sensenova_u1.image_processing import (
     encode_image,
@@ -332,7 +335,7 @@ def generate_image_edit(
     except torch.OutOfMemoryError as error:
         torch.cuda.empty_cache()
         raise ValueError(
-            f"SenseNova-U1 I2I with {len(references)} reference images exceeds GPU memory; "
+            f"{REFERENCE_MEMORY_ERROR_PREFIX}{len(references)} reference images exceeds GPU memory; "
             "reduce references or lower generate.factory.dit_layerwise_resident_layers"
         ) from error
     else:

@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Images API response models and the model route registration contract."""
+"""Image response metadata shared by generation and editing endpoints."""
 
 import base64
 import io
 import time
-from typing import Protocol
 
-from fastapi import FastAPI
 from PIL import Image
 from pydantic import BaseModel
 
@@ -67,9 +65,3 @@ def build_image_response(
     else:
         pass
     return ImageGenerationResponse(created=int(time.time()), data=images, usage=usage)
-
-
-class ImageApiRegistrar(Protocol):
-    """Register a model's Images API routes on an initialized app."""
-
-    def __call__(self, app: FastAPI) -> None: ...
