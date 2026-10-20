@@ -50,7 +50,9 @@ from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
 from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
     position_ids_from_indexes as position_ids_from_indexes,
 )
-from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import sdpa_attn_func
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    sdpa_attn_func as sdpa_attn_func,
+)
 from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
     set_attn_backend as set_attn_backend,
 )
