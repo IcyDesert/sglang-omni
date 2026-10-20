@@ -2,6 +2,71 @@ import XCTest
 @testable import Voxt
 
 final class RemoteLLMRuntimeClientResponsesRequestTests: XCTestCase {
+    /// A short transcription exhausted its inferred output limit before the reasoning model emitted text.
+    func testOpenAIResponsesLeavesDefaultOutputBudgetToServer() throws {
+        let client = RemoteLLMRuntimeClient()
+        for streamingEnabled in [false, true] {
+            let request = try client.makeResponsesRequest(
+                provider: .openAI,
+                endpointValue: "https://inference.example/v1/responses",
+                model: "custom-reasoning-deployment",
+                systemPrompt: "Clean the transcription.",
+                inputPayload: "hello",
+                configuration: TestFactories.makeRemoteConfiguration(
+                    providerID: RemoteLLMProvider.openAI.rawValue,
+                    model: "custom-reasoning-deployment",
+                    endpoint: "https://inference.example/v1/responses"
+                ),
+                previousResponseID: nil,
+                tuning: .init(maxTokens: 128, temperature: 0.2, topP: 0.9),
+                textFormat: nil,
+                streamingEnabled: streamingEnabled
+            )
+            let body = try XCTUnwrap(request.httpBody)
+            let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+            XCTAssertNil(payload["max_output_tokens"])
+            XCTAssertEqual(payload["stream"] as? Bool, streamingEnabled)
+        }
+    }
+
+    /// Explicit effort for a custom model was silently discarded by the OpenAI model allowlist.
+    func testCustomOpenAIResponsesPreservesExplicitEffortAndOutputLimit() throws {
+        let client = RemoteLLMRuntimeClient()
+        for effort in ["low", "high", "max"] {
+            let request = try client.makeResponsesRequest(
+                provider: .openAI,
+                endpointValue: "https://inference.example/v1/responses",
+                model: "custom-reasoning-deployment",
+                systemPrompt: "Clean the transcription.",
+                inputPayload: "hello",
+                configuration: TestFactories.makeRemoteConfiguration(
+                    providerID: RemoteLLMProvider.openAI.rawValue,
+                    model: "custom-reasoning-deployment",
+                    endpoint: "https://inference.example/v1/responses",
+                    generationSettings: LLMGenerationSettings(
+                        maxOutputTokens: 8192,
+                        thinking: LLMThinkingSettings(mode: .effort, effort: effort, budgetTokens: nil, exposeReasoning: false)
+                    )
+                ),
+                previousResponseID: nil,
+                tuning: .init(maxTokens: 128, temperature: 0.2, topP: 0.9),
+                textFormat: nil,
+                streamingEnabled: false
+            )
+            let body = try XCTUnwrap(request.httpBody)
+            let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+            let reasoning = try XCTUnwrap(payload["reasoning"] as? [String: Any])
+            XCTAssertEqual(reasoning["effort"] as? String, effort)
+            XCTAssertEqual(payload["max_output_tokens"] as? Int, 8192)
+            XCTAssertEqual(client.requestMaxTokensDescription(
+                provider: .openAI,
+                usesResponsesAPI: true,
+                tuning: .init(maxTokens: 128, temperature: 0.2, topP: 0.9),
+                configuredMaxOutputTokens: 8192
+            ), "8192")
+        }
+    }
+
     func testMakeResponsesRequestBuildsSingleTurnAliyunPayload() throws {
         let client = RemoteLLMRuntimeClient()
         let request = try client.makeResponsesRequest(

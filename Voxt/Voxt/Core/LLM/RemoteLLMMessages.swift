@@ -110,7 +110,7 @@ extension RemoteLLMRuntimeClient {
             if configuration.codexFastModeEnabled {
                 payload["service_tier"] = "priority"
             }
-        } else {
+        } else if provider != .openAI || generationSettings.maxOutputTokens != nil {
             payload["max_output_tokens"] = maxOutputTokens
         }
         if provider != .openAI && provider != .codex {
@@ -261,9 +261,15 @@ extension RemoteLLMRuntimeClient {
 
         if provider == .openAI {
             if settings.thinking.mode == .effort,
-               let effort = settings.thinking.effort,
-               OpenAIReasoningEffort.apiValue(selection: effort, model: model) != nil {
-                return effort
+               let effort = settings.thinking.effort?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !effort.isEmpty {
+                if let host = URL(string: configuration.endpoint)?.host,
+                   host.lowercased() != "api.openai.com" {
+                    return effort
+                }
+                if OpenAIReasoningEffort.apiValue(selection: effort, model: model) != nil {
+                    return effort
+                }
             }
             return OpenAIReasoningEffort.apiValue(
                 selection: configuration.openAIReasoningEffort,

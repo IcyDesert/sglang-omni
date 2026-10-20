@@ -23,4 +23,6 @@ Remote and local text-enhancement support for prompts, requests, streaming respo
 
 These are extensions of the existing client, not new service layers. Helpers used across files are internal; helpers local to an implementation remain private. Normal task execution goes through `executeCompiledRequest`; `enhance(userPrompt:)` remains used by title/summary and debug flows.
 
+OpenAI Responses requests leave the output token limit to the server unless the user explicitly configures one, because reasoning and visible text share that budget. Custom OpenAI endpoint hosts receive the explicitly configured reasoning effort without the OpenAI model-name allowlist; the endpoint validates supported values. Official OpenAI endpoints retain model-family filtering, and Codex retains its existing server-managed budget and reasoning policy.
+
 `RewriteAnswerModels.swift` contains answer/conversation values and normalization shared with overlays and history. Delivery snapshots remain in `Core/SessionFinalizeContext.swift`.

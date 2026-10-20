@@ -64,10 +64,14 @@ extension RemoteLLMRuntimeClient {
     func requestMaxTokensDescription(
         provider: RemoteLLMProvider,
         usesResponsesAPI: Bool,
-        tuning: GenerationTuning
+        tuning: GenerationTuning,
+        configuredMaxOutputTokens: Int? = nil
     ) -> String {
         if usesResponsesAPI && provider == .codex {
             return "auto"
+        }
+        if usesResponsesAPI && provider == .openAI {
+            return configuredMaxOutputTokens.map { "\(max(1, $0))" } ?? "auto"
         }
         return "\(tuning.maxTokens)"
     }

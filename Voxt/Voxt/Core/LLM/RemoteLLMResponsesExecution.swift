@@ -70,7 +70,8 @@ extension RemoteLLMRuntimeClient {
                     requestMaxTokensDescription: requestMaxTokensDescription(
                         provider: provider,
                         usesResponsesAPI: true,
-                        tuning: tuning
+                        tuning: tuning,
+                        configuredMaxOutputTokens: configuration.effectiveGenerationSettings(provider: provider).maxOutputTokens
                     )
                 )
                 return try await completeResponsesStreaming(
@@ -119,7 +120,8 @@ extension RemoteLLMRuntimeClient {
             requestMaxTokensDescription: requestMaxTokensDescription(
                 provider: provider,
                 usesResponsesAPI: true,
-                tuning: tuning
+                tuning: tuning,
+                configuredMaxOutputTokens: configuration.effectiveGenerationSettings(provider: provider).maxOutputTokens
             )
         )
 
