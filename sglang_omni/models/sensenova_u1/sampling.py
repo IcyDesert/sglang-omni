@@ -10,6 +10,23 @@ from dataclasses import dataclass
 from pydantic import JsonValue
 
 
+def resolve_generation_parameters(
+    parameters: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Apply generate-stage overrides before sampling and resource validation."""
+    resolved_parameters = dict(parameters)
+    stage_parameters = resolved_parameters.pop("stage_params", None)
+    if isinstance(stage_parameters, dict):
+        generate_parameters = stage_parameters.get("generate")
+        if isinstance(generate_parameters, dict):
+            resolved_parameters.update(generate_parameters)
+        else:
+            pass
+    else:
+        pass
+    return resolved_parameters
+
+
 @dataclass(frozen=True)
 class SenseNovaU1Sampling:
     width: int = 2048
@@ -23,6 +40,7 @@ class SenseNovaU1Sampling:
 
     @classmethod
     def from_params(cls, params: dict[str, JsonValue]) -> SenseNovaU1Sampling:
+        params = resolve_generation_parameters(params)
         n = params.get("n", 1)
         if type(n) is not int or not 1 <= n <= 10:
             raise ValueError("SenseNova-U1 n must be an integer between 1 and 10")
@@ -55,6 +73,7 @@ class SenseNovaU1ImageEditSampling:
 
     @classmethod
     def from_params(cls, params: dict[str, JsonValue]) -> SenseNovaU1ImageEditSampling:
+        params = resolve_generation_parameters(params)
         input_max_pixels = params.get("input_max_pixels")
         if input_max_pixels is not None and (
             type(input_max_pixels) is not int or input_max_pixels < 512 * 512
