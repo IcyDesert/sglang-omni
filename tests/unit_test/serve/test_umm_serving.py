@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import base64
 import json
 import logging
 
@@ -9,6 +10,8 @@ from fastapi.testclient import TestClient
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.client import Client
+from sglang_omni.client.client import umm_segment_chunk
+from sglang_omni.client.image_media import InlineImage
 from sglang_omni.client.types import (
     GenerateChunk,
     GenerateRequest,
@@ -300,3 +303,69 @@ def test_untagged_result_segments_keep_the_generic_result_path():
     )
     assert chunk.text == "hello"
     assert not isinstance(chunk, UMMGenerateChunk)
+
+
+IMAGE_USAGE = {
+    "input_tokens": 3,
+    "total_tokens": 3,
+    "input_tokens_details": {"text_tokens": 3, "image_tokens": 4},
+}
+
+
+def result_with_usage(usage_data: object, streamed: bool) -> dict[str, object]:
+    result = final_result(streamed=False)
+    result["segments"].append(UMMSegment("execution", 3, "usage", usage_data).to_dict())
+    if streamed:
+        for segment in result["segments"]:
+            segment.pop("data")
+    else:
+        pass
+    return result
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_final_result_reads_image_usage_from_its_usage_segment(streamed):
+    usage_data = {"image_usage": IMAGE_USAGE, "stage_name": "generate"}
+    chunk = Client.default_result_builder("r", result_with_usage(usage_data, streamed))
+    if streamed:
+        # The streamed usage segment already carried the data.
+        assert chunk.image_usage is None and chunk.stage_name is None
+    else:
+        assert chunk.image_usage == IMAGE_USAGE and chunk.stage_name == "generate"
+    streamed_chunk = umm_segment_chunk(
+        GenerateChunk("r", stage_name="output"),
+        UMMSegment("execution", 3, "usage", usage_data).to_dict(),
+    )
+    assert streamed_chunk.stage_name == "generate"
+
+
+@pytest.mark.parametrize(
+    "usage_data",
+    ["not a mapping", {"image_usage": {"input_tokens": -1, "total_tokens": 0}}],
+)
+def test_invalid_usage_segment_is_rejected(usage_data):
+    with pytest.raises(ValueError):
+        Client.default_result_builder("r", result_with_usage(usage_data, False))
+
+
+def test_result_builder_keeps_only_string_image_lists():
+    chunk = Client.default_result_builder(
+        "r", {"image_b64": "a", "images_b64": ["a", "b"]}
+    )
+    assert chunk.image_b64 == "a" and chunk.images_b64 == ["a", "b"]
+    assert (
+        Client.default_result_builder("r", {"images_b64": ["a", 1]}).images_b64 is None
+    )
+
+
+@pytest.mark.parametrize("field", ["sha256", "size_bytes", "url"])
+def test_inline_image_rejects_tampered_content(field):
+    media = InlineImage.from_png(base64.b64encode(b"png bytes").decode("ascii"))
+    assert media.encoded_image() == base64.b64encode(b"png bytes").decode("ascii")
+    changes = {
+        "sha256": "0" * 64,
+        "size_bytes": media.size_bytes + 1,
+        "url": "https://example.invalid/image.png",
+    }
+    with pytest.raises(ValueError):
+        media.model_copy(update={field: changes[field]}).encoded_image()
