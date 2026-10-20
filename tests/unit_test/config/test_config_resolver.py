@@ -38,6 +38,61 @@ def make(config, path, value, source=CLI, **kwargs):
 
 
 class TestResolve:
+    @pytest.mark.parametrize(
+        ("first_values", "later_values", "error"),
+        [
+            (
+                {"stages.thinker.tp_size": 2},
+                {"stages.thinker.gpu": [0, 1]},
+                "gpu is required",
+            ),
+            (
+                {
+                    "stages.thinker.engine.kv_cache_bytes": "2GiB",
+                    "stages.thinker.engine.mem_fraction_static": 0.7,
+                },
+                {"stages.thinker.engine.mem_fraction_static": None},
+                "cannot be set together",
+            ),
+        ],
+    )
+    def test_later_source_can_complete_relationships(
+        self, pipeline_config, first_values, later_values, error
+    ):
+        """A file's incomplete relationships must survive until CLI overrides."""
+        intermediate = ConfigResolver(pipeline_config).resolve(
+            patchset(
+                *(
+                    make(pipeline_config, key, value, YAML)
+                    for key, value in first_values.items()
+                )
+            )
+        )
+        with pytest.raises(ValueError, match=error):
+            intermediate.config.check_conflicts()
+        final = ConfigResolver(intermediate.config).resolve(
+            patchset(
+                *(
+                    make(intermediate.config, key, value, CLI)
+                    for key, value in later_values.items()
+                )
+            )
+        )
+        final.config.check_conflicts()
+        for key, value in later_values.items():
+            assert final.value(key) == value
+
+    @pytest.mark.parametrize(
+        ("path", "value"), [("stages.thinker.gpu", -1), ("stages.thinker.tp_size", 0)]
+    )
+    def test_invalid_field_is_rejected_before_final_validation(
+        self, pipeline_config, path, value
+    ):
+        with pytest.raises(ValueError):
+            ConfigResolver(pipeline_config).resolve(
+                patchset(make(pipeline_config, path, value))
+            )
+
     def test_baseline_is_untouched(self, pipeline_config: PipelineConfig):
         ConfigResolver(pipeline_config).resolve(
             patchset(make(pipeline_config, MEM_FRACTION, "0.8"))

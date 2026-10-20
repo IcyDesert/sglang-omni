@@ -3,7 +3,7 @@
 
 from typing import ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from sglang_omni.admission import REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV
 from sglang_omni.config import (
@@ -95,8 +95,7 @@ class MiniCPMODuplexVision(BaseModel):
     max_slice_nums: int = Field(default=1, ge=1)
     max_slice_nums_limit: int = Field(default=9, ge=1, le=9)
 
-    @model_validator(mode="after")
-    def check_limits(self) -> "MiniCPMODuplexVision":
+    def check_conflicts(self) -> None:
         if self.max_slice_nums > self.max_slice_nums_limit:
             raise ValueError("max_slice_nums exceeds max_slice_nums_limit")
         elif self.max_slice_nums_limit > 1 and (
@@ -104,7 +103,7 @@ class MiniCPMODuplexVision(BaseModel):
         ):
             raise ValueError("max_tiles_per_unit cannot fit one frame at the limit")
         else:
-            return self
+            pass
 
 
 class MiniCPMODuplexSpeech(BaseModel):
@@ -143,6 +142,10 @@ class MiniCPMODuplexPipelineConfig(PipelineConfig):
         "sglang_omni.models.minicpm_o.session_adapters.build_realtime_deployment"
     )
     is_realtime_only: ClassVar[bool] = True
+
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
+        self.vision.check_conflicts()
 
     def stage_factory_kwargs(self, stage_name: str) -> dict[str, JsonValue]:
         request_slots = (

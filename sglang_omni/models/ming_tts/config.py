@@ -310,8 +310,8 @@ class MingTTSPipelineConfig(PipelineConfig):
         ),
     ]
 
-    def model_post_init(self, __context: object = None) -> None:
-        super().model_post_init(__context)
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
         stages = validate_ming_tts_pipeline_contract(self)
         preprocessing = stages[PREPROCESSING_STAGE]
         audio_decode = stages[AUDIO_DECODE_STAGE]
