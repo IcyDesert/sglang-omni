@@ -846,6 +846,7 @@ class Client:
             else:
                 pass
             chunk.usage = Client.build_usage_info(result)
+            chunk.image_usage = result.get("image_usage")
             diarization = result.get("diarization")
             chunk.diarization = (
                 None

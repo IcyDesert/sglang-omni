@@ -19,6 +19,17 @@ class UsageInfoDict(TokenUsageDict, total=False):
     engine_time_s: float
 
 
+class ImageInputTokensDetailsDict(TypedDict):
+    text_tokens: int | None
+    image_tokens: int
+
+
+class ImageUsageDict(TypedDict, total=False):
+    input_tokens: int
+    total_tokens: int
+    input_tokens_details: ImageInputTokensDetailsDict
+
+
 # note (Yucheng Hu): finish reason reported on speech surfaces when the model
 # did not say how generation ended.
 UNKNOWN_FINISH_REASON = "unknown"
@@ -191,6 +202,7 @@ class GenerateChunk:
     audio_data: object = None
     media: list[dict[str, object]] | None = None
     sample_rate: int | None = None
+    image_usage: ImageUsageDict | None = None
     diarization: DiarizationResult | None = None
     image: str | None = None  # base64-encoded PNG from the terminal result
 
@@ -221,6 +233,7 @@ class GenerateChunk:
             "audio_data": self.audio_data,
             "media": self.media,
             "sample_rate": self.sample_rate,
+            "image_usage": self.image_usage,
             "image": self.image,
         }
 
