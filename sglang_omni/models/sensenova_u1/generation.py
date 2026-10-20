@@ -352,7 +352,7 @@ def prepare_cache_dit(
     img_cfg_scale: float = 1.0,
     is_edit: bool = False,
 ) -> None:
-    # note (Codex): Direct generation calls may bypass the factory controller.
+    # note (Wes): Direct generation calls may bypass the factory controller.
     controller = model.__dict__.get("sensenova_cache_dit")
     if not isinstance(controller, SenseNovaCacheDit):
         return

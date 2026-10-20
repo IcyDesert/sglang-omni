@@ -133,7 +133,7 @@ class TestCacheDitLifecycle(unittest.TestCase):
     def enable(
         self, adapter: SimpleNamespace, *, cache_config: SimpleNamespace
     ) -> None:
-        # note (Codex): Match the backend callback; the fake only swaps layers.
+        # note (Wes): Match the backend callback; the fake only swaps layers.
         adapter.transformer.layers = [SimpleNamespace(cached=True)]
 
     def disable(self, adapter: SimpleNamespace) -> None:

@@ -191,7 +191,7 @@ def test_engine_kv_cache_bytes_rejects_max_total_tokens() -> None:
 
 class AuthorConfiguredSenseNova(SenseNovaU1PipelineConfig):
     def stage_factory_kwargs(self, stage_name: str) -> dict[str, str | int | bool]:
-        # note (Codex): The pipeline hook requires a stage name for this model.
+        # note (Wes): The pipeline hook requires a stage name for this model.
         return {
             "dtype": "float16",
             "dit_layerwise_offload": True,

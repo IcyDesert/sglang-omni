@@ -5,10 +5,10 @@ import threading
 
 import pytest
 
-from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
     TensorParallelScheduler,
 )
+from sglang_omni.scheduling.message import IncomingMessage
 
 
 def request(request_id):
@@ -40,12 +40,10 @@ def test_asymmetric_abort_preserves_collective_order():
     try:
         threads[0].start()
         assert entered.wait(2)
-        # Rank zero is inside its first collective while rank one has not
-        # started. Rank one must not skip the cancelled queued forward.
+        # Rank zero is inside its first collective while rank one has not started. Rank one must not skip the cancelled queued forward.
         schedulers[0].abort("cancelled")
         schedulers[1].abort("cancelled")
-        # Shutdown must also drain the next dispatched request on both ranks,
-        # including a follower whose compute thread has not started yet.
+        # Shutdown must also drain the next dispatched request on both ranks, including a follower whose compute thread has not started yet.
         for scheduler in schedulers:
             scheduler.stop()
         threads[1].start()

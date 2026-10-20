@@ -409,8 +409,7 @@ async def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
             fanout.fanout_work.assert_called_once_with(payload)
             assert simple_like.inbox.get_nowait().request_id == "req-1"
 
-            # Already dispatched collective work survives a follower abort;
-            # an aborted leader still drops work before dispatching it.
+            # Already dispatched collective work survives a follower abort; an aborted leader still drops work before dispatching it.
             simple_like.preserve_tp_work_on_abort = True
             stage_simple.aborted.add("req-1")
             fanout.reset_mock()
