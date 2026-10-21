@@ -9,7 +9,6 @@ from typing import Literal
 
 from benchmarks.duplex.profiles import PROFILES, ProfileName
 from benchmarks.duplex.reference_capture import PROTOCOL_FORMAT, TraceFormat
-from sglang_omni.models.minicpm_o.native_config import DEFAULT_MAX_SESSIONS
 from sglang_omni.scheduling.session import NODE_STAGE_MAX_OPEN_SESSIONS
 
 EngineName = Literal["minicpmo", "qwen3-omni", "cascade"]
@@ -40,9 +39,7 @@ class Engine:
         if PROFILES[self.record_profile].protocol == "native":
             return None
         else:
-            return json.dumps(
-                {"type": "server_vad", "silence_duration_ms": 500}
-            )
+            return json.dumps({"type": "server_vad", "silence_duration_ms": 500})
 
     @property
     def ready_text(self) -> str:
@@ -62,8 +59,8 @@ ENGINES: dict[EngineName, Engine] = {
         launch_config=None,
         hf_model_ids=(),
         server_gpu_count=1,
-        max_sessions=DEFAULT_MAX_SESSIONS,
-        sets_max_sessions=False,
+        max_sessions=8,
+        sets_max_sessions=True,
         needs_aligner=False,
     ),
     "qwen3-omni": Engine(
