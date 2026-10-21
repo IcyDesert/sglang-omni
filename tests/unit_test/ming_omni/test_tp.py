@@ -107,7 +107,9 @@ def test_ming_speech_rejects_talker_inside_explicit_thinker_tp_gpus() -> None:
             stage.gpu = 1
 
     with pytest.raises(ValueError, match="collides"):
-        MingOmniSpeechPipelineConfig(model_path="dummy", stages=stages)
+        MingOmniSpeechPipelineConfig(
+            model_path="dummy", stages=stages
+        ).check_conflicts()
 
 
 @pytest.mark.parametrize(
@@ -134,7 +136,7 @@ def test_ming_rejects_non_ar_stage_tp_size_gt_one(
             stage.gpu = gpu
 
     with pytest.raises(ValueError, match=f"{stage_name}.*does not support TP"):
-        config_cls(model_path="dummy", stages=stages)
+        config_cls(model_path="dummy", stages=stages).check_conflicts()
 
 
 def test_ming_streaming_speech_allows_thinker_tp_size_gt_one() -> None:
@@ -179,7 +181,9 @@ def test_ming_speech_rejects_any_talker_gpu_list_overlap_with_thinker_tp() -> No
             stage.gpu = [2]
 
     with pytest.raises(ValueError, match="collides"):
-        MingOmniSpeechPipelineConfig(model_path="dummy", stages=stages)
+        MingOmniSpeechPipelineConfig(
+            model_path="dummy", stages=stages
+        ).check_conflicts()
 
 
 def test_ming_speech_allows_talker_outside_explicit_thinker_tp_gpus() -> None:

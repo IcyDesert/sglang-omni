@@ -560,6 +560,7 @@ def serve(
         # carries a message written to be read; a traceback would bury it
         # under the merge internals.
         raise typer.BadParameter(str(exc)) from exc
+    merged_config.warn_long_audio_admission_exceeds_engine()
     if colocate:
         validate_colocate_config(merged_config)
     else:

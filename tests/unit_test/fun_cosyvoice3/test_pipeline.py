@@ -203,7 +203,7 @@ def test_fun_cosyvoice3_rejects_explicit_tensorrt_and_dit_compile() -> None:
                 "vocoder.factory.enable_flow_estimator_trt": True,
                 "vocoder.factory.enable_dit_torch_compile": True,
             }
-        )
+        ).check_conflicts()
 
 
 def test_fun_cosyvoice3_state_round_trip_preserves_wire_contract() -> None:

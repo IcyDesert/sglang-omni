@@ -103,13 +103,19 @@ This is the same pattern `EngineStageConfig` uses, and the same principle as
 the shared groups: constraints are declarations on fields, not hand-written
 checks. (A subclass carrying real fields is not an empty shell.)
 
-The other two sites cover what a field declaration cannot express — both run
-at resolve time too, because the resolver rebuilds and re-validates the
-pipeline class on every merge:
+The other two sites cover what a field declaration cannot express. Neither
+runs during resolution: a file may disagree with itself until a later CLI
+override repairs it, so relationships are checked once, on the final config:
 
-- **Cross-field and cross-stage rules** go in the pipeline class's
-  `model_post_init` — Ming-TTS validates its audio-decode cadence and batch
-  contract there, and Ming-Omni its GPU-collision rule.
+- **Cross-field and cross-stage rules** go in the owning class's
+  `check_local_conflicts` — Ming-TTS validates its audio-decode cadence and
+  batch contract there, and Ming-Omni its GPU-collision rule. `serve`,
+  `config resolve`/`explain`, and topology compilation call
+  `check_conflicts()` on the final config, which visits every nested model
+  (stages, factory and engine groups, list and dict members) and runs each
+  one's `check_local_conflicts` after its children pass. A subclass that
+  extends a parent's rules calls `super().check_local_conflicts()` first;
+  nothing forwards checks to nested models by hand.
 - **Rules that need the consumer's runtime state** stay in the consumer —
   the dots vocoder refuses a `stream_slots` that disagrees with the latent
   engine's admission limit, a relationship only known at launch.
@@ -142,16 +148,18 @@ Rules for a declared field:
   string. Pydantic enforces the constraint at construction and resolution,
   and path compilation carries the same constraint into CLI/YAML conversion —
   one declaration, every channel. Do not write the range as a hand-rolled
-  `model_post_init` check; that is reserved for rules a declaration cannot
-  express (see below).
+  `check_local_conflicts` check; that is reserved for rules a declaration
+  cannot express (see below).
 - **Type shape is already handled.** Conversion is lossless-only: an int fits
   a float field and `0`/`1` fit a bool field, but a bool is refused on a
   numeric field and a float is refused on an int field, for CLI text and
   native YAML scalars alike. You get this for free.
 
-`model_post_init` on the group is only for what a declaration cannot say:
-cross-field rules, or advisory warnings (`prefill_coalesce_requests=1` warns
-that the value is a no-op).
+`check_local_conflicts` on the group is only for what a declaration cannot
+say: cross-field rules such as `kv_cache_bytes` against `mem_fraction_static`.
+Keep it free of logging: it runs on every conflict check, so an advisory
+warning belongs in a separate method that `serve` calls once at launch
+(`warn_long_audio_admission_exceeds_engine` is the pattern).
 
 ## Case 3: an engine (ServerArgs) setting
 
@@ -176,8 +184,8 @@ Fields read by the parent process before any stage code runs — placement,
 process grouping, TP shape — live at the stage top level in `StageConfig`.
 Add one only when the launcher or planner genuinely consumes it. Same
 validation split as everywhere else: static `Field` constraints for ranges
-(`tp_size: Field(default=1, ge=1)`), `model_post_init` for cross-field shape
-(a TP stage's `gpu` list must match `tp_size` and be unique).
+(`tp_size: Field(default=1, ge=1)`), `check_local_conflicts` for cross-field
+shape (a TP stage's `gpu` list must match `tp_size` and be unique).
 
 Do **not** re-check these rules downstream. The planner and topology walker
 trust a validated config; a constraint has exactly one site.
@@ -194,8 +202,8 @@ Whole-pipeline values (`model_path`, `name`, `placement.*`) are top-level
 YAML top level). Model-specific pipeline classes may add their own fields the
 same way (see `MossTTSLocalPipelineConfig`'s cache and cuda-graph fields).
 Cross-stage invariants for one model belong in that pipeline class's
-`model_post_init` — e.g. Ming-Omni refusing a talker GPU that collides with
-the thinker's TP range.
+`check_local_conflicts` — e.g. Ming-Omni refusing a talker GPU that collides
+with the thinker's TP range.
 
 ## Values users do not set
 
@@ -239,8 +247,8 @@ Every rule has exactly one home, chosen by what the rule needs to see:
 |---|---|---|
 | Only the value | Static `Field` constraint / `Literal` — on the shared group, or a per-stage group subclass for one model | `mem_fraction_static: Field(gt=0, lt=1)`; `VocoderFactoryArgs.stream_slots` |
 | The right conversion | Nothing — lossless coercion is built in | bool refused on int fields |
-| Sibling fields on one object | `model_post_init` on that model | TP `gpu` list matches `tp_size` |
-| Several stages of one pipeline | The pipeline class's `model_post_init` | Ming GPU-collision check; Ming-TTS audio-decode contract |
+| Sibling fields on one object | `check_local_conflicts` on that model | TP `gpu` list matches `tp_size` |
+| Several stages of one pipeline | The pipeline class's `check_local_conflicts` | Ming GPU-collision check; Ming-TTS audio-decode contract |
 | The consumer's runtime state | The consumer, at the point of use | vocoder `stream_slots` vs. latent engine |
 | The factory's parameter list | Nothing — the signature check is built in | unknown `factory.*` key refused |
 
@@ -270,8 +278,8 @@ reintroduce them:
    knobs.
 3. Ranges and enums are static declarations (`Field(...)`, `Literal`), not
    code.
-4. Cross-field rules go in the owning model's `model_post_init`; nothing is
-   checked twice.
+4. Cross-field rules go in the owning model's `check_local_conflicts`, which
+   runs on the final config only; nothing is checked twice.
 5. Verify the whole surface end to end:
 
 ```bash

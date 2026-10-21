@@ -125,7 +125,9 @@ def test_preprocessing_cannot_set_what_it_derives(
     manager = ConfigManager(Drama3PipelineConfig(model_path="checkpoint"))
 
     with pytest.raises(ValueError) as rejection:
-        manager.merge_config([(f"preprocessing.factory.{field_name}", value)])
+        manager.merge_config(
+            [(f"preprocessing.factory.{field_name}", value)]
+        ).check_conflicts()
 
     assert f"set stages.{owner}.factory.{field_name} instead" in str(rejection.value)
 
@@ -163,7 +165,9 @@ def test_the_vocoder_cannot_set_the_engine_cap_on_new_frames() -> None:
     manager = ConfigManager(Drama3PipelineConfig(model_path="checkpoint"))
 
     with pytest.raises(ValueError) as rejection:
-        manager.merge_config([("vocoder.factory.max_new_tokens", "1024")])
+        manager.merge_config(
+            [("vocoder.factory.max_new_tokens", "1024")]
+        ).check_conflicts()
 
     assert "set stages.tts_engine.factory.max_new_tokens instead" in str(
         rejection.value
@@ -182,7 +186,9 @@ def test_the_engine_cannot_set_the_vocoder_windows(field_name: str, value: str) 
     manager = ConfigManager(Drama3PipelineConfig(model_path="checkpoint"))
 
     with pytest.raises(ValueError) as rejection:
-        manager.merge_config([(f"tts_engine.factory.{field_name}", value)])
+        manager.merge_config(
+            [(f"tts_engine.factory.{field_name}", value)]
+        ).check_conflicts()
 
     assert f"set stages.vocoder.factory.{field_name} instead" in str(rejection.value)
 

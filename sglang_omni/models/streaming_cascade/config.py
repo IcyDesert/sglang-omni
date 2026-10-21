@@ -538,11 +538,11 @@ class StreamingCascadePipelineConfig(AudioSessionPipelineConfig):
 
     def check_local_conflicts(self) -> None:
         """Check the final declaration before building its Session graph."""
-        super().check_local_conflicts()
         if any(node.kind is not None for node in self.session_nodes.values()):
             self.component_graph()
         else:
             pass
+        super().check_local_conflicts()
 
     def session_graph(self) -> SessionGraph:
         """Expand component shorthands without adding another router or host node."""

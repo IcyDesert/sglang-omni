@@ -262,7 +262,7 @@ def test_long_audio_admission_at_engine_capacity_warns(monkeypatch, caplog) -> N
         Qwen3ASRPipelineConfig(
             model_path="dummy",
             audio_chunking=AudioChunkingConfig(max_concurrent_long_audio_requests=8),
-        ).check_conflicts()
+        ).warn_long_audio_admission_exceeds_engine()
         assert any(
             "max_concurrent_long_audio_requests=8" in record.message
             and "max_running_requests=64" in record.message
@@ -270,11 +270,13 @@ def test_long_audio_admission_at_engine_capacity_warns(monkeypatch, caplog) -> N
         )
         # The derived default and anything below the cap stay quiet.
         caplog.clear()
-        Qwen3ASRPipelineConfig(model_path="dummy").check_conflicts()
+        Qwen3ASRPipelineConfig(
+            model_path="dummy"
+        ).warn_long_audio_admission_exceeds_engine()
         Qwen3ASRPipelineConfig(
             model_path="dummy",
             audio_chunking=AudioChunkingConfig(max_concurrent_long_audio_requests=7),
-        ).check_conflicts()
+        ).warn_long_audio_admission_exceeds_engine()
         assert not [
             r for r in caplog.records if "max_concurrent_long_audio" in r.message
         ]

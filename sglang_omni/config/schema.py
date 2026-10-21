@@ -837,10 +837,12 @@ class PipelineConfig(ConfigModel):
             )
         else:
             pass
-        self.warn_long_audio_admission_exceeds_engine()
 
     def warn_long_audio_admission_exceeds_engine(self) -> None:
-        """Warn when long audio alone can fill every engine running slot."""
+        """Warn when long audio alone can fill every engine running slot.
+
+        Advisory only, so serve calls it once at launch instead of every conflict check.
+        """
         if not type(self).allow_audio_chunking:
             return
         else:
