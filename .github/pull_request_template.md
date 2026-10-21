@@ -38,10 +38,10 @@ Lint, Test Layout, Docs Check, Rust Router and the NPU image build run on GitHub
 - Any stage label also runs the H100 unit tests.
 - `run-unit-test-ci-only` runs just the H100 unit tests after shared setup when no other stage labels or `run-all-ci` are present. Use `/tag-and-rerun-ci unit-test` to add it and re-run completed CI.
 - A model label picks the model of every selected stage that accepts it. It does not select a stage. Without one, a selected stage draws its model at random. Keep at most one model label per stage.
-  - ASR: `run-asr-fun-asr-nano-2512`, `run-asr-qwen3-asr-1.7b`, `run-asr-whisper-large-v3`
-  - TTS and MPS: `run-higgs-tts-3-4b`, `run-moss-tts-local-transformer-v1.5`. `run-mps-ci` is the only MPS label. With both stage labels, one model label selects that model for both. With only `run-tts-ci`, MPS does not run.
-  - TTS only: `run-tts-qwen3-tts-12hz-1.7b-base`, `run-tts-qwen3-tts-12hz-1.7b-customvoice` (label only, never drawn), `run-tts-fun-cosyvoice3-0.5b-2512`
-  - Omni: `run-omni-qwen3-omni-30b-a3b-instruct`, `run-omni-minicpm-o-4.5`
+  - ASR: `run-fun-asr-nano-2512`, `run-qwen3-asr-1.7b`, `run-whisper-large-v3`
+  - TTS and MPS: `run-higgs-tts-3-4b`, `run-moss-tts-local-transformer-v1.5`. `run-mps-ci` is the only MPS stage label. With both stage labels, one model label selects that model for both. With only `run-tts-ci`, MPS does not run.
+  - TTS: `run-qwen3-tts-12hz-1.7b-base`, `run-qwen3-tts-12hz-1.7b-customvoice` (label only, never drawn), `run-fun-cosyvoice3-0.5b-2512`
+  - Omni: `run-qwen3-omni-30b-a3b-instruct`, `run-minicpm-o-4.5`
 
 Use `/tag-and-rerun-ci` with short targets, for example `/tag-and-rerun-ci tts asr` or `/tag-and-rerun-ci qwen3-tts qwen3-asr`. Use `/tag-and-rerun-full-ci` for all stages, with optional model targets. Bare `/tag-and-rerun-ci` and full GitHub label arguments are not accepted. Existing stage selections stay enabled. Use `/rerun-failed-ci` to retry failed jobs.
 

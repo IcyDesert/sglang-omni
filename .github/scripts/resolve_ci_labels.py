@@ -2,10 +2,10 @@
 """Resolve the CI stages and models that pull request labels select.
 
 A stage runs with its stage label or run-all-ci. run-lint-only satisfies the
-gate and runs no self-hosted job. A model label picks the model of every
-selected stage that accepts it, and never selects a stage. Higgs and MOSS
-labels are shared by TTS and MPS. A selected stage without a model label
-draws its model at random.
+gate and runs no self-hosted job. A model label names a model, not a stage.
+It picks that model for every selected stage that accepts it, and never
+selects a stage. Higgs and MOSS labels are shared by TTS and MPS. A selected
+stage without a model label draws its model at random.
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ CI_STAGES: tuple[CiStage, ...] = (
         label="run-asr-ci",
         workflow=OMNI_CI_WORKFLOW,
         preset_by_model_label={
-            "run-asr-fun-asr-nano-2512": "fun",
-            "run-asr-qwen3-asr-1.7b": "qwen3",
-            "run-asr-whisper-large-v3": "whisper",
+            "run-fun-asr-nano-2512": "fun",
+            "run-qwen3-asr-1.7b": "qwen3",
+            "run-whisper-large-v3": "whisper",
         },
         random_presets=("fun", "qwen3", "whisper"),
     ),
@@ -59,9 +59,9 @@ CI_STAGES: tuple[CiStage, ...] = (
         preset_by_model_label={
             HIGGS_TTS_MODEL_LABEL: "higgs",
             MOSS_TTS_MODEL_LABEL: "moss",
-            "run-tts-qwen3-tts-12hz-1.7b-base": "qwen3-tts",
-            "run-tts-qwen3-tts-12hz-1.7b-customvoice": "qwen3-tts-custom-voice",
-            "run-tts-fun-cosyvoice3-0.5b-2512": "cosyvoice3",
+            "run-qwen3-tts-12hz-1.7b-base": "qwen3-tts",
+            "run-qwen3-tts-12hz-1.7b-customvoice": "qwen3-tts-custom-voice",
+            "run-fun-cosyvoice3-0.5b-2512": "cosyvoice3",
         },
         # note (chenyang): qwen3-tts-custom-voice gates nothing until it is
         # calibrated on the CI host, so only its model label selects it.
@@ -82,8 +82,8 @@ CI_STAGES: tuple[CiStage, ...] = (
         label="run-omni-ci",
         workflow=OMNI_CI_WORKFLOW,
         preset_by_model_label={
-            "run-omni-qwen3-omni-30b-a3b-instruct": "qwen3-omni",
-            "run-omni-minicpm-o-4.5": "minicpmo",
+            "run-qwen3-omni-30b-a3b-instruct": "qwen3-omni",
+            "run-minicpm-o-4.5": "minicpmo",
         },
         random_presets=("qwen3-omni", "minicpmo"),
     ),
