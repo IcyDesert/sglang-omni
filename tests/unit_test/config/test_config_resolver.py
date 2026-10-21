@@ -44,7 +44,8 @@ class NestedConfig(ConfigModel):
     )
     reject_parent: bool = False
 
-    def check_local_conflicts(self) -> None:
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
         if self.reject_parent:
             raise ValueError("parent conflict")
         else:

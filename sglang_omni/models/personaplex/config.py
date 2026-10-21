@@ -112,8 +112,8 @@ class PersonaPlexPipelineConfig(PipelineConfig):
     )
     stages: list[StageConfig] = Field(default_factory=personaplex_stages_factory)
 
-    def check_local_conflicts(self) -> None:
-        super().check_local_conflicts()
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
         # Note (nightdecode): An unset num_decode_slots stays unset and is
         # derived at launch in stage_factory_kwargs; writing the derivation
         # back would make it look pinned on the next merge. Only a pinned

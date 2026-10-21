@@ -88,8 +88,8 @@ class Cosmos3UMMPipelineConfig(UMMPipelineConfig, Cosmos3PipelineConfig):
         ),
     ]
 
-    def check_local_conflicts(self) -> None:
-        super().check_local_conflicts()
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
         # The adapter module imports the native stages, which a configuration
         # loaded for any model must not import.
         from sglang_omni.models.cosmos3.umm import max_model_bytes

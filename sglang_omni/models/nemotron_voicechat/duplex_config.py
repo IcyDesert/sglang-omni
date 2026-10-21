@@ -140,8 +140,8 @@ class NemotronVoiceChatToolPipelineConfig(NemotronVoiceChatDuplexPipelineConfig)
     tools: ToolRegistry = Field(default_factory=dict)
     tool_names: list[str] | None = None
 
-    def check_local_conflicts(self) -> None:
-        super().check_local_conflicts()
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
         for name in self.tools if self.tool_names is None else self.tool_names:
             if name not in self.tools:
                 raise ValueError(f"unknown tool {name!r}")

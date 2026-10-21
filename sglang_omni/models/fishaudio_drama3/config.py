@@ -162,8 +162,8 @@ class Drama3PipelineConfig(PipelineConfig):
         ),
     ]
 
-    def check_local_conflicts(self) -> None:
-        super().check_local_conflicts()
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
         preprocessing_extra = (
             self.stage_named("preprocessing").factory.model_extra or {}
         )

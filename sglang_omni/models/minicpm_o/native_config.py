@@ -96,7 +96,8 @@ class MiniCPMODuplexVision(ConfigModel):
     max_slice_nums: int = Field(default=1, ge=1)
     max_slice_nums_limit: int = Field(default=9, ge=1, le=9)
 
-    def check_local_conflicts(self) -> None:
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
         if self.max_slice_nums > self.max_slice_nums_limit:
             raise ValueError("max_slice_nums exceeds max_slice_nums_limit")
         elif self.max_slice_nums_limit > 1 and (

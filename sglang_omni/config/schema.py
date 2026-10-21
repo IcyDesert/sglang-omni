@@ -186,8 +186,9 @@ class EngineArgs(ConfigModel):
         else:
             pass
 
-    def check_local_conflicts(self) -> None:
+    def check_conflicts(self) -> None:
         """Check capacity settings after all configuration sources are merged."""
+        super().check_conflicts()
         if self.kv_cache_bytes is not None and self.mem_fraction_static is not None:
             raise ValueError(
                 "engine.kv_cache_bytes cannot be set together with engine.mem_fraction_static; if the fraction comes from the pipeline's built-in defaults, set mem_fraction_static: null on the same stage"
@@ -487,8 +488,9 @@ class StageConfig(ConfigModel):
         else:
             pass
 
-    def check_local_conflicts(self) -> None:
+    def check_conflicts(self) -> None:
         """Check stage relationships only after source overrides are complete."""
+        super().check_conflicts()
         if self.runtime_gpu_ids is not None:
             if not self.allow_child_processes or self.tp_size != 1:
                 raise ValueError(
@@ -584,7 +586,8 @@ class AudioChunkingConfig(ConfigModel):
     max_concurrent_chunks: int = Field(default=8, ge=1)
     max_concurrent_long_audio_requests: int | None = Field(default=None, ge=1)
 
-    def check_local_conflicts(self) -> None:
+    def check_conflicts(self) -> None:
+        super().check_conflicts()
         if (
             self.max_total_audio_s is not None
             and self.max_total_audio_s < self.max_audio_clip_s
@@ -819,8 +822,9 @@ class PipelineConfig(ConfigModel):
         else:
             pass
 
-    def check_local_conflicts(self) -> None:
+    def check_conflicts(self) -> None:
         """Validate the final configuration before inspection or launch."""
+        super().check_conflicts()
         self.validate_general()
         self.validate_processes()
 
