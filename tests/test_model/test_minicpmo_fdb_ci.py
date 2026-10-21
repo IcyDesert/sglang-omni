@@ -17,7 +17,7 @@ import pytest
 from huggingface_hub import snapshot_download
 from pydantic import JsonValue
 
-from benchmarks.duplex.fdb.common import DEFAULT_MODEL_REVISION, MODEL_ID
+from benchmarks.duplex.fdb.engines import ENGINES
 from benchmarks.duplex.run_artifacts import file_sha256
 from benchmarks.duplex.v10_dataset import SUBSET_TASKS
 from benchmarks.duplex.v15_dataset import SUBSETS as V15_CATEGORIES
@@ -25,6 +25,7 @@ from benchmarks.duplex.v15_dataset import SUBSETS as V15_CATEGORIES
 pytestmark = pytest.mark.benchmark
 
 RUN_NAME = "ci"
+ENGINE = ENGINES["minicpmo"]
 V15_PER_SUBSET = 2
 V10_PER_SUBSET = 5
 GPUS = "0,1"
@@ -95,7 +96,9 @@ def test_minicpmo_full_duplex_bench_smoke() -> None:
     env = {
         **os.environ,
         "FDB_WORK": str(fdb_work),
-        "MODEL_PATH": snapshot_download(MODEL_ID, revision=DEFAULT_MODEL_REVISION),
+        "MODEL_PATH": snapshot_download(
+            ENGINE.model_id, revision=ENGINE.model_revision
+        ),
         # note (luojiaxuan): with JUDGE=gpt, setup skips the 27B judge model; the
         # smoke never runs the judge step, so no API key is read.
         "JUDGE": "gpt",
