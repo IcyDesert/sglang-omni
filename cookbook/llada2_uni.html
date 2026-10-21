@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.8" />
-    <meta name="docbuild:last-update" content="Oct 20, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 21, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -523,12 +523,10 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#server-configuration">Server Configuration</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#image-generation-and-editing">Image Generation and Editing</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#thinking-image-generation">Thinking Image Generation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#interleaved-output">Interleaved Output</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#text-input">Text Input</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#image-and-text-input">Image and Text Input</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#incoming-features">Incoming Features</a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-limitations">Known Limitations</a></li>
 </ul>
             </nav>
@@ -674,6 +672,55 @@ length. The native response remains <code class="docutils literal notranslate"><
 expose the thinking text. No <code class="docutils literal notranslate"><span class="pre">modalities</span></code> field is needed. Thinking-mode
 editing is unsupported, and chat completions remain for understanding.</p>
 </section>
+<section id="interleaved-output">
+<h2>Interleaved Output<a class="headerlink" href="#interleaved-output" title="Link to this heading">#</a></h2>
+<p>The interleaved variant answers with text and images in one response. Each
+image decodes while the model writes the next text.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span>--model-path<span class="w"> </span>inclusionAI/LLaDA2.0-Uni<span class="w"> </span>--variant<span class="w"> </span>interleaved<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--thinker.engine.enable_torch_compile<span class="w"> </span><span class="nb">false</span>
+</pre></div>
+</div>
+<p>Send text-only <code class="docutils literal notranslate"><span class="pre">messages</span></code> to <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/chat/completions</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+
+<span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+    <span class="s2">"http://localhost:8000/v1/chat/completions"</span><span class="p">,</span>
+    <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">"model"</span><span class="p">:</span> <span class="s2">"inclusionAI/LLaDA2.0-Uni"</span><span class="p">,</span>
+        <span class="s2">"messages"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"Illustrate a three-frame story"</span><span class="p">}],</span>
+        <span class="s2">"stage_params"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"orchestrator"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"max_frames"</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">:</span> <span class="mi">42</span><span class="p">}},</span>
+    <span class="p">},</span>
+    <span class="n">timeout</span><span class="o">=</span><span class="mi">1800</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="n">segments</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">()[</span><span class="s2">"choices"</span><span class="p">][</span><span class="mi">0</span><span class="p">][</span><span class="s2">"message"</span><span class="p">][</span><span class="s2">"segments"</span><span class="p">]</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">choices[0].message.segments</span></code> lists the text and image segments in the order
+the model wrote them, and <code class="docutils literal notranslate"><span class="pre">message.content</span></code> holds the text. With
+<code class="docutils literal notranslate"><span class="pre">stream:</span> <span class="pre">true</span></code>, each segment arrives in <code class="docutils literal notranslate"><span class="pre">choices[0].delta.segment</span></code> as soon as it
+is ready. An image segment carries the PNG with its size and SHA-256, and <code class="docutils literal notranslate"><span class="pre">url</span></code> is a
+PNG data URL:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"segment"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"execution_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"..."</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"segment_index"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"image"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"data"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"image"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"mime_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"image/png"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"size_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">12345</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"sha256"</span><span class="p">:</span><span class="w"> </span><span class="s2">"..."</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"url"</span><span class="p">:</span><span class="w"> </span><span class="s2">"..."</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Optional controls go in <code class="docutils literal notranslate"><span class="pre">stage_params.orchestrator</span></code>: <code class="docutils literal notranslate"><span class="pre">max_frames</span></code> (default
+10, the most the default server admits), <code class="docutils literal notranslate"><span class="pre">text_max_new_tokens</span></code>,
+<code class="docutils literal notranslate"><span class="pre">image_max_new_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">max_image_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">dllm_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">cfg_scale</span></code>,
+<code class="docutils literal notranslate"><span class="pre">cfg_text_scale</span></code>, <code class="docutils literal notranslate"><span class="pre">cfg_image_scale</span></code>, <code class="docutils literal notranslate"><span class="pre">cfg_rescale</span></code>, <code class="docutils literal notranslate"><span class="pre">decode_mode</span></code>,
+<code class="docutils literal notranslate"><span class="pre">decoder_steps</span></code>, and <code class="docutils literal notranslate"><span class="pre">seed</span></code>.</p>
+</section>
 <section id="text-input">
 <h2>Text Input<a class="headerlink" href="#text-input" title="Link to this heading">#</a></h2>
 <p>Send a text-only prompt and get a text response.</p>
@@ -804,19 +851,13 @@ editing is unsupported, and chat completions remain for understanding.</p>
 </tbody>
 </table>
 </div>
-<section id="incoming-features">
-<h3>Incoming Features<a class="headerlink" href="#incoming-features" title="Link to this heading">#</a></h3>
-<ul class="simple">
-<li><p>Interleaved Generation</p></li>
-</ul>
-</section>
 </section>
 <section id="known-limitations">
 <h2>Known Limitations<a class="headerlink" href="#known-limitations" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p>Image generation and editing return one image per non-streaming request.</p></li>
 <li><p>Thinking mode supports text-to-image only.</p></li>
-<li><p>Interleaved generation is an incoming feature.</p></li>
+<li><p>Interleaved output takes text-only input.</p></li>
 </ul>
 </section>
 </section>
@@ -874,12 +915,10 @@ editing is unsupported, and chat completions remain for understanding.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#server-configuration">Server Configuration</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#image-generation-and-editing">Image Generation and Editing</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#thinking-image-generation">Thinking Image Generation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#interleaved-output">Interleaved Output</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#text-input">Text Input</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#image-and-text-input">Image and Text Input</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#incoming-features">Incoming Features</a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-limitations">Known Limitations</a></li>
 </ul>
   </nav></div>
@@ -914,7 +953,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 20, 2026.
+  Last updated on Oct 21, 2026.
   <br/>
 </p>
   </div>
