@@ -219,10 +219,16 @@ def test_generate_all_stages_chains_the_steps_and_stops_at_a_failure(
 
         return record
 
-    def chain(all_stages: bool) -> list[str]:
+    def chain(all_stages: bool, should_run_semantic_judge: bool = True) -> list[str]:
         calls.clear()
         runbook_cli.generate_stages(
-            settings, args.repeat, *selections, args.num_shards, ("0",), all_stages
+            settings,
+            args.repeat,
+            *selections,
+            args.num_shards,
+            ("0",),
+            all_stages,
+            should_run_semantic_judge,
         )
         return [name for name, _, _ in calls]
 
@@ -233,9 +239,19 @@ def test_generate_all_stages_chains_the_steps_and_stops_at_a_failure(
     assert calls == [
         ("generate", (settings, 2, *selections, 3, ("0",)), {}),
         ("asr", (settings, 2), {"retry_failed": False}),
-        ("judge", (settings, 2), {"retry_failed": False}),
+        (
+            "judge",
+            (settings, 2),
+            {"retry_failed": False, "should_run_semantic_judge": True},
+        ),
         ("aggregate", (settings,), {}),
     ]
+    chain(True, should_run_semantic_judge=False)
+    assert calls[2] == (
+        "judge",
+        (settings, 2),
+        {"retry_failed": False, "should_run_semantic_judge": False},
+    )
     monkeypatch.setattr(runbook_cli, "asr", step("asr", "WARNING: rerun asr"))
     with pytest.raises(SystemExit, match="rerun asr"):
         chain(True)
@@ -854,7 +870,7 @@ def test_judge_evaluates_every_pending_subset_and_names_the_failed_ones(
     with pytest.raises(
         SystemExit, match="v1.0 evaluation failed for candor_turn_taking"
     ):
-        judge_module.judge(settings, 1, False)
+        judge_module.judge(settings, 1, False, True)
     assert evaluated_subsets(calls) == ["candor_turn_taking", "icc_backchannel"]
     assert (repeat_dir / "report.txt").is_file()
 
@@ -875,10 +891,10 @@ def test_judge_hands_the_pending_subsets_to_the_judge_phase(
     monkeypatch.setattr(
         judge_module,
         "judge_with_qwen",
-        lambda *arguments: handed.append(arguments[-2:]) or (True, []),
+        lambda *arguments: handed.append(arguments[-3:-1]) or (True, []),
     )
     monkeypatch.setattr(judge_module, "write_report", lambda *_: True)
-    judge_module.judge(settings, 1, False)
+    judge_module.judge(settings, 1, False, True)
     # note (luojiaxuan): the judge-free subset is scored before the judge phase,
     # which gets only the interruption subset.
     assert evaluated_subsets(calls) == ["icc_backchannel"]
@@ -890,9 +906,19 @@ def test_judge_runs_no_v10_phase_for_a_v15_only_repeat(
 ) -> None:
     stage_scored_repeat(settings, None)
     calls = stub_judge_phases(monkeypatch, failing_subset=None)
-    judge_module.judge(settings, 1, False)
+    judge_module.judge(settings, 1, False, True)
     assert calls
     assert not any(V10_CLI in command for command in calls)
+
+
+def test_judge_leaves_out_only_the_semantic_judge_when_asked(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage_scored_repeat(settings, None)
+    calls = stub_judge_phases(monkeypatch, failing_subset=None)
+    judge_module.judge(settings, 1, False, should_run_semantic_judge=False)
+    assert any("custom-judge" in command for command in calls)
+    assert not any("benchmarks.duplex.semantic_judge" in command for command in calls)
 
 
 @pytest.mark.parametrize(
@@ -970,7 +996,7 @@ def test_judge_stops_with_the_server_log_once_the_judge_server_exits(
     monkeypatch.setattr(judge_module, "judge_server", judge_server)
     monkeypatch.setattr(judge_module, "run_command", run)
     with pytest.raises(SystemExit) as stopped:
-        judge_module.judge(settings, 1, False)
+        judge_module.judge(settings, 1, False, True)
     log_file = repeat_dir / "logs" / "judge-server.log"
     assert str(stopped.value) == (
         f"ERROR: the judge server exited with code 1 {stopped_at}; "
@@ -1054,7 +1080,7 @@ def test_asr_and_judge_run_only_the_v10_phases_for_a_v10_only_repeat(
     ]
     (repeat_dir / "v10" / "reference" / "asr.json").write_text("{}")
     judge_calls = stub_judge_phases(monkeypatch, failing_subset=None)
-    judge_module.judge(settings, 1, False)
+    judge_module.judge(settings, 1, False, True)
     assert [command[3] for command in judge_calls] == ["reference-evaluate"] * 2
     assert not (repeat_dir / "report.txt").exists()
     # note (luojiaxuan): a repeat that was never generated has no sample-ids.txt.
@@ -1086,7 +1112,7 @@ def test_judge_starts_no_judge_when_no_llm_request_is_pending(
         "judge_server",
         lambda *_: pytest.fail("the judge server started with no LLM request"),
     )
-    judge_module.judge(settings, 1, False)
+    judge_module.judge(settings, 1, False, True)
     assert evaluated_subsets(calls) == [
         "synthetic_pause_handling",
         "candor_turn_taking",
@@ -1104,10 +1130,10 @@ def test_judge_starts_no_judge_when_no_llm_request_is_pending(
     (interruption / "v10" / "reference" / "asr.json").write_text("{}")
     if judge_name == "gpt":
         with pytest.raises(SystemExit, match="OPENAI_API_KEY"):
-            judge_module.judge(load_settings("v10-interruption"), 1, False)
+            judge_module.judge(load_settings("v10-interruption"), 1, False, True)
     else:
         with pytest.raises(pytest.fail.Exception, match="judge server started"):
-            judge_module.judge(load_settings("v10-interruption"), 1, False)
+            judge_module.judge(load_settings("v10-interruption"), 1, False, True)
 
 
 def test_asr_and_judge_refuse_a_selected_v10_without_its_artifacts(
@@ -1118,12 +1144,12 @@ def test_asr_and_judge_refuse_a_selected_v10_without_its_artifacts(
     with pytest.raises(SystemExit, match="did not finish the v1.0 export"):
         asr_module.asr(settings, 1, False)
     with pytest.raises(SystemExit, match="did not finish the v1.0 export"):
-        judge_module.judge(settings, 1, False)
+        judge_module.judge(settings, 1, False, True)
     tree = repeat_dir / "v10" / "reference"
     tree.mkdir()
     (tree / "manifest.json").write_text("{}")
     with pytest.raises(SystemExit, match="asr.*asr.json is missing"):
-        judge_module.judge(settings, 1, False)
+        judge_module.judge(settings, 1, False, True)
 
 
 def test_evaluate_v10_runs_each_subset_on_its_own_and_reports_failures(

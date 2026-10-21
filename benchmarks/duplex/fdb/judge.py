@@ -107,6 +107,7 @@ def judge_with_qwen(
     has_v15: bool,
     v10_tree: Path | None,
     v10_subsets: list[str],
+    should_run_semantic_judge: bool,
 ) -> tuple[bool, list[str]]:
     scores = repeat_dir / "scores"
     qwen_scores = repeat_dir / "judge-qwen"
@@ -151,35 +152,39 @@ def judge_with_qwen(
                     judge_config,
                 )
             )
-            log(f"== v1.5 semantic A/F/U judge -> {semantic_scores}")
-            is_semantic_ok = run_judge_phase(
-                server,
-                "the v1.5 semantic A/F/U judge",
-                [
-                    str(settings.scoring_python),
-                    "-m",
-                    "benchmarks.duplex.semantic_judge",
-                    "--reference-audio",
-                    str(repeat_dir / "reference-audio"),
-                    "--scores",
-                    str(scores),
-                    "--engine",
-                    settings.engine.name,
-                    "--dataset-root",
-                    str(settings.dataset),
-                    "--out",
-                    str(semantic_scores),
-                    "--base-url",
-                    settings.judge_url,
-                    "--model-id",
-                    JUDGE_MODEL_ID,
-                    "--model-revision",
-                    settings.judge_revision_file.read_text().strip(),
-                    "--served-model",
-                    JUDGE_SERVED_MODEL,
-                ],
-                api_key_env,
-            )
+            if should_run_semantic_judge:
+                log(f"== v1.5 semantic A/F/U judge -> {semantic_scores}")
+                is_semantic_ok = run_judge_phase(
+                    server,
+                    "the v1.5 semantic A/F/U judge",
+                    [
+                        str(settings.scoring_python),
+                        "-m",
+                        "benchmarks.duplex.semantic_judge",
+                        "--reference-audio",
+                        str(repeat_dir / "reference-audio"),
+                        "--scores",
+                        str(scores),
+                        "--engine",
+                        settings.engine.name,
+                        "--dataset-root",
+                        str(settings.dataset),
+                        "--out",
+                        str(semantic_scores),
+                        "--base-url",
+                        settings.judge_url,
+                        "--model-id",
+                        JUDGE_MODEL_ID,
+                        "--model-revision",
+                        settings.judge_revision_file.read_text().strip(),
+                        "--served-model",
+                        JUDGE_SERVED_MODEL,
+                    ],
+                    api_key_env,
+                )
+            else:
+                log("== v1.5 semantic A/F/U judge skipped")
+                is_semantic_ok = True
             is_v15_ok = is_judge_ok and is_summary_ok and is_semantic_ok
         else:
             pass
@@ -283,7 +288,12 @@ def write_report(
     return is_summary_ok and report.returncode == 0
 
 
-def judge(settings: Settings, repeat: int, retry_failed: bool) -> None:
+def judge(
+    settings: Settings,
+    repeat: int,
+    retry_failed: bool,
+    should_run_semantic_judge: bool,
+) -> None:
     repeat_dir = settings.repeat_dir(repeat)
     has_v15 = selected_v15(settings, repeat)
     if (
@@ -336,9 +346,20 @@ def judge(settings: Settings, repeat: int, retry_failed: bool) -> None:
         log(f"WARNING: the v1.0 evaluation failed for {', '.join(failed_v10)}")
     else:
         pass
-    if has_v15 or judged_v10:
-        judge_with = judge_with_qwen if settings.judge == "qwen" else judge_with_gpt
-        is_judge_ok, failed_judged = judge_with(
+    if (has_v15 or judged_v10) and settings.judge == "qwen":
+        is_judge_ok, failed_judged = judge_with_qwen(
+            settings,
+            repeat_dir,
+            tree_arguments,
+            retry_arguments,
+            has_v15,
+            v10_tree,
+            judged_v10,
+            should_run_semantic_judge,
+        )
+        failed_v10 += failed_judged
+    elif has_v15 or judged_v10:
+        is_judge_ok, failed_judged = judge_with_gpt(
             settings,
             repeat_dir,
             tree_arguments,
