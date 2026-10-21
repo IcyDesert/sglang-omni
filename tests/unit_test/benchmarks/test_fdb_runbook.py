@@ -25,7 +25,6 @@ from benchmarks.duplex.fdb.__main__ import build_parser, sample_selection
 from benchmarks.duplex.fdb.aggregate import render
 from benchmarks.duplex.fdb.common import (
     PARAKEET_SHA256,
-    RECORD_PROFILE,
     Settings,
     load_settings,
     require_v10_export,
@@ -617,7 +616,7 @@ def test_v10_record_and_export_commands_parse_with_the_v10_cli(
     ]
     args = run_v10_cli(shard, "record", monkeypatch)
     assert args.sample_id == [V10_IDS[0]]
-    assert args.profile == RECORD_PROFILE
+    assert args.profile == settings.engine.record_profile
     assert args.dataset_root == settings.dataset_v10
     assert args.dataset_revision == V10_REVISION
     assert args.url == settings.realtime_url
