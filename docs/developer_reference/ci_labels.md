@@ -90,8 +90,8 @@ The stage label is `run-tts-ci`. A model label picks the model for stages 1, 2, 
 
 | Model label | Checkpoint | In the random pool |
 | --- | --- | --- |
-| `run-tts-higgs-tts-3-4b` | `bosonai/higgs-tts-3-4b` | Yes |
-| `run-tts-moss-tts-local-transformer-v1.5` | `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` | Yes |
+| `run-higgs-tts-3-4b` | `bosonai/higgs-tts-3-4b` | Yes |
+| `run-moss-tts-local-transformer-v1.5` | `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` | Yes |
 | `run-tts-qwen3-tts-12hz-1.7b-base` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Yes |
 | `run-tts-qwen3-tts-12hz-1.7b-customvoice` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | No |
 | `run-tts-fun-cosyvoice3-0.5b-2512` | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Yes |
@@ -102,12 +102,12 @@ Qwen3-TTS CustomVoice uses a named voice instead of a reference clip, and its th
 
 MPS has one job, stage 1 - MPS non-streaming. It runs two TTS router workers on a single H100 that share the GPU through CUDA MPS, and checks three things: the two workers are separate MPS clients on the intended GPU, they actually execute at the same time, and the non-streaming word error rate, speaker similarity, UTMOS and audio integrity match the TTS stage's assertions.
 
-The stage label is `run-mps-ci`. MPS draws its model independently of the TTS stage, and TTS model labels do not affect it:
+The stage label is `run-mps-ci`. MPS has no model labels of its own. Higgs and MOSS use the TTS labels below. The label does not run MPS. With `run-tts-ci` and `run-mps-ci`, one of these labels selects that model for both stages. With only `run-tts-ci`, MPS does not run. With no Higgs or MOSS label, MPS draws from its own pool.
 
 | Model label | Checkpoint | MPS config | In the random pool |
 | --- | --- | --- | --- |
-| `run-mps-higgs-tts-3-4b` | `bosonai/higgs-tts-3-4b` | `examples/mps_dp/configs/higgs_h100_dp3.yaml` | Yes |
-| `run-mps-moss-tts-local-transformer-v1.5` | `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` | `examples/mps_dp/configs/moss_local_h100_dp2.yaml` | Yes |
+| `run-higgs-tts-3-4b` | `bosonai/higgs-tts-3-4b` | `examples/mps_dp/configs/higgs_h100_dp3.yaml` | Yes |
+| `run-moss-tts-local-transformer-v1.5` | `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` | `examples/mps_dp/configs/moss_local_h100_dp2.yaml` | Yes |
 
 ### Omni
 
@@ -158,7 +158,7 @@ The stage label is `run-mac-ci`.
 1. A stage runs only when its stage label or `run-all-ci` is on the pull request. `run-all-ci` selects every stage.
 2. Self-hosted CI needs `run-all-ci`, a stage label, or `run-lint-only`. Without one, the gates of Omni CI and the hardware workflows fail with `No CI label found`. The checks on GitHub-hosted runners do not depend on labels. `run-lint-only` runs no self-hosted job, so a green lint check leaves no self-hosted failure. It does not turn off a stage label that is also present.
 3. Any stage label also runs PR Test. A pull request labeled only `run-mac-ci` still runs PR Test on H100.
-4. A model label only picks the model of a selected stage. It never selects a stage by itself. If neither its stage label nor `run-all-ci` is present, the label is ignored and the gate prints a warning.
+4. A model label picks the model of every selected stage that accepts it. It never selects a stage by itself. Higgs and MOSS labels are accepted by TTS and MPS. If no selected stage accepts the label, the gate prints a warning.
 5. A selected stage without a model label draws its model at random from that stage's pool. The draw is seeded by the workflow run ID, so re-running jobs in the same run keeps the same model, while a new push or a newly added label starts a new run and draws again.
 6. Each stage takes at most one model label. Two model labels for the same stage fail the gate, even when that stage is not selected.
 7. Stage labels combine. `run-tts-ci` together with `run-mps-ci` runs PR Test, TTS and MPS, and nothing else.
@@ -186,14 +186,16 @@ The checks on GitHub-hosted runners run in every case below, so the table lists 
 | `run-lint-only` | Nothing self-hosted. The gates succeed. |
 | `run-unit-test-ci-only` | PR Test only, after shared setup. |
 | `run-tts-ci` | PR Test, then TTS on a random model from its pool. |
-| `run-tts-ci`, `run-tts-moss-tts-local-transformer-v1.5` | PR Test, then TTS on MOSS-TTS. |
-| `run-tts-ci`, `run-mps-ci` | PR Test, TTS and MPS, each with its own random model. |
+| `run-tts-ci`, `run-moss-tts-local-transformer-v1.5` | PR Test, then TTS on MOSS-TTS. MPS does not run. |
+| `run-mps-ci`, `run-higgs-tts-3-4b` | PR Test, then MPS on Higgs-TTS. TTS does not run. |
+| `run-tts-ci`, `run-mps-ci` | PR Test, TTS and MPS, each drawing its own model. |
+| `run-tts-ci`, `run-mps-ci`, `run-higgs-tts-3-4b` | PR Test, then TTS and MPS, both on Higgs-TTS. |
 | `run-mac-ci` | PR Test on H100 and Voxt Mac CI. No H100 model stage. |
 | `run-all-ci` | Every stage. Each model stage draws its own model. |
 | `run-all-ci`, `run-omni-minicpm-o-4.5` | Every stage. Omni uses MiniCPM-o 4.5, the other stages draw at random. |
 | `run-tts-ci`, `run-omni-minicpm-o-4.5` | PR Test and TTS. The Omni model label is ignored with a warning, because Omni is not selected. |
 | `run-omni-minicpm-o-4.5` | Nothing. The gate fails, because a model label does not select a stage. |
-| `run-tts-ci`, `run-tts-higgs-tts-3-4b`, `run-tts-moss-tts-local-transformer-v1.5` | Nothing. The gate fails, because TTS has two model labels. |
+| `run-tts-ci`, `run-higgs-tts-3-4b`, `run-moss-tts-local-transformer-v1.5` | Nothing. The gate fails, because TTS and MPS accept two model labels. |
 
 ## Label changes, re-runs and manual runs
 
@@ -207,7 +209,7 @@ A maintainer can start Omni CI by hand from the Actions tab or with `gh workflow
 
 ```bash
 gh workflow run omni-ci.yaml --ref <branch> \
-  -f ci_labels="run-tts-ci run-tts-moss-tts-local-transformer-v1.5"
+  -f ci_labels="run-tts-ci run-moss-tts-local-transformer-v1.5"
 ```
 
 Manual runs of CPU CI, XPU CI and Voxt Mac CI ignore labels and always run their tests.
@@ -224,11 +226,11 @@ Maintainers with CI permissions can use `/tag-and-rerun-ci` with one or more sho
 /tag-and-rerun-ci mps-higgs
 ```
 
-Stage targets are `lint`, `unit-test`, `asr`, `tts`, `mps`, `omni`, `intel-cpu`, `intel-xpu` and `mac`. `lint` adds `run-lint-only`. Model targets are `fun-asr`, `qwen3-asr`, `whisper-asr`, `higgs`, `moss`, `qwen3-tts`, `qwen3-tts-custom-voice`, `cosyvoice3`, `qwen3-omni`, `minicpmo`, `mps-higgs` and `mps-moss`. A short model target adds both its stage label and its model label.
+Stage targets are `lint`, `unit-test`, `asr`, `tts`, `mps`, `omni`, `intel-cpu`, `intel-xpu` and `mac`. `lint` adds `run-lint-only`. Model targets are `fun-asr`, `qwen3-asr`, `whisper-asr`, `higgs`, `moss`, `qwen3-tts`, `qwen3-tts-custom-voice`, `cosyvoice3`, `qwen3-omni`, `minicpmo`, `mps-higgs` and `mps-moss`. `higgs` and `moss` add `run-tts-ci` plus `run-higgs-tts-3-4b` or `run-moss-tts-local-transformer-v1.5`. `mps-higgs` and `mps-moss` add `run-mps-ci` plus that same model label. A short model target adds its stage label and its model label.
 
-Use `/tag-and-rerun-full-ci` to add `run-all-ci` and select all stages. It also accepts short model targets, for example `/tag-and-rerun-full-ci qwen3-tts qwen3-asr qwen3-omni`. Add `mps-higgs` or `mps-moss` to select the MPS model independently. Model choices not specified by the command keep their existing labels or use the normal random selection. Bare `/tag-and-rerun-ci` and full GitHub label arguments, such as `run-tts-ci` or `run-all-ci`, are not accepted. Manual dispatch still accepts full labels through its `ci_labels` input.
+Use `/tag-and-rerun-full-ci` to add `run-all-ci` and select all stages. It also accepts short model targets, for example `/tag-and-rerun-full-ci qwen3-tts qwen3-asr qwen3-omni`. `higgs` or `mps-higgs` selects Higgs for every selected stage that accepts it, TTS and MPS included. Model choices not specified by the command keep their existing labels or use the normal random selection. Bare `/tag-and-rerun-ci` and full GitHub label arguments, such as `run-tts-ci` or `run-all-ci`, are not accepted. Manual dispatch still accepts full labels through its `ci_labels` input.
 
-The command replaces conflicting model labels only in the requested stages and keeps other labels, including an existing `run-all-ci`. Existing stage labels still apply, so arguments do not narrow an already broader selection. It re-runs all jobs of the newest completed selected parent workflows on the current PR commit, unless GitHub requires workflow approval. If the newest run is active, the command leaves it running rather than retrying an older run. To apply changed labels after preflight has resolved the selection, run the command again after the active workflow finishes. Path filters and PR gates still apply.
+The command replaces a conflicting Higgs or MOSS label for both TTS and MPS, because those labels are shared. It replaces other model labels only in the requested stages, and keeps other labels, including an existing `run-all-ci`. Existing stage labels still apply, so arguments do not narrow an already broader selection. It re-runs all jobs of the newest completed selected parent workflows on the current PR commit, unless GitHub requires workflow approval. If the newest run is active, the command leaves it running rather than retrying an older run. To apply changed labels after preflight has resolved the selection, run the command again after the active workflow finishes. Path filters and PR gates still apply.
 
 `/tag-run-ci-label` accepts the same short targets but only updates labels; without arguments, it adds `run-all-ci`. Labels added by the bot do not start workflows; push a commit or use a tag-and-rerun command to start them. `/rerun-failed-ci` retries failed jobs without changing labels or stopping active runs. PR authors can use it on their own PRs.
 

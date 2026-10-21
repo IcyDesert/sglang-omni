@@ -326,7 +326,7 @@ they are.
 Run CI with `run-all-ci`. A stage without a model label draws its model at
 random, so give each preset its own run on the new image before merge: keep
 `run-all-ci` and add one model label per stage, for example
-`run-tts-moss-tts-local-transformer-v1.5`, `run-asr-fun-asr-nano-2512` and
+`run-moss-tts-local-transformer-v1.5`, `run-asr-fun-asr-nano-2512` and
 `run-omni-minicpm-o-4.5`. The model labels within a stage are exclusive. The
 CI section of the pull request template lists every label.
 
