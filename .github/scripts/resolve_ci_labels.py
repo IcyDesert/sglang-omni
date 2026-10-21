@@ -83,7 +83,6 @@ CI_STAGES: tuple[CiStage, ...] = (
         },
         random_presets=("qwen3-omni", "minicpmo"),
     ),
-
     CiStage(
         name="full_duplex",
         label="run-full-duplex",
