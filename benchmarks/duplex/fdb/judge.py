@@ -11,7 +11,6 @@ from pathlib import Path
 
 from benchmarks.duplex.fdb.common import (
     CUSTOM_JUDGE_API_KEY_ENV,
-    ENGINE_LABEL,
     GPT_JUDGE_MODEL,
     JUDGE_MODEL_ID,
     JUDGE_SERVED_MODEL,
@@ -165,7 +164,7 @@ def judge_with_qwen(
                     "--scores",
                     str(scores),
                     "--engine",
-                    ENGINE_LABEL,
+                    settings.engine.name,
                     "--dataset-root",
                     str(settings.dataset),
                     "--out",
@@ -273,7 +272,7 @@ def write_report(
                 "--scores",
                 str(scores),
                 "--engine",
-                ENGINE_LABEL,
+                settings.engine.name,
                 *semantic_arguments,
             ),
             cwd=REPO_ROOT,
@@ -290,7 +289,11 @@ def judge(settings: Settings, repeat: int, retry_failed: bool) -> None:
     if (
         has_v15
         and not (
-            repeat_dir / "scores" / "engines" / ENGINE_LABEL / "manifest-receipt.json"
+            repeat_dir
+            / "scores"
+            / "engines"
+            / settings.engine.name
+            / "manifest-receipt.json"
         ).is_file()
     ):
         raise SystemExit(f"ERROR: run `{step_command('asr', settings, repeat)}` first.")
@@ -310,7 +313,7 @@ def judge(settings: Settings, repeat: int, retry_failed: bool) -> None:
         "--reference-source",
         str(settings.fdb_source),
         "--tree",
-        f"{ENGINE_LABEL}={repeat_dir / 'reference-audio'}",
+        f"{settings.engine.name}={repeat_dir / 'reference-audio'}",
     ]
     retry_arguments = ["--retry-failed"] if retry_failed else []
     # note (luojiaxuan): only the v1.0 interruption subset asks an LLM; the other
