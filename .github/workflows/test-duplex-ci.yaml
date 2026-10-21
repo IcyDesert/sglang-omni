@@ -74,8 +74,9 @@ jobs:
           source omni/bin/activate
           export PYTHONPATH=$PWD
           bash .github/scripts/run_flaky_pytest.sh \
-            pytest tests/test_model/test_minicpmo_fdb_ci.py -v -s -x
+            pytest tests/test_model/test_fdb_ci.py -v -s -x
         env:
+          FDB_CI_STRATEGY: full-duplex
           HF_ENDPOINT: https://huggingface.co
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
 
@@ -121,8 +122,9 @@ jobs:
           source omni/bin/activate
           export PYTHONPATH=$PWD
           bash .github/scripts/run_flaky_pytest.sh \
-            pytest tests/test_model/test_qwen3_omni_fdb_ci.py -v -s -x
+            pytest tests/test_model/test_fdb_ci.py -v -s -x
         env:
+          FDB_CI_STRATEGY: turn-based
           HF_ENDPOINT: https://huggingface.co
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
 
@@ -168,8 +170,9 @@ jobs:
           source omni/bin/activate
           export PYTHONPATH=$PWD
           bash .github/scripts/run_flaky_pytest.sh \
-            pytest tests/test_model/test_cascade_fdb_ci.py -v -s -x
+            pytest tests/test_model/test_fdb_ci.py -v -s -x
         env:
+          FDB_CI_STRATEGY: cascaded
           HF_ENDPOINT: https://huggingface.co
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
 
