@@ -25,9 +25,6 @@ from sglang_omni.models.sensenova_u1.cache_dit import (
     decoder_layers,
 )
 from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
-    _ATTN_BACKEND as _ATTN_BACKEND,
-)
-from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
     create_block_causal_mask as create_block_causal_mask,
 )
 from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
