@@ -12,28 +12,30 @@ from sglang.srt.layers.layernorm import RMSNorm
 from transformers.cache_utils import DynamicCache
 
 from sglang_omni.models.sensenova_u1 import stages
-from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import flash_or_sdpa
+from sglang_omni.models.sensenova_u1.neo_unify import (
+    attention_backend as attention_backend_module,
+)
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
+    create_block_causal_mask,
+    flash_or_sdpa,
+    npu_fia_available,
+    npu_swiglu_available,
+    position_ids_from_indexes,
+    sdpa_attn_func,
+)
 from sglang_omni.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOLLMConfig,
 )
 from sglang_omni.models.sensenova_u1.neo_unify.flash_cache import (
     copy_right_aligned_prefix_bnsd,
-    prepare_i2i_flash_kv_cache,
-)
-from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import (
-    NEOChatModel,
     prepare_flash_kv_cache,
-    randn_with_seed,
 )
-from sglang_omni.models.sensenova_u1.neo_unify.modeling_qwen3 import (
-    Qwen3Attention,
+from sglang_omni.models.sensenova_u1.neo_unify.generation_math import randn_with_seed
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
+from sglang_omni.models.sensenova_u1.neo_unify.qwen_attention import Qwen3Attention
+from sglang_omni.models.sensenova_u1.neo_unify.qwen_feed_forward import (
     Qwen3MLP,
-    create_block_causal_mask,
     make_qwen3_rms_norm,
-    npu_fia_available,
-    npu_swiglu_available,
-    position_ids_from_indexes,
-    sdpa_attn_func,
 )
 from sglang_omni.platforms import current_platform as model_platform
 
@@ -57,7 +59,7 @@ def test_right_aligns_bnsd_prefix_for_npu_fia():
 
 
 @pytest.mark.parametrize("prefix_length", [2, 5, 9])
-def test_prepares_each_i2i_prefix_length_for_attention(prefix_length):
+def test_full_length_prefixes_keep_the_unmasked_attention_path(prefix_length):
     batch_size = 2
     cache = DynamicCache()
     cache.update(
@@ -66,11 +68,17 @@ def test_prepares_each_i2i_prefix_length_for_attention(prefix_length):
         layer_idx=0,
     )
 
-    prepare_i2i_flash_kv_cache(cache, current_len=3, batch_size=batch_size)
+    prepare_flash_kv_cache(
+        cache,
+        current_len=3,
+        batch_size=batch_size,
+        prefix_lengths=torch.full((batch_size,), prefix_length),
+    )
 
     layer = cache.layers[0]
     assert layer.flash_cache_layout == "BSND"
-    assert layer.flash_actual_seq_lengths_kv == [prefix_length + 3] * batch_size
+    assert layer.flash_actual_seq_lengths_kv is None
+    assert layer.flash_key_padding_mask is None
     assert layer.flash_k_cache.shape == (batch_size, prefix_length + 3, 2, 4)
     assert layer.flash_v_cache.shape == (batch_size, prefix_length + 3, 2, 4)
 
@@ -205,20 +213,13 @@ def test_builds_per_sample_image_indexes():
     assert indexes[:, 2].tolist() == [[0, 1, 0, 1], [0, 1, 0, 1]]
 
 
-def test_compacts_variable_length_kv_before_attention():
-    generator = torch.Generator().manual_seed(29)
-    q = torch.randn(2, 3, 4, 8, generator=generator)
-    k = torch.randn(2, 8, 2, 8, generator=generator)
-    v = torch.randn(2, 8, 2, 8, generator=generator)
-    actual = flash_or_sdpa(q, k, v, actual_seq_lengths_kv=[5, 8])
-
-    expected_short = sdpa_attn_func(
-        q[:1],
-        torch.cat((k[:1, :2], k[:1, 5:]), dim=1),
-        torch.cat((v[:1, :2], v[:1, 5:]), dim=1),
-    )
-    expected_long = sdpa_attn_func(q[1:], k[1:], v[1:])
-    torch.testing.assert_close(actual, torch.cat((expected_short, expected_long)))
+def test_kv_lengths_outside_npu_fia_are_rejected():
+    """Per-row KV lengths outside NPU FIA would silently attend to padded keys."""
+    q = torch.randn(2, 3, 4, 8)
+    k = torch.randn(2, 8, 2, 8)
+    v = torch.randn(2, 8, 2, 8)
+    with pytest.raises(RuntimeError, match="NPU FIA"):
+        flash_or_sdpa(q, k, v, actual_seq_lengths_kv=[5, 8])
 
 
 def test_sdpa_masks_padded_prefix_keys():
@@ -482,6 +483,14 @@ def test_prefix_and_denoise_attention_match_singletons(monkeypatch):
     text = torch.randn(2, 5, 64, generator=generator)
     image = torch.randn(2, 3, 64, generator=generator)
     helper = SimpleNamespace(device=torch.device("cpu"))
+    attention_batch_sizes: list[int] = []
+    sdpa = attention_backend_module.sdpa_attn_func
+
+    def record_sdpa(q, k, v, *args, **kwargs):
+        attention_batch_sizes.append(q.shape[0])
+        return sdpa(q, k, v, *args, **kwargs)
+
+    monkeypatch.setattr(attention_backend_module, "sdpa_attn_func", record_sdpa)
 
     def run(prefix, lengths, image_states):
         batch_size, width, _ = prefix.shape
@@ -519,6 +528,8 @@ def test_prefix_and_denoise_attention_match_singletons(monkeypatch):
         return prefix_keys, outputs
 
     keys, batched = run(text, [2, 5], image)
+    # The padded batch attends in one call per denoise step, not once per row.
+    assert attention_batch_sizes == [2, 2]
     for index, length in enumerate([2, 5]):
         single_keys, single = run(
             text[index : index + 1, :length],

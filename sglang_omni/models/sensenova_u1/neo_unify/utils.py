@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import torch
 import torchvision.transforms as T
 from PIL import Image
-from pydantic import JsonValue
-
-from sglang_omni.models.sensenova_u1.image_processing import smart_resize
 
 # Modified for SGLang; see this directory's README.md for upstream source.
 
@@ -38,24 +33,6 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def dynamic_preprocess_native_resolution(
-    image: Image.Image,
-    size_factor: int = 32,
-    min_pixels: int = 65536,
-    max_pixels: int = 4194304,
-    **_kwargs: JsonValue,
-) -> Image.Image:
-    width, height = image.size
-    resized_height, resized_width = smart_resize(
-        height,
-        width,
-        factor=size_factor,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-    )
-    return image.resize((resized_width, resized_height))
-
-
 def preprocess_pixel_values(
     pixel_values: torch.Tensor, patch_size: int = 16
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -73,56 +50,20 @@ def preprocess_pixel_values(
     return flatten_pixel_values, grid_hw
 
 
-def get_contrasting_background(image: Image.Image) -> tuple[int, int, int]:
-    """Return a background color for RGBA->RGB conversion, or None to use default."""
-    # note (Wes): Retain the image argument for callers; the background is fixed white.
-    return (255, 255, 255)
-
-
 def load_image_native(
-    image: Image.Image | str | Path,
-    patch_size: int = 16,
-    downsample_ratio: float = 0.5,
-    min_pixels: int = 65536,
-    max_pixels: int = 4194304,
-    upscale: bool = False,
+    image: Image.Image,
+    patch_size: int,
+    downsample_ratio: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Load and preprocess an image: RGB convert, smart-resize, normalize, patchify."""
-    if not isinstance(image, Image.Image):
-        image = Image.open(image)
-    else:
-        pass
-    if image.mode == "RGBA":
-        bg_color = get_contrasting_background(image)
-        if bg_color:
-            background = Image.new("RGB", image.size, bg_color)
-            background.paste(image, mask=image.split()[3])
-            image = background.convert("RGB")
-        else:
-            image = image.convert("RGB")
-    else:
-        image = image.convert("RGB")
-
-    if upscale:
-        image = image.resize((image.width * 2, image.height * 2), Image.BILINEAR)
-    else:
-        pass
-
+    """Normalize and pack a reference already resized by image_processing."""
+    image_factor = int(patch_size / downsample_ratio)
+    assert image.width % image_factor == 0 and image.height % image_factor == 0
     transform = T.Compose(
         [
-            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
             T.ToTensor(),
             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
     )
-
-    new_image = dynamic_preprocess_native_resolution(
-        image,
-        size_factor=int(patch_size // downsample_ratio),
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
+    return preprocess_pixel_values(
+        transform(image).to(torch.float32), patch_size=patch_size
     )
-    pixel_values, grid_hw = preprocess_pixel_values(
-        transform(new_image).to(torch.float32), patch_size=patch_size
-    )
-    return pixel_values, grid_hw

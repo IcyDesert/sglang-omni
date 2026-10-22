@@ -46,10 +46,8 @@ def test_native_outputs_and_seed_order(
     generate_image(request, model, tokenizer)
     model.t2i_generate.assert_called_once()
     assert model.t2i_generate.call_args.args[1] == "a cat"
-    assert model.t2i_generate.call_args.kwargs["batch_size"] == n
-    assert model.t2i_generate.call_args.kwargs["seed"] == (
-        7 if n == 1 else list(range(7, 7 + n))
-    )
+    assert model.t2i_generate.call_args.kwargs["sampling"].n == n
+    assert model.t2i_generate.call_args.kwargs["sampling"].seed == 7
     outputs = [request.data["image_b64"]] if n == 1 else request.data["images_b64"]
     assert len(outputs) == n
     for index, encoded in enumerate(outputs):
@@ -64,19 +62,50 @@ def test_native_outputs_and_seed_order(
         )
 
 
-def test_multi_output_requests_execute_separately(
+def test_image_edit_returns_every_output_from_one_request(
+    tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    """Edits accepted only one output per request, so n outputs re-sent every reference."""
+    reference = io.BytesIO()
+    Image.new("RGB", (32, 32), (255, 0, 0)).save(reference, format="PNG")
+    request = StagePayload(
+        request_id="edit",
+        request=OmniRequest(
+            inputs={
+                "task": "image_edit",
+                "prompt": "edit",
+                "image_b64": base64.b64encode(reference.getvalue()).decode("ascii"),
+            },
+            params={
+                "width": 32,
+                "height": 32,
+                "size_explicit": True,
+                "seed": 7,
+                "n": 2,
+            },
+        ),
+        data=None,
+    )
+    model = Mock()
+    model.it2i_generate.return_value = torch.zeros(1, 3, 32, 32)
+    generate_image(request, model, tokenizer)
+    assert [
+        (call.kwargs["sampling"].n, call.kwargs["sampling"].seed)
+        for call in model.it2i_generate.call_args_list
+    ] == [(1, 7), (1, 8)]
+    assert len(request.data["images_b64"]) == 2
+    assert image_generation_request_cost(request) == 2 * 32 * 32 * 50 * 2
+
+
+def test_compatible_batch_reaches_the_model_in_one_call(
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     model = Mock()
-    model.t2i_generate.side_effect = [
-        torch.zeros(2, 3, 32, 32),
-        torch.zeros(1, 3, 32, 32),
-    ]
-    requests = [payload(2), payload(1)]
+    model.t2i_generate.return_value = torch.zeros(2, 3, 32, 32)
+    requests = [payload(1), payload(1)]
     assert generate_images(requests, model, tokenizer) == requests
-    assert [
-        call.kwargs["batch_size"] for call in model.t2i_generate.call_args_list
-    ] == [2, 1]
+    model.t2i_generate.assert_called_once()
+    assert model.t2i_generate.call_args.kwargs["seeds"] == [7, 7]
 
 
 @pytest.mark.parametrize("output", [None, torch.zeros(1, 3, 32, 32)])

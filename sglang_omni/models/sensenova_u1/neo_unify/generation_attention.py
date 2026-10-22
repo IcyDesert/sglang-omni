@@ -160,6 +160,10 @@ def forward_gen(
                             layer, "flash_actual_seq_lengths_kv", None
                         )
                         kv_padding_size = getattr(layer, "flash_kv_padding_size", None)
+                        if attention_mask is None:
+                            attention_mask = layer.flash_key_padding_mask
+                        else:
+                            pass
                     else:
                         past_k, past_v = layer.keys, layer.values
                         if past_k is not None:

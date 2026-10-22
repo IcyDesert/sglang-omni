@@ -5,10 +5,8 @@ import threading
 
 import pytest
 
-from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
-    TensorParallelScheduler,
-)
 from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.scheduling.tensor_parallel_scheduler import TensorParallelScheduler
 
 
 def request(request_id):
@@ -27,7 +25,10 @@ def test_asymmetric_abort_preserves_collective_order():
         return request_id
 
     schedulers = [
-        TensorParallelScheduler(lambda value, rank=rank: compute(rank, value))
+        TensorParallelScheduler(
+            lambda value, rank=rank: compute(rank, value),
+            shutdown_join_timeout_s=5.0,
+        )
         for rank in range(2)
     ]
     threads = [
@@ -81,7 +82,9 @@ def test_shutdown_drains_work_before_cleanup_on_compute_thread():
         events.append("cleanup")
         cleanup_threads.append(threading.get_ident())
 
-    scheduler = TensorParallelScheduler(compute, shutdown_callback=cleanup)
+    scheduler = TensorParallelScheduler(
+        compute, shutdown_join_timeout_s=5.0, shutdown_callback=cleanup
+    )
     thread = threading.Thread(target=scheduler.start, daemon=True)
     scheduler.inbox.put(request("active"))
     scheduler.inbox.put(request("queued"))
@@ -106,6 +109,7 @@ def test_stop_before_thread_start_still_drains_and_cleans_up():
     events = []
     scheduler = TensorParallelScheduler(
         lambda value: events.append(value),
+        shutdown_join_timeout_s=5.0,
         shutdown_callback=lambda: events.append("cleanup"),
     )
     scheduler.abort("queued")
@@ -131,7 +135,9 @@ def test_failure_is_reported_while_cleanup_is_blocked():
         cleanup_entered.set()
         assert release_cleanup.wait(3)
 
-    scheduler = TensorParallelScheduler(compute, shutdown_callback=cleanup)
+    scheduler = TensorParallelScheduler(
+        compute, shutdown_join_timeout_s=5.0, shutdown_callback=cleanup
+    )
     scheduler.failure_callback = failures.append
     scheduler.inbox.put(request("failed"))
 
@@ -148,7 +154,7 @@ def test_failure_is_reported_while_cleanup_is_blocked():
         assert thread.is_alive()
         assert len(failures) == 1
         assert str(failures[0].__cause__) == "rank-local allocation failed"
-        assert scheduler.wait_for_shutdown is False
+        assert scheduler.shutdown_join_timeout_s is None
         assert scheduler.outbox.get_nowait().type == "error"
     finally:
         release_cleanup.set()
@@ -165,7 +171,9 @@ def test_forward_failure_does_not_reuse_collectives_for_the_next_request():
         raise RuntimeError("rank-local allocation failed")
 
     scheduler = TensorParallelScheduler(
-        compute, shutdown_callback=lambda: calls.append("cleanup")
+        compute,
+        shutdown_join_timeout_s=5.0,
+        shutdown_callback=lambda: calls.append("cleanup"),
     )
     scheduler.inbox.put(request("failed"))
     scheduler.inbox.put(request("next"))

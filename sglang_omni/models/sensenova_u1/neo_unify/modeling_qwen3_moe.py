@@ -3,56 +3,30 @@
 import torch
 from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, can_return_tuple
+from transformers.utils import TransformersKwargs
 
 from sglang_omni.models.sensenova_u1.cache_dit import (
     decoder_attention_type,
     decoder_layers,
 )
-from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
-    create_block_causal_mask,
-    position_ids_from_indexes,
-)
 from sglang_omni.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOMoELLMConfig,
 )
-from sglang_omni.models.sensenova_u1.neo_unify.moe_layers import (
-    Qwen3MoeDecoderLayer,
-    Qwen3MoeMLP,
-    Qwen3MoeSparseMoeBlock,
-)
+from sglang_omni.models.sensenova_u1.neo_unify.moe_layers import Qwen3MoeDecoderLayer
 from sglang_omni.models.sensenova_u1.neo_unify.qwen_attention import Qwen3Attention
 from sglang_omni.models.sensenova_u1.neo_unify.qwen_feed_forward import (
-    SenseNovaRMSNorm as _SenseNovaRMSNorm,
-)
-from sglang_omni.models.sensenova_u1.neo_unify.qwen_feed_forward import (
+    SenseNovaRMSNorm,
     make_qwen3_rms_norm,
 )
 from sglang_omni.models.sensenova_u1.neo_unify.transformers_compat import (
-    causal_mask_kwargs,
     model_input_compat,
     tied_weights_keys,
 )
 
 # Modified for SGLang; see this directory's README.md for upstream source.
-
-
-__all__ = [
-    "Qwen3MoeMLP",
-    "Qwen3MoeSparseMoeBlock",
-    "Qwen3MoeDecoderLayer",
-    "Qwen3MoePreTrainedModel",
-    "Qwen3MoeModel",
-    "Qwen3MoeForCausalLM",
-]
 
 
 class Qwen3MoePreTrainedModel(PreTrainedModel):
@@ -88,16 +62,15 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm: _SenseNovaRMSNorm = make_qwen3_rms_norm(
+        self.norm: SenseNovaRMSNorm = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.norm_mot_gen: _SenseNovaRMSNorm = make_qwen3_rms_norm(
+        self.norm_mot_gen: SenseNovaRMSNorm = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
         self.gradient_checkpointing: bool = False
         self.has_sliding_layers: bool = "sliding_attention" in self.config.layer_types
-        self.current_index: int = -1
 
         self.post_init()
 
@@ -107,7 +80,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         image_gen_indicators: torch.Tensor | None = None,
         indexes: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: dict[str, torch.Tensor | None] | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
@@ -160,34 +133,6 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         else:
             pass
 
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            if input_ids is not None:
-                mask_kwargs = causal_mask_kwargs(
-                    create_causal_mask,
-                    config=self.config,
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    cache_position=cache_position,
-                    past_key_values=past_key_values,
-                    position_ids=position_ids,
-                )
-                causal_mask_mapping = {
-                    "full_attention": create_causal_mask(**mask_kwargs),
-                }
-                self.current_index += 1
-                indexes = torch.LongTensor([[self.current_index], [0], [0]]).to(
-                    input_ids.device
-                )
-            else:
-                causal_mask_mapping = {
-                    "full_attention": create_block_causal_mask(
-                        position_ids_from_indexes(indexes, 0)
-                    ),
-                }
-                self.current_index = position_ids_from_indexes(indexes, 0).max()
-        else:
-            self.current_index = position_ids_from_indexes(indexes, 0).max()
-
         hidden_states = inputs_embeds
 
         layers = decoder_layers(
@@ -204,7 +149,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
-                attention_mask=causal_mask_mapping[attention_type],
+                attention_mask=attention_mask[attention_type],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -217,14 +162,10 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         elif not exist_non_image_gen_tokens:
             hidden_states = self.norm_mot_gen(hidden_states)
         else:
-            _hidden_states = hidden_states.new_zeros(hidden_states.shape)
-            _hidden_states[~image_gen_indicators] = self.norm(
-                hidden_states[~image_gen_indicators]
+            raise NotImplementedError(
+                "Mixed und/gen backbone forward is not supported. "
+                "Split the sequence at token-type boundaries."
             )
-            _hidden_states[image_gen_indicators] = self.norm_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-            hidden_states = _hidden_states
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -232,7 +173,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         )
 
 
-class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
+class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
     _tied_weights_keys = tied_weights_keys(
         "lm_head.weight", "model.embed_tokens.weight"
     )
@@ -250,66 +191,5 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         )
         self.post_init()
 
-    @can_return_tuple
-    def forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
-        indexes: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
-        use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> CausalLMOutputWithPast:
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            indexes=indexes,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
 
-        hidden_states = outputs.last_hidden_state
-        slice_indices = (
-            slice(-logits_to_keep, None)
-            if isinstance(logits_to_keep, int)
-            else logits_to_keep
-        )
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                **kwargs,
-            )
-        else:
-            pass
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-
-__all__ = [
-    "Qwen3MoeForCausalLM",
-    "Qwen3MoeModel",
-    "Qwen3MoePreTrainedModel",
-    "Qwen3MoeDecoderLayer",
-    "Qwen3MoeSparseMoeBlock",
-    "Qwen3MoeMLP",
-]
+__all__ = ["Qwen3MoeForCausalLM", "Qwen3MoeModel", "Qwen3MoePreTrainedModel"]

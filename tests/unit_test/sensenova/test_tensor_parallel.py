@@ -28,6 +28,8 @@ from sglang_omni.models.sensenova_u1.tensor_parallel import (
 )
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
+from tests.unit_test.fixtures.pipeline_fakes import make_stage_payload
+from tests.unit_test.pipeline.helpers import make_stage
 
 
 def make_model():
@@ -175,6 +177,34 @@ def test_tp_one_is_a_noop_and_double_sharding_is_rejected():
         apply_tensor_parallel(model, 0, 2, None)
 
 
+def test_sharding_copies_checkpoint_slices_without_random_init(monkeypatch):
+    """Sharding randomly initialized every projection on the host before discarding it."""
+    model = make_model()
+    # Holding the originals keeps their storage addresses from being reused by shards.
+    original_parameters = list(model.language_model.parameters())
+    original_storages = {
+        parameter.untyped_storage().data_ptr() for parameter in original_parameters
+    }
+    initialized_device_types: list[str] = []
+    kaiming_uniform = nn.init.kaiming_uniform_
+
+    def record_kaiming_uniform(tensor, *args, **kwargs):
+        initialized_device_types.append(tensor.device.type)
+        return kaiming_uniform(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(nn.init, "kaiming_uniform_", record_kaiming_uniform)
+    apply_tensor_parallel(model, 1, 2, None)
+
+    assert initialized_device_types
+    assert set(initialized_device_types) == {"meta"}
+    sharded_parameters = list(model.language_model.parameters())
+    assert all(parameter.device.type == "cpu" for parameter in sharded_parameters)
+    assert all(parameter.is_contiguous() for parameter in sharded_parameters)
+    assert original_storages.isdisjoint(
+        parameter.untyped_storage().data_ptr() for parameter in sharded_parameters
+    )
+
+
 @pytest.mark.parametrize(
     "rank,size,batch", [(0, 3, 1), (-1, 2, 1), (2, 2, 1), (0, 2, 2)]
 )
@@ -252,14 +282,19 @@ def cancel_and_resume_generation(rank: int, rendezvous: str) -> None:
                 generation_checkpoint()
                 return payload
 
-        scheduler = SenseNovaTensorParallelScheduler(compute)
+        scheduler = SenseNovaTensorParallelScheduler(
+            compute, report_cancellation=rank == 0, shutdown_join_timeout_s=20.0
+        )
         cancelled = StagePayload("cancelled", OmniRequest("prompt"), None)
         scheduler.run_single(
             IncomingMessage("cancelled", "new_request", cancelled), execution_loop
         )
-        failure = scheduler.outbox.get_nowait()
-        assert failure.type == "error"
-        assert isinstance(failure.data, SenseNovaCancelledError)
+        if rank == 0:
+            failure = scheduler.outbox.get_nowait()
+            assert failure.type == "error"
+            assert isinstance(failure.data, SenseNovaCancelledError)
+        else:
+            assert scheduler.outbox.empty()
         assert scheduler.compute_error is None
         subsequent = StagePayload("next", OmniRequest("prompt"), None)
         scheduler.run_single(
@@ -278,3 +313,36 @@ def test_asymmetric_cancellation_leaves_tp_group_reusable(tmp_path: Path) -> Non
     torch.multiprocessing.spawn(
         cancel_and_resume_generation, args=(rendezvous,), nprocs=2, join=True
     )
+
+
+def test_follower_stage_survives_cooperative_cancellation() -> None:
+    """A cancelled TP request stopped the follower stage, so the next request hung the TP group."""
+
+    async def run() -> None:
+        completed_request_ids: list[str] = []
+
+        def compute(payload: StagePayload) -> StagePayload:
+            with GenerationScope(
+                [payload], scheduler.is_aborted, torch.device("cpu"), None
+            ):
+                generation_checkpoint()
+                completed_request_ids.append(payload.request_id)
+                return payload
+
+        scheduler = SenseNovaTensorParallelScheduler(
+            compute, report_cancellation=False, shutdown_join_timeout_s=5.0
+        )
+        follower = make_stage(role="follower", scheduler=scheduler)
+        follower.on_abort("cancelled")
+        await follower.execute(make_stage_payload(request_id="cancelled"))
+        await follower.execute(make_stage_payload(request_id="next"))
+        scheduler.stop()
+        await asyncio.to_thread(scheduler.start)
+        follower.end_outbox_drain()
+        await follower.drain_outbox()
+
+        assert completed_request_ids == ["next"]
+        assert scheduler.compute_error is None
+        assert scheduler.outbox.empty()
+
+    asyncio.run(run())

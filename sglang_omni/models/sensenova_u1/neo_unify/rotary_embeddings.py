@@ -1,6 +1,7 @@
 """Rotary embeddings."""
 
 import copy
+import logging
 import os
 from typing import Protocol
 
@@ -11,6 +12,21 @@ from transformers import Qwen3Config
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
 # Modified for SGLang; see this directory's README.md for upstream source.
+
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
+# note (Wes): The bit-exact RoPE kernel ships only with CUDA builds of sglang.
+try:
+    from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
+        fused_rope_rotate_half_bitexact,
+    )
+except ImportError:
+    fused_rope_rotate_half_bitexact = None
+
+logger = logging.getLogger(__name__)
 
 
 SENSENOVA_NPU_FUSED_ROPE_ENV = "SGLANG_SENSENOVA_NPU_FUSED_ROPE"
@@ -80,14 +96,9 @@ def sensenova_npu_rotary_mul(
     else:
         pass
 
-    try:
-        import torch_npu
-    except ImportError:
+    if torch_npu is None or not hasattr(torch_npu, "npu_rotary_mul"):
         SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
-        return None
-
-    if not hasattr(torch_npu, "npu_rotary_mul"):
-        SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
+        logger.warning("torch_npu.npu_rotary_mul is unavailable; using eager RoPE")
         return None
     else:
         pass
@@ -99,8 +110,9 @@ def sensenova_npu_rotary_mul(
             torch_npu.npu_rotary_mul(q, cos, sin, rotary_mode="half"),
             torch_npu.npu_rotary_mul(k, cos, sin, rotary_mode="half"),
         )
-    except (RuntimeError, TypeError):
+    except (RuntimeError, TypeError) as error:
         SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
+        logger.warning(f"NPU fused RoPE failed ({error}); using eager RoPE from now on")
         return None
 
 
@@ -113,8 +125,10 @@ def apply_rotary_pos_emb(
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies Rotary Position Embedding to the query and key tensors."""
-    if sensenova_npu_fused_rope_enabled() and can_use_sensenova_npu_fused_rope(
-        q, k, cos, sin, unsqueeze_dim
+    # note (Wes): The device check runs first so CUDA forwards never read the NPU opt-in variable.
+    if (
+        can_use_sensenova_npu_fused_rope(q, k, cos, sin, unsqueeze_dim)
+        and sensenova_npu_fused_rope_enabled()
     ):
         npu_output = sensenova_npu_rotary_mul(q, k, cos, sin)
         if npu_output is not None:
@@ -125,7 +139,8 @@ def apply_rotary_pos_emb(
         pass
 
     if (
-        q.is_cuda
+        fused_rope_rotate_half_bitexact is not None
+        and q.is_cuda
         and q.dtype is torch.bfloat16
         and k.dtype is torch.bfloat16
         and cos.dtype is torch.bfloat16
@@ -143,10 +158,6 @@ def apply_rotary_pos_emb(
         and q.shape[-1] in (32, 64)
         and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
     ):
-        from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
-            fused_rope_rotate_half_bitexact,
-        )
-
         cos_rows = cos.reshape(-1, cos.shape[-1]).contiguous()
         sin_rows = sin.reshape(-1, sin.shape[-1]).contiguous()
         q_embed = fused_rope_rotate_half_bitexact(

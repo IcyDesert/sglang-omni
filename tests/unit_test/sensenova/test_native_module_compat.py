@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check standalone native modules without loading accelerator dependencies."""
 
+import base64
 import importlib
+import io
 import pickle
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Protocol
-from unittest.mock import Mock
 
 import pytest
 import torch
-from transformers import PretrainedConfig, Qwen3Config
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from PIL import Image
+
+from sglang_omni.models.sensenova_u1.image_processing import prepare_reference_images
+from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1ImageEditSampling
 
 
 class NativeModuleLoader(Protocol):
@@ -102,48 +104,6 @@ def test_flow_head_state_dict_round_trip(native_modules: NativeModuleLoader) -> 
         )
 
 
-def test_causal_mask_kwargs_preserve_transformers_version_contract(
-    native_modules: NativeModuleLoader,
-) -> None:
-    module = native_modules("transformers_compat")
-
-    def legacy_mask(
-        config: PretrainedConfig,
-        input_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        cache_position: torch.Tensor,
-        past_key_values: Cache | None,
-        position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return input_embeds + cache_position.reshape(1, -1, 1)
-
-    def current_mask(
-        config: PretrainedConfig,
-        inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None,
-        position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        assert position_ids is not None
-        return inputs_embeds + position_ids.unsqueeze(-1)
-
-    embeddings = torch.randn(1, 3, 4)
-    positions = torch.arange(3)
-    for factory in (legacy_mask, current_mask):
-        keywords = module.causal_mask_kwargs(
-            factory,
-            config=PretrainedConfig(),
-            inputs_embeds=embeddings,
-            attention_mask=None,
-            cache_position=positions,
-            past_key_values=None,
-            position_ids=positions.unsqueeze(0),
-        )
-        torch.testing.assert_close(
-            factory(**keywords), embeddings + positions.reshape(1, -1, 1)
-        )
-
-
 def test_sdpa_grouped_query_matches_explicit_head_repetition(
     native_modules: NativeModuleLoader,
 ) -> None:
@@ -177,51 +137,6 @@ def test_seeded_generation_preserves_global_rng(
     )
     torch.testing.assert_close(actual, expected)
     assert torch.equal(torch.get_rng_state(), previous_state)
-
-
-@pytest.mark.parametrize("additional_tokens", [1, 4])
-def test_preallocated_cache_preserves_appended_values(
-    native_modules: NativeModuleLoader, additional_tokens: int
-) -> None:
-
-    prefix_cache = native_modules("prefix_cache")
-    config = Qwen3Config(num_hidden_layers=1, num_key_value_heads=1, head_dim=2)
-    cache = DynamicCache(config=config)
-    prefix = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2)
-    cache.update(prefix, prefix + 10, 0)
-    prefix_cache.preallocate_think_cache(cache, additional_tokens)
-    suffix = torch.ones(1, 1, 2, 2)
-    keys, values = cache.update(suffix, suffix + 20, 0)
-    torch.testing.assert_close(keys, torch.cat((prefix, suffix), dim=-2))
-    torch.testing.assert_close(values, torch.cat((prefix + 10, suffix + 20), dim=-2))
-    assert cache.get_seq_length() == 5
-
-
-def test_prefix_transfer_rejects_mismatched_tokens_and_cleans_files(
-    native_modules: NativeModuleLoader,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-
-    prefix_cache = native_modules("prefix_cache")
-    monkeypatch.setenv("SGLANG_SENSENOVA_KV_TRANSFER_DIR", str(tmp_path))
-    metadata_path = tmp_path / "prefix.json"
-    buffer_path = tmp_path / "prefix.bin"
-    metadata_path.write_text("{}")
-    buffer_path.write_bytes(b"unchanged")
-    metadata = {
-        "dump_id": "prefix",
-        "data_file": "prefix.bin",
-        "shape": [1, 2, 1, 2, 2],
-        "layer_ids": [0],
-        "dtype": "torch.bfloat16",
-        "token_sha256": "wrong",
-    }
-    config = Qwen3Config(num_hidden_layers=1, num_key_value_heads=1, head_dim=2)
-    with pytest.raises(RuntimeError, match="token hash does not match"):
-        prefix_cache.load_srt_prefix_kv(metadata, [1, 2], config, torch.device("cpu"))
-    assert not metadata_path.exists()
-    assert not buffer_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -301,56 +216,37 @@ def test_vision_config_preserves_nested_ratio_round_trip(
     assert restored.downsample_ratio == (0.5,)
 
 
-def test_interleaved_images_advance_sizes_and_stop_at_limit(
-    native_modules: NativeModuleLoader, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "reference_size,resize_enabled,pixel_budget",
+    [((256, 256), False, None), ((768, 512), False, None), ((512, 512), True, 262144)],
+)
+def test_reference_patch_tensors_preserve_the_admitted_resize(
+    native_modules: NativeModuleLoader,
+    reference_size: tuple[int, int],
+    resize_enabled: bool,
+    pixel_budget: int | None,
 ) -> None:
-    # note (Wes): Isolate orchestration from accelerator model type imports.
-    state_types = ModuleType(
-        "sglang_omni.models.sensenova_u1.neo_unify.generation_state"
+    """The native model resized references again after serving applied its policy."""
+    image_buffer = io.BytesIO()
+    Image.new("RGB", reference_size, (64, 128, 192)).save(image_buffer, format="PNG")
+    references = prepare_reference_images(
+        base64.b64encode(image_buffer.getvalue()).decode("ascii"),
+        SenseNovaU1ImageEditSampling.from_params(
+            {"do_resize": resize_enabled, "input_max_pixels": pixel_budget}
+        ),
     )
-    state_types.GenerationState = Mock
-    monkeypatch.setitem(sys.modules, state_types.__name__, state_types)
-    generation = native_modules("interleaved_generation")
-    device = torch.device("cpu")
-    cache = Mock()
-    cache.get_seq_length.return_value = 0
-    model = Mock()
-    model.device = device
-    model.template = "neo1_0"
-    model.system_message = ""
-    model.patch_size = 1
-    model.downsample_ratio = 1.0
-    model.build_t2i_query.return_value = ""
-    model.build_it2i_inputs.return_value = (
-        torch.zeros(1, 1, 2),
-        torch.zeros(3, 1, dtype=torch.long),
-        None,
+    native_images = native_modules("utils")
+    pixels, grid = native_images.load_image_native(references[0], 16, 0.5)
+    assert (int(grid[0, 1]) * 16, int(grid[0, 0]) * 16) == references[0].size
+    reconstructed = (
+        pixels.view(int(grid[0, 0]), int(grid[0, 1]), 3, 16, 16)
+        .permute(2, 0, 3, 1, 4)
+        .reshape(3, references[0].height, references[0].width)
     )
-    model.language_model.return_value = CausalLMOutputWithPast(
-        logits=torch.tensor([[[0.0, 1.0, 0.0, 0.0]]]), past_key_values=cache
+    expected_rgb = torch.tensor([64, 128, 192], dtype=torch.float32) / 255
+    expected_rgb = (
+        expected_rgb - torch.tensor(native_images.IMAGENET_MEAN)
+    ) / torch.tensor(native_images.IMAGENET_STD)
+    torch.testing.assert_close(
+        reconstructed, expected_rgb[:, None, None].expand_as(reconstructed)
     )
-    model.language_model.get_input_embeddings.return_value = torch.nn.Embedding(
-        4, 2, dtype=torch.bfloat16
-    )
-    model.extract_feature.return_value = torch.zeros(4, 2, dtype=torch.bfloat16)
-    tokenizer = Mock()
-
-    def token_id(token: str) -> int:
-        return {"<img>": 1, "</img>": 2, "<IMG_CONTEXT>": 3}.get(token, 0)
-
-    tokenizer.convert_tokens_to_ids.side_effect = token_id
-    image_sizes = [(2 + index, 2) for index in range(10)]
-    denoise = Mock(
-        side_effect=[(device, torch.tensor([[2, 2]]), torch.zeros(1, 3, 2, 2))] * 10
-        + [AssertionError("Generation exceeded the existing image limit")]
-    )
-    monkeypatch.setattr(generation, "interleaved_text_image_denoise", denoise)
-
-    text, _ = generation.interleave_gen(
-        model, tokenizer, "Draw a sequence", image_size=image_sizes
-    )
-
-    assert text == "<image>" * 10
-    assert denoise.call_count == 10
-    selected_sizes = [call.args[6][call.args[8]] for call in denoise.call_args_list]
-    assert selected_sizes == image_sizes

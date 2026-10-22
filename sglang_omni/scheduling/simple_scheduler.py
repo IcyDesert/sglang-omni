@@ -46,6 +46,7 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
     A batch_compute_fn may return a BaseException in an item's
     result slot to fail only that request while preserving the rest of the batch.
     A batch_key_fn can keep incompatible requests in separate batches.
+    shutdown_join_timeout_s bounds how long the stage waits for the compute thread on stop; None uses the stage default.
     Streaming stages should provide a dedicated scheduler implementation
     (for example ``Code2WavScheduler``) rather than rely on SimpleScheduler.
     """
@@ -74,6 +75,7 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
         abort_callback: Callable[[str], None] | None = None,
         shutdown_callback: Callable[[], None] | None = None,
         shutdown_on_compute_thread: bool = False,
+        shutdown_join_timeout_s: float | None = None,
         request_arrival_hook: RequestArrivalHook | None = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
@@ -105,7 +107,7 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
         self.shutdown_callback = shutdown_callback
         self.request_arrival_hook = request_arrival_hook
         self.shutdown_lock = threading.Lock()
-        self.wait_for_shutdown: bool = shutdown_on_compute_thread
+        self.shutdown_join_timeout_s: float | None = shutdown_join_timeout_s
         self.shutdown_on_compute_thread: bool = shutdown_on_compute_thread
         self.started: bool = False
         self.stop_requested: bool = False

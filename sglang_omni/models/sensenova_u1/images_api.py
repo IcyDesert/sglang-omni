@@ -11,15 +11,21 @@ import uuid
 from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool
 
 from sglang_omni.client.image_media import InlineImage
 from sglang_omni.client.types import GenerateChunk, GenerateRequest, UMMGenerateChunk
-from sglang_omni.models.sensenova_u1.admission import REFERENCE_MEMORY_ERROR_PREFIX
+from sglang_omni.models.sensenova_u1.admission import (
+    DEFAULT_UMM_ADMISSION_LIMITS,
+    REFERENCE_MEMORY_ERROR_PREFIX,
+)
 from sglang_omni.models.sensenova_u1.sampling import (
+    GenerationSeed,
+    GenerationSteps,
+    GuidanceScale,
+    ImageCount,
     SenseNovaU1ImageEditSampling,
     SenseNovaU1Sampling,
-    validate_seed_range,
 )
 from sglang_omni.serve.openai_api import (
     image_result_with_disconnect_watch,
@@ -38,14 +44,14 @@ class ImageGenerationRequest(BaseModel):
 
     model: str | None = None
     prompt: str = Field(min_length=1)
-    size: str = "2048x2048"
-    n: int = Field(default=1, ge=1, le=10)
+    size: str | None = None
+    n: ImageCount | None = None
     response_format: Literal["b64_json"] = "b64_json"
-    seed: int = Field(default=42, ge=0)
-    num_inference_steps: int = Field(default=50, ge=1)
-    guidance_scale: float = Field(default=4.0, ge=0, allow_inf_nan=False)
-    enable_cache_dit: bool | None = None
-    cache_dit_params: dict[str, object] | None = None
+    seed: GenerationSeed | None = None
+    num_inference_steps: GenerationSteps | None = None
+    guidance_scale: GuidanceScale | None = None
+    enable_cache_dit: StrictBool | None = None
+    cache_dit_params: dict[str, JsonValue] | None = None
 
 
 class ImageGenerationData(BaseModel):
@@ -99,24 +105,18 @@ def register_image_generations(app: FastAPI) -> None:
         else:
             pass
         try:
-            width, height = parse_image_size(image_request.size)
-            params = {
-                "width": width,
-                "height": height,
-                "num_inference_steps": image_request.num_inference_steps,
-                "guidance_scale": image_request.guidance_scale,
-                "seed": image_request.seed,
-                "n": image_request.n,
-            }
-            if image_request.enable_cache_dit is not None:
-                params["enable_cache_dit"] = image_request.enable_cache_dit
+            params = image_request.model_dump(
+                exclude={"model", "prompt", "size", "response_format"},
+                exclude_none=True,
+            )
+            if image_request.size is not None:
+                width, height = parse_image_size(image_request.size)
+                params.update(width=width, height=height)
             else:
                 pass
-            if image_request.cache_dit_params is not None:
-                params["cache_dit_params"] = image_request.cache_dit_params
-            else:
-                pass
-            SenseNovaU1Sampling.from_params(params)
+            params = SenseNovaU1Sampling.from_params(params).model_dump(
+                exclude_none=True
+            )
             if not image_request.prompt.strip():
                 raise ValueError("SenseNova-U1 requires a non-empty text prompt")
             else:
@@ -197,11 +197,7 @@ def register_image_edits(app: FastAPI) -> None:
         else:
             pass
         try:
-            if not 1 <= n <= 10:
-                raise ValueError("SenseNova-U1 n must be an integer between 1 and 10")
-            else:
-                pass
-            params = {"n": 1, "size_explicit": size is not None}
+            params = {"n": n, "size_explicit": size is not None}
             submitted_form = await request.form()
             for name, boolean_text in (
                 ("enable_cache_dit", enable_cache_dit),
@@ -243,58 +239,56 @@ def register_image_edits(app: FastAPI) -> None:
                     params[name] = value
                 else:
                     pass
-            edit_sampling = SenseNovaU1ImageEditSampling.from_params(params)
-            validate_seed_range(edit_sampling.seed, n)
-            params.update(
-                width=edit_sampling.width,
-                height=edit_sampling.height,
-                num_inference_steps=edit_sampling.num_inference_steps,
-                guidance_scale=edit_sampling.guidance_scale,
-                img_cfg_scale=edit_sampling.img_cfg_scale,
-                seed=edit_sampling.seed,
+            params = SenseNovaU1ImageEditSampling.from_params(params).model_dump(
+                exclude_none=True
             )
             if not prompt.strip():
                 raise ValueError("SenseNova-U1 requires a non-empty image edit prompt")
             else:
                 pass
-            reference_images = [
-                await read_image_edit_upload(upload) for upload in uploads
-            ]
+            limits = DEFAULT_UMM_ADMISSION_LIMITS
+            if len(uploads) > limits.max_reference_images:
+                raise ValueError(
+                    "SenseNova reference count exceeds max_reference_images"
+                )
+            else:
+                pass
+            encoded_references: list[str] = []
+            encoded_reference_bytes = 0
+            for upload in uploads:
+                reference_image = await read_image_edit_upload(upload)
+                encoded_reference_bytes += 4 * ((len(reference_image) + 2) // 3)
+                if encoded_reference_bytes > limits.max_input_bytes:
+                    raise ValueError("SenseNova input exceeds max_input_bytes")
+                else:
+                    encoded_references.append(
+                        base64.b64encode(reference_image).decode("ascii")
+                    )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        encoded_references = [
-            base64.b64encode(reference_image).decode("ascii")
-            for reference_image in reference_images
-        ]
-        encoded_outputs = []
-        parent_request_id = str(uuid.uuid4())
+        generate_request = GenerateRequest(
+            model=app.state.model_name,
+            prompt={
+                "task": "image_edit",
+                "prompt": prompt,
+                "image_b64": encoded_references,
+            },
+            extra_params=params,
+            output_modalities=["image"],
+            stream=False,
+        )
+        request_id = str(uuid.uuid4())
         try:
-            for output_index in range(n):
-                output_params = dict(params)
-                output_params["seed"] = edit_sampling.seed + output_index
-                generate_request = GenerateRequest(
-                    model=app.state.model_name,
-                    prompt={
-                        "task": "image_edit",
-                        "prompt": prompt,
-                        "image_b64": encoded_references,
-                    },
-                    extra_params=output_params,
-                    output_modalities=["image"],
-                    stream=False,
-                )
-                request_id = f"{parent_request_id}:{output_index}"
-                chunk = await image_result_with_disconnect_watch(
-                    request, app.state.client, generate_request, request_id
-                )
-                encoded_outputs.extend(umm_images(chunk))
+            chunk = await image_result_with_disconnect_watch(
+                request, app.state.client, generate_request, request_id
+            )
+            return build_image_response(umm_images(chunk))
         except Exception as exc:
-            logger.exception(f"Image edit failed for request {parent_request_id}")
+            logger.exception(f"Image edit failed for request {request_id}")
             raise HTTPException(
                 status_code=image_error_status_code(exc), detail=str(exc)
             ) from exc
-        return build_image_response(encoded_outputs)
 
 
 def register_images_api(app: FastAPI) -> None:

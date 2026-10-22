@@ -7,6 +7,6 @@ The Python files in this directory are adapted from:
 - License: Apache-2.0 (see the upstream LICENSE at this commit).
 
 They were modified for SGLang multimodal_gen native integration.
-For SGLang-Omni, the platform import was changed and the optional SRT
-thinking fallback exception is kept local. The first pipeline uses native T2I
-without SRT thinking or KV transfer.
+For SGLang-Omni, the platform import was changed. The pipeline runs native
+T2I and I2I only; thinking, interleaved output, and SRT KV transfer are not
+included.

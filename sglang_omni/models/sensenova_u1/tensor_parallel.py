@@ -12,14 +12,18 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang_omni.models.sensenova_u1.cancellation import SenseNovaCancelledError
-from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
-    TensorParallelScheduler,
-)
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.scheduling.tensor_parallel_scheduler import (
+    RequestCompute,
+    RequestValidator,
+    ShutdownCallback,
+    TensorParallelScheduler,
+)
 
 SUPPORTED_TP_SIZES: tuple[int, ...] = (1, 2, 4, 8)
-TP_INITIALIZATION_TIMEOUT_MINUTES: int = 10
+# The process-group timeout covers initialization and every collective in the group.
+TP_COLLECTIVE_TIMEOUT: timedelta = timedelta(minutes=10)
 
 
 def validate_tp_settings(
@@ -68,7 +72,7 @@ def initialize_tp(
         init_method=f"tcp://127.0.0.1:{nccl_port}",
         rank=tensor_parallel_rank,
         world_size=tensor_parallel_size,
-        timeout=timedelta(minutes=TP_INITIALIZATION_TIMEOUT_MINUTES),
+        timeout=TP_COLLECTIVE_TIMEOUT,
     )
     return dist.group.WORLD
 
@@ -84,12 +88,12 @@ class RowParallelLinear(nn.Linear):
         process_group: dist.ProcessGroup | None,
     ) -> None:
         input_feature_count = linear.in_features // tensor_parallel_size
+        # note (Wes): Meta placeholders skip nn.Linear's random init; the checkpoint slices below replace them.
         super().__init__(
             input_feature_count,
             linear.out_features,
             bias=linear.bias is not None,
-            device=linear.weight.device,
-            dtype=linear.weight.dtype,
+            device="meta",
         )
         self.weight = nn.Parameter(
             linear.weight.detach()[
@@ -97,9 +101,7 @@ class RowParallelLinear(nn.Linear):
                 tensor_parallel_rank
                 * input_feature_count : (tensor_parallel_rank + 1)
                 * input_feature_count,
-            ]
-            .contiguous()
-            .clone(),
+            ].clone(memory_format=torch.contiguous_format),
             requires_grad=False,
         )
         if linear.bias is not None:
@@ -128,8 +130,7 @@ def column_parallel(
         linear.in_features,
         output_feature_count,
         bias=linear.bias is not None,
-        device=linear.weight.device,
-        dtype=linear.weight.dtype,
+        device="meta",
     )
     shard.weight = nn.Parameter(
         linear.weight.detach()[
@@ -251,6 +252,23 @@ def synchronize_tp_noise(model: nn.Module, noise: torch.Tensor) -> None:
 class SenseNovaTensorParallelScheduler(TensorParallelScheduler):
     """Stop TP generation at SenseNova checkpoints without breaking collectives."""
 
+    def __init__(
+        self,
+        request_compute: RequestCompute,
+        *,
+        report_cancellation: bool,
+        shutdown_join_timeout_s: float,
+        validate_request: RequestValidator | None = None,
+        shutdown_callback: ShutdownCallback | None = None,
+    ) -> None:
+        super().__init__(
+            request_compute,
+            shutdown_join_timeout_s=shutdown_join_timeout_s,
+            validate_request=validate_request,
+            shutdown_callback=shutdown_callback,
+        )
+        self.report_cancellation: bool = report_cancellation
+
     def abort(self, request_id: str) -> None:
         SimpleScheduler.abort(self, request_id)
 
@@ -263,7 +281,11 @@ class SenseNovaTensorParallelScheduler(TensorParallelScheduler):
         try:
             SimpleScheduler.run_single(self, message, loop)
         except SenseNovaCancelledError as error:
-            self.emit_error(message.request_id, error, self.outbox)
+            # note (Wes): A follower stage treats any scheduler error as a broken collective sequence, so only the leader reports the agreed cancellation.
+            if self.report_cancellation:
+                self.emit_error(message.request_id, error, self.outbox)
+            else:
+                pass
         except Exception as error:
             # note (AuFlow): A failed rank must not reuse collectives for the next request.
             self.compute_error = error

@@ -35,18 +35,18 @@ class FailureCallback(Protocol):
 class TensorParallelScheduler(SimpleScheduler):
     """Drain dispatched TP forwards before cleanup, even after cancellation."""
 
-    preserve_tp_work_on_abort: bool = True
-
     def __init__(
         self,
         request_compute: RequestCompute,
         *,
+        shutdown_join_timeout_s: float,
         validate_request: RequestValidator | None = None,
         shutdown_callback: ShutdownCallback | None = None,
     ) -> None:
-        super().__init__(request_compute)
+        super().__init__(
+            request_compute, shutdown_join_timeout_s=shutdown_join_timeout_s
+        )
         self.validate_request: RequestValidator | None = validate_request
-        self.wait_for_shutdown: bool = True
         self.shutdown_callback: ShutdownCallback | None = shutdown_callback
         self.stop_marker: IncomingMessage = IncomingMessage(
             request_id="", type="stream_done"
@@ -80,7 +80,7 @@ class TensorParallelScheduler(SimpleScheduler):
                 pass
         except BaseException as exc:
             # note (AuFlow): Cleanup can block in a broken collective. Notify the stage first so the supervisor can shut down the entire TP group.
-            self.wait_for_shutdown = False
+            self.shutdown_join_timeout_s = None
             if self.failure_callback is not None:
                 self.failure_callback(exc)
             else:

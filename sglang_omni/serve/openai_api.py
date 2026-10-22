@@ -1598,7 +1598,8 @@ async def read_image_edit_upload(image: UploadFile) -> bytes:
             else:
                 pass
             decoded.verify()
-    except (OSError, Image.DecompressionBombError) as exc:
+    # note (Wes): Pillow's PNG verify raises SyntaxError for a corrupt chunk checksum.
+    except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
         raise ValueError("reference image is not a valid image") from exc
     return image_bytes
 

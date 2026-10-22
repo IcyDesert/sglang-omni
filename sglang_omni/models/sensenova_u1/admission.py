@@ -66,7 +66,7 @@ def validate_admission(
         and inputs["prompt"].strip()
     ):
         options = SenseNovaU1ImageEditSampling.from_params(parameters)
-        expected_images = 1
+        expected_images = options.n
         output_width, output_height = options.width, options.height
         references = inputs.get("image_b64")
         if isinstance(references, str):
@@ -125,7 +125,13 @@ def validate_admission(
                         "SenseNova resized references exceed max_reference_pixels"
                     )
                 else:
-                    image.verify()
+                    try:
+                        image.verify()
+                    # note (Wes): Pillow's PNG verify raises SyntaxError for a corrupt chunk checksum.
+                    except SyntaxError as error:
+                        raise ValueError(
+                            "SenseNova reference is not a valid image"
+                        ) from error
     else:
         raise ValueError(
             "SenseNova UMM supports a text prompt or an image_edit request"

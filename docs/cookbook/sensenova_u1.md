@@ -129,7 +129,8 @@ The response follows the Images API shape:
 
 `size` dimensions must be positive multiples of 32. Text-to-image requests
 support `n` from 1 to 10 and return base64 PNG images. Image edits also accept
-`n` from 1 to 10, executing each output separately with `seed + output_index`.
+`n` from 1 to 10 in one pipeline request: the references are decoded and
+resized once, then each output runs in turn with `seed + output_index`.
 Both routes require `think_mode=false`.
 
 ## Cache-DiT Acceleration
@@ -150,8 +151,8 @@ fields as multipart form data, with `cache_dit_params` encoded as a JSON
 object. Only `Fn_compute_blocks`, `Bn_compute_blocks`, `max_warmup_steps`,
 `residual_diff_threshold`, and `max_continuous_cached_steps` are supported.
 
-The cache wraps the Qwen decoder only during pure image denoising. Prefix,
-Think, text, and KV-cache updates continue through the original decoder. Three
+The cache wraps the Qwen decoder only during pure image denoising. Prefix
+prefill and KV-cache updates continue through the original decoder. Three
 branch image guidance and timestep-gated CFG run without Cache-DiT. In a
 dynamic T2I batch, requests with different cache settings are dispatched in
 separate batches.
@@ -187,9 +188,17 @@ The edits endpoint accepts `input_max_pixels` to control reference-image
 resizing and `do_resize` as a `true` or `false` form field. For example,
 `-F 'input_max_pixels=262144' -F 'do_resize=true'` lowers the reference pixel
 budget to 512x512 pixels while retaining the aspect ratio. The minimum accepted
-budget is 262144. `do_resize=false` preserves the reference dimensions but does
-not disable admission limits or output-size selection. These options do not
-replace `size`, which controls the generated image dimensions when provided.
+budget is 262144. These options do not replace `size`, which controls the
+generated image dimensions when provided.
+
+`do_resize=false` sends every reference to the model at its original
+dimensions, so each reference's width and height must be multiples of 32
+pixels. An unaligned reference, such as a 4032x3024 photo, is rejected with
+400 rather than resized. Without resizing, reference pixels are bounded per
+request, not per image: all references in one request together may contain at
+most 33554432 pixels (`max_reference_pixels`, 32 x 1024 x 1024), and the edits
+endpoint also caps each upload at 4096x4096 pixels. `do_resize=false` does not
+disable the other admission limits or output-size selection.
 
 I2I accelerator memory errors identify the CUDA or NPU backend and suggest
 reducing references or output size. Lowering `input_max_pixels` only helps

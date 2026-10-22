@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """SenseNova phase, output, and Images API contracts on the real controller."""
 
+import base64
+import io
 from dataclasses import replace
 from typing import Literal
 
@@ -23,7 +25,10 @@ from sglang_omni.models.sensenova_u1.cancellation import (
     generation_checkpoint,
 )
 from sglang_omni.models.sensenova_u1.config import SenseNovaU1PipelineConfig
-from sglang_omni.models.sensenova_u1.image_processing import prepare_reference_images
+from sglang_omni.models.sensenova_u1.image_processing import (
+    prepare_reference_images,
+    resolve_reference_output_size,
+)
 from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1ImageEditSampling
 from sglang_omni.models.sensenova_u1.umm import SenseNovaUMMAdapter
 from sglang_omni.pipeline.umm import (
@@ -33,6 +38,7 @@ from sglang_omni.pipeline.umm import (
 )
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.serve.openai_errors import generation_error_status_code
+from tests.unit_test.fixtures.sensenova_umm import png_with_bad_idat_crc
 
 pytest_plugins = ["tests.unit_test.fixtures.sensenova_umm"]
 
@@ -354,7 +360,18 @@ def test_abort_releases_sensenova_state(controller: UMMController) -> None:
     assert not controller.adapter.executions
 
 
-@pytest.mark.parametrize("reference", ["not base64", "", []])
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "not base64",
+        "",
+        [],
+        pytest.param(
+            base64.b64encode(png_with_bad_idat_crc()).decode("ascii"),
+            id="bad-idat-crc",
+        ),
+    ],
+)
 def test_invalid_edit_reference_never_reaches_generation(
     controller: UMMController, reference: str | list[str]
 ) -> None:
@@ -478,6 +495,23 @@ def test_disabled_resize_preserves_small_reference_admission(
     assert images[0].size == (64, 32)
     assert controller.transition(StagePayload("request", request, None)) is not None
     controller.abort("request")
+
+
+@pytest.mark.parametrize("invalid_reference_index", [0, 1])
+def test_reference_validation_matches_preprocessing(
+    encoded_image: str, invalid_reference_index: int
+) -> None:
+    """TP preflight accepted an unaligned reference after the first image."""
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (65, 32)).save(image_buffer, format="PNG")
+    references = [encoded_image, encoded_image]
+    references[invalid_reference_index] = base64.b64encode(
+        image_buffer.getvalue()
+    ).decode("ascii")
+    sampling = SenseNovaU1ImageEditSampling.from_params({"do_resize": False})
+    for preprocess in (resolve_reference_output_size, prepare_reference_images):
+        with pytest.raises(ValueError, match="divisible by 32"):
+            preprocess(references, sampling)
 
 
 def test_decoder_pixel_limit_is_a_request_error(

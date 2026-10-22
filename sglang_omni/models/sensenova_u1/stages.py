@@ -29,35 +29,32 @@ from sglang_omni.models.sensenova_u1.image_processing import (
     resolve_reference_output_size,
 )
 from sglang_omni.models.sensenova_u1.neo_unify import register
-from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
-from sglang_omni.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
     npu_fia_available,
     npu_swiglu_available,
 )
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
 from sglang_omni.models.sensenova_u1.offload import (
     LayerwiseOffloadConfig,
     SenseNovaLayerwiseOffload,
 )
 from sglang_omni.models.sensenova_u1.sampling import (
     SenseNovaU1ImageEditSampling,
-    SenseNovaU1Sampling,
-    cache_dit_batch_key,
     image_guidance_branch_count,
     resolve_cache_dit_defaults,
 )
 from sglang_omni.models.sensenova_u1.tensor_parallel import (
+    TP_COLLECTIVE_TIMEOUT,
     SenseNovaTensorParallelScheduler,
     apply_tensor_parallel,
     initialize_tp,
     validate_tp_device,
     validate_tp_settings,
 )
-from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
-    TensorParallelScheduler,
-)
 from sglang_omni.models.weight_loader import resolve_dtype
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.scheduling.tensor_parallel_scheduler import TensorParallelScheduler
 from sglang_omni.utils.device import resolve_concrete_device
 
 __all__ = [
@@ -74,6 +71,9 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+# A healthy stop ends at the next denoise checkpoint; this caps only a wedged step or TP collective.
+GENERATION_SHUTDOWN_TIMEOUT_S = TP_COLLECTIVE_TIMEOUT.total_seconds()
+
 
 def image_generation_request_cost(payload: StagePayload) -> int:
     """Estimate denoise work as pixel-steps, including the CFG branch."""
@@ -86,9 +86,8 @@ def image_generation_request_cost(payload: StagePayload) -> int:
     else:
         options = text_to_image_options(payload)
         branches = 1 + int(options.guidance_scale > 1)
-    outputs = options.n if isinstance(options, SenseNovaU1Sampling) else 1
     return (
-        outputs
+        options.n
         * options.width
         * options.height
         * options.num_inference_steps
@@ -113,15 +112,7 @@ def image_generation_batch_key(
         return ("text_to_image_multi_output", payload.request_id)
     else:
         pass
-    return (
-        "text_to_image",
-        options.width,
-        options.height,
-        options.num_inference_steps,
-        options.guidance_scale,
-        options.enable_cache_dit,
-        cache_dit_batch_key(options.cache_dit_params),
-    )
+    return ("text_to_image", *options.batch_key())
 
 
 def validate_generation_request(payload: StagePayload, model: NEOChatModel) -> None:
@@ -298,17 +289,23 @@ def create_generation_executor(
             else:
                 pass
 
-    if tp_size > 1:
-        scheduler_class = (
-            SenseNovaTensorParallelScheduler
-            if cooperative_cancellation
-            else TensorParallelScheduler
-        )
-        scheduler = scheduler_class(
+    def _validate(payload: StagePayload) -> None:
+        validate_generation_request(payload, model)
+
+    if tp_size > 1 and cooperative_cancellation:
+        scheduler = SenseNovaTensorParallelScheduler(
             _generate,
-            validate_request=lambda payload: validate_generation_request(
-                payload, model
-            ),
+            report_cancellation=tp_rank == 0,
+            shutdown_join_timeout_s=GENERATION_SHUTDOWN_TIMEOUT_S,
+            validate_request=_validate,
+            shutdown_callback=_shutdown,
+        )
+        return scheduler
+    elif tp_size > 1:
+        scheduler = TensorParallelScheduler(
+            _generate,
+            shutdown_join_timeout_s=GENERATION_SHUTDOWN_TIMEOUT_S,
+            validate_request=_validate,
             shutdown_callback=_shutdown,
         )
         return scheduler
@@ -325,6 +322,7 @@ def create_generation_executor(
         max_batch_cost=max_batch_cost if batch_enabled else None,
         shutdown_callback=_shutdown,
         shutdown_on_compute_thread=True,
+        shutdown_join_timeout_s=GENERATION_SHUTDOWN_TIMEOUT_S,
     )
 
     return scheduler

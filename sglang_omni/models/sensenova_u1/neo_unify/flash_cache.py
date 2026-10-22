@@ -48,6 +48,7 @@ def prepare_flash_kv_cache(
     else:
         pass
 
+    key_padding_mask: torch.Tensor | None = None
     for layer in past_key_values.layers:
         past_k = layer.keys
         past_v = layer.values
@@ -59,6 +60,7 @@ def prepare_flash_kv_cache(
             layer.flash_v_cache = None
             layer.flash_actual_seq_lengths_kv = None
             layer.flash_kv_padding_size = None
+            layer.flash_key_padding_mask = None
             layer.flash_cache_layout = None
             continue
         else:
@@ -97,6 +99,7 @@ def prepare_flash_kv_cache(
             layer.flash_kv_padding_size = torch.zeros(
                 1, dtype=torch.int64, device=past_k.device
             )
+            layer.flash_key_padding_mask = None
             layer.flash_cache_layout = "BNSD"
         else:
             past_k_flash = past_k.transpose(1, 2).contiguous()
@@ -113,44 +116,32 @@ def prepare_flash_kv_cache(
             )
             k_cache[:, :prefix_len].copy_(past_k_flash)
             v_cache[:, :prefix_len].copy_(past_v_flash)
-            layer.flash_actual_seq_lengths_kv = (
-                None
-                if lengths is None or past_k.device.type == "npu"
-                else [length + current_len for length in lengths]
-            )
+            layer.flash_actual_seq_lengths_kv = None
             layer.flash_kv_padding_size = None
             layer.flash_cache_layout = "BSND"
+            # note (Wes): One key mask shared by all layers lets padded rows attend in a single call; NPU without FIA gets an explicit mask from denoise_images instead.
+            if (
+                lengths is None
+                or past_k.device.type == "npu"
+                or min(lengths) == prefix_len
+            ):
+                layer.flash_key_padding_mask = None
+            else:
+                if key_padding_mask is None:
+                    key_positions = torch.arange(total_len, device=past_k.device)
+                    valid_prefix_lengths = torch.tensor(lengths, device=past_k.device)
+                    key_padding_mask = (
+                        (key_positions < valid_prefix_lengths[:, None])
+                        | (key_positions >= prefix_len)
+                    )[:, None, None, :]
+                else:
+                    pass
+                layer.flash_key_padding_mask = key_padding_mask
 
         layer.flash_prefix_len = prefix_len
         layer.flash_total_len = total_len
         layer.flash_k_cache = k_cache
         layer.flash_v_cache = v_cache
-
-
-def prepare_i2i_flash_kv_cache(
-    past_key_values: DynamicCache | None,
-    current_len: int,
-    batch_size: int,
-) -> None:
-    """Prepare one unpadded I2I CFG branch for NPU FIA or SDPA fallback."""
-    if past_key_values is None:
-        return
-    else:
-        pass
-
-    prefix = past_key_values.layers[0].keys
-    prefix_lengths = torch.full(
-        (batch_size,),
-        prefix.shape[2],
-        dtype=torch.long,
-        device=prefix.device,
-    )
-    prepare_flash_kv_cache(
-        past_key_values,
-        current_len=current_len,
-        batch_size=batch_size,
-        prefix_lengths=prefix_lengths,
-    )
 
 
 def clear_flash_kv_cache(past_key_values: DynamicCache | None) -> None:
@@ -181,6 +172,10 @@ def clear_flash_kv_cache(past_key_values: DynamicCache | None) -> None:
             pass
         if hasattr(layer, "flash_kv_padding_size"):
             delattr(layer, "flash_kv_padding_size")
+        else:
+            pass
+        if hasattr(layer, "flash_key_padding_mask"):
+            delattr(layer, "flash_key_padding_mask")
         else:
             pass
         if hasattr(layer, "flash_cache_layout"):

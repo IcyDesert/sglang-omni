@@ -100,7 +100,7 @@ class TestSenseNovaSampling(unittest.TestCase):
             {"input_max_pixels": 512 * 512 - 1},
             {"do_resize": "false"},
             {"size_explicit": 1},
-            {"n": 2},
+            {"n": 11},
             {"think_mode": True},
         ):
             with self.subTest(params=params), self.assertRaises(ValueError):

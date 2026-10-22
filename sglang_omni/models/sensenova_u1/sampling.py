@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 import json
-import math
-from dataclasses import dataclass
+from typing import Annotated, Self
 
-from pydantic import JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool
 
 MAX_GENERATION_SEED = 2**64 - 1
 
@@ -41,144 +40,75 @@ def resolve_generation_parameters(
     return resolved_parameters
 
 
-@dataclass(frozen=True)
-class SenseNovaU1Sampling:
-    width: int = 2048
-    height: int = 2048
-    num_inference_steps: int = 50
-    guidance_scale: float = 4.0
-    seed: int = 42
-    enable_cache_dit: bool | None = None
-    cache_dit_params: JsonValue = None
-    n: int = 1
+IMAGE_DIMENSION_MULTIPLE = 32
+MIN_INPUT_MAX_PIXELS = 512 * 512
 
-    @classmethod
-    def from_params(cls, params: dict[str, JsonValue]) -> SenseNovaU1Sampling:
-        params = resolve_generation_parameters(params)
-        n = params.get("n", 1)
-        if type(n) is not int or not 1 <= n <= 10:
-            raise ValueError("SenseNova-U1 n must be an integer between 1 and 10")
-        else:
-            pass
-        values = validated_values(cls, {**params, "n": 1}, ("guidance_scale",))
-        validate_seed_range(values["seed"], n)
-        enable_cache_dit, cache_dit_params = cache_dit_values(params)
-        return cls(
-            **values,
-            n=n,
-            enable_cache_dit=enable_cache_dit,
-            cache_dit_params=cache_dit_params,
+ImageDimension = Annotated[
+    int, Field(gt=0, multiple_of=IMAGE_DIMENSION_MULTIPLE, strict=True)
+]
+ImageCount = Annotated[int, Field(ge=1, le=10, strict=True)]
+GenerationSeed = Annotated[int, Field(ge=0, strict=True)]
+GenerationSteps = Annotated[int, Field(gt=0, strict=True)]
+GuidanceScale = Annotated[float, Field(ge=0, allow_inf_nan=False, strict=True)]
+
+GENERATION_TIMESTEP_SHIFT = 3.0
+GENERATION_TIME_EPSILON = 0.02
+
+
+class SenseNovaU1Sampling(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    width: ImageDimension = 2048
+    height: ImageDimension = 2048
+    num_inference_steps: GenerationSteps = 50
+    guidance_scale: GuidanceScale = 4.0
+    seed: GenerationSeed = 42
+    enable_cache_dit: StrictBool | None = None
+    cache_dit_params: JsonValue = None
+    n: ImageCount = 1
+
+    def batch_key(self) -> tuple[int, int, int, float, bool | None, str]:
+        """Group requests with identical denoising and cache settings."""
+        return (
+            self.width,
+            self.height,
+            self.num_inference_steps,
+            self.guidance_scale,
+            self.enable_cache_dit,
+            cache_dit_batch_key(self.cache_dit_params),
         )
 
-
-@dataclass(frozen=True)
-class SenseNovaU1ImageEditSampling:
-    """I2I defaults aligned with SGLang's SenseNova serving pipeline."""
-
-    width: int = 2048
-    height: int = 2048
-    num_inference_steps: int = 50
-    guidance_scale: float = 4.0
-    img_cfg_scale: float = 1.0
-    seed: int = 42
-    input_max_pixels: int | None = None
-    do_resize: bool = True
-    size_explicit: bool = False
-    enable_cache_dit: bool | None = None
-    cache_dit_params: JsonValue = None
-
     @classmethod
-    def from_params(cls, params: dict[str, JsonValue]) -> SenseNovaU1ImageEditSampling:
-        params = resolve_generation_parameters(params)
-        input_max_pixels = params.get("input_max_pixels")
-        if input_max_pixels is not None and (
-            type(input_max_pixels) is not int or input_max_pixels < 512 * 512
-        ):
-            raise ValueError("input_max_pixels must be at least 262144")
+    def from_params(cls, params: dict[str, JsonValue]) -> Self:
+        parameters = resolve_generation_parameters(params)
+        if parameters.get("think_mode", False) is not False:
+            raise ValueError("SenseNova-U1 think_mode is not supported")
         else:
-            pass
-        do_resize = params.get("do_resize", True)
-        if type(do_resize) is not bool:
-            raise ValueError("do_resize must be a boolean")
-        else:
-            pass
-        size_explicit = params.get("size_explicit", False)
-        if type(size_explicit) is not bool:
-            raise ValueError("size_explicit must be a boolean")
-        else:
-            pass
-        values = validated_values(cls, params, ("guidance_scale", "img_cfg_scale"))
-        validate_seed_range(values["seed"], 1)
-        cache_options = dict(params)
+            sampling = cls.model_validate(parameters)
+        validate_seed_range(sampling.seed, sampling.n)
         if (
-            image_guidance_branch_count(
-                values["guidance_scale"], values["img_cfg_scale"]
+            isinstance(sampling, SenseNovaU1ImageEditSampling)
+            and image_guidance_branch_count(
+                sampling.guidance_scale, sampling.img_cfg_scale
             )
             > 2
         ):
-            cache_options["cache_dit_params"] = None
+            parameters["cache_dit_params"] = None
         else:
             pass
-        enable_cache_dit, cache_dit_params = cache_dit_values(cache_options)
-        return cls(
-            **values,
-            input_max_pixels=input_max_pixels,
-            do_resize=do_resize,
-            size_explicit=size_explicit,
-            enable_cache_dit=enable_cache_dit,
-            cache_dit_params=cache_dit_params,
-        )
+        _, cache_parameters = cache_dit_values(parameters)
+        return sampling.model_copy(update={"cache_dit_params": cache_parameters})
 
 
-def validated_values(
-    defaults: type[SenseNovaU1Sampling | SenseNovaU1ImageEditSampling],
-    params: dict[str, JsonValue],
-    scale_names: tuple[str, ...],
-) -> dict[str, JsonValue]:
-    if params.get("think_mode", False) is not False:
-        raise ValueError("SenseNova-U1 think_mode is not supported yet")
-    else:
-        pass
-    if params.get("n", 1) != 1:
-        raise ValueError("SenseNova-U1 currently supports exactly one image")
-    else:
-        pass
-    default_values: dict[str, int | float] = {
-        "width": defaults.width,
-        "height": defaults.height,
-        "num_inference_steps": defaults.num_inference_steps,
-        "guidance_scale": defaults.guidance_scale,
-        "seed": defaults.seed,
-    }
-    if "img_cfg_scale" in scale_names:
-        default_values["img_cfg_scale"] = SenseNovaU1ImageEditSampling.img_cfg_scale
-    else:
-        pass
-    names = ("width", "height", "num_inference_steps", *scale_names, "seed")
-    values = {name: params.get(name, default_values[name]) for name in names}
-    for name in ("width", "height", "num_inference_steps", "seed"):
-        value = values[name]
-        if type(value) is not int or value < (0 if name == "seed" else 1):
-            qualifier = "non-negative" if name == "seed" else "positive"
-            raise ValueError(f"{name} must be a {qualifier} integer")
-        else:
-            pass
-    if values["width"] % 32 or values["height"] % 32:
-        raise ValueError("SenseNova-U1 width and height must be divisible by 32")
-    else:
-        pass
-    for name in scale_names:
-        value = values[name]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-        ):
-            raise ValueError(f"{name} must be a finite non-negative number")
-        else:
-            pass
-    return values
+class SenseNovaU1ImageEditSampling(SenseNovaU1Sampling):
+    """Image editing adds image guidance and reference resizing controls."""
+
+    img_cfg_scale: GuidanceScale = 1.0
+    input_max_pixels: (
+        Annotated[int, Field(ge=MIN_INPUT_MAX_PIXELS, strict=True)] | None
+    ) = None
+    do_resize: StrictBool = True
+    size_explicit: StrictBool = False
 
 
 CACHE_DIT_PARAMETER_NAMES = frozenset(

@@ -385,6 +385,9 @@ async def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
 
             from sglang_omni.pipeline.stage.runtime import Stage
             from sglang_omni.pipeline.tp_control import TPLeaderFanout
+            from sglang_omni.scheduling.tensor_parallel_scheduler import (
+                TensorParallelScheduler,
+            )
 
             fanout = MagicMock(spec=TPLeaderFanout)
 
@@ -427,19 +430,23 @@ async def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
             assert simple_like.inbox.get_nowait().request_id == "req-1"
 
             # Already dispatched collective work survives a follower abort; an aborted leader still drops work before dispatching it.
-            simple_like.preserve_tp_work_on_abort = True
-            stage_simple.aborted.add("req-1")
+            collective = TensorParallelScheduler(
+                lambda value: value, shutdown_join_timeout_s=5.0
+            )
+            stage_collective = make_stage(collective)
+            stage_collective.aborted.add("req-1")
             fanout.reset_mock()
-            await stage_simple.execute(payload)
+            await stage_collective.execute(payload)
             fanout.fanout_work.assert_not_called()
-            assert simple_like.inbox.empty()
-            stage_simple.role = "follower"
-            await stage_simple.execute(payload)
-            assert simple_like.inbox.get_nowait().request_id == "req-1"
+            assert collective.inbox.empty()
+            stage_collective.role = "follower"
+            await stage_collective.execute(payload)
+            assert collective.inbox.get_nowait().request_id == "req-1"
             fanout.fanout_work.assert_not_called()
 
             # Schedulers without the collective-work contract still skip it.
-            simple_like.preserve_tp_work_on_abort = False
+            stage_simple.aborted.add("req-1")
+            stage_simple.role = "follower"
             await stage_simple.execute(payload)
             assert simple_like.inbox.empty()
     finally:

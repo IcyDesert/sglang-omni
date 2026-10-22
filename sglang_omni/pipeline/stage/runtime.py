@@ -68,6 +68,8 @@ from sglang_omni.scheduling.message import (
     ResultOwningScheduler,
     StageScheduler,
 )
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.scheduling.tensor_parallel_scheduler import TensorParallelScheduler
 from sglang_omni.serve.stage_routes import StageHttpServer, StageRoutesError
 
 TorchProfiler = current_platform.get_torch_profiler()
@@ -275,7 +277,7 @@ class Stage:
                 else:
                     pass
 
-            if hasattr(self.scheduler, "failure_callback"):
+            if isinstance(self.scheduler, TensorParallelScheduler):
                 self.scheduler.failure_callback = _report_scheduler_failure
             else:
                 pass
@@ -395,18 +397,20 @@ class Stage:
             # the thread instead of letting a daemon thread be reclaimed at
             # process exit. A slow thread is logged, not fatal: shutdown
             # correctness must not start depending on this timeout.
-            # note (AuFlow): TP cleanup must wait for all dispatched collectives.
+            # note (Wes): TP cleanup waits for dispatched collectives up to the scheduler's collective timeout, so a dead peer cannot hang stop forever.
             scheduler_thread = self.scheduler_thread
             if scheduler_thread is not None:
+                join_timeout_s = (
+                    self.scheduler.shutdown_join_timeout_s
+                    if isinstance(self.scheduler, SimpleScheduler)
+                    else None
+                )
+                if join_timeout_s is None:
+                    join_timeout_s = _SCHEDULER_THREAD_JOIN_TIMEOUT_S
+                else:
+                    pass
                 try:
-                    await asyncio.to_thread(
-                        scheduler_thread.join,
-                        (
-                            None
-                            if getattr(self.scheduler, "wait_for_shutdown", False)
-                            else _SCHEDULER_THREAD_JOIN_TIMEOUT_S
-                        ),
-                    )
+                    await asyncio.to_thread(scheduler_thread.join, join_timeout_s)
                 except Exception as exc:
                     _record_cleanup_error("scheduler thread", exc)
                 else:
@@ -414,7 +418,7 @@ class Stage:
                         logger.warning(
                             "Stage %s scheduler thread did not stop within %gs",
                             self.name,
-                            _SCHEDULER_THREAD_JOIN_TIMEOUT_S,
+                            join_timeout_s,
                         )
                     else:
                         self.scheduler_thread = None
@@ -1178,19 +1182,22 @@ class Stage:
 
     async def execute(self, payload: StagePayload) -> None:
         request_id = payload.request_id
+        is_tensor_parallel = isinstance(self.scheduler, TensorParallelScheduler)
         # note (AuFlow): A follower abort must not skip dispatched collectives.
-        preserve_tp_work = self.role == "follower" and getattr(
-            self.scheduler, "preserve_tp_work_on_abort", False
-        )
+        preserve_tp_work = self.role == "follower" and is_tensor_parallel
         if request_id in self.aborted and not preserve_tp_work:
             return
         else:
             pass
         # note (AuFlow): Reject invalid work before any rank enters collectives.
-        validate_request = getattr(self.scheduler, "validate_request", None)
-        if self.role != "follower" and validate_request is not None:
+        if (
+            self.role != "follower"
+            and is_tensor_parallel
+            and self.scheduler.validate_request is not None
+        ):
             try:
-                validate_request(payload)
+                # note (Wes): Validation can decode every reference image, so it runs off the event loop to keep aborts flowing.
+                await asyncio.to_thread(self.scheduler.validate_request, payload)
             except ValueError as exc:
                 await self.send_failure(request_id, str(exc))
                 return

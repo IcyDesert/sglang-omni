@@ -42,20 +42,19 @@ from sglang_omni.models.sensenova_u1.stages import (
 from sglang_omni.models.sensenova_u1.tensor_parallel import (
     SenseNovaTensorParallelScheduler,
 )
-from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
-    TensorParallelScheduler,
-)
 from sglang_omni.pipeline.replicas import expand_replica_stages
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.scheduling.tensor_parallel_scheduler import TensorParallelScheduler
 from sglang_omni.serve.openai_api import create_app, image_result_with_disconnect_watch
 from sglang_omni.utils.imports import import_string
 from tests.unit_test.fixtures.pipeline_fakes import (
     FakeRelay,
     RecordingStageControlPlane,
 )
+from tests.unit_test.fixtures.sensenova_umm import png_with_bad_idat_crc
 
 
 def umm_image_chunk(request_id: str, encoded_images: list[str]) -> UMMGenerateChunk:
@@ -115,7 +114,8 @@ def tokenizer() -> PreTrainedTokenizerBase:
     )
 
 
-def test_t2i_api_returns_all_outputs_in_one_request():
+def test_t2i_api_returns_all_outputs_in_one_request() -> None:
+    """HTTP coercion accepted invalid sampling values before dispatch."""
     buffer = io.BytesIO()
     Image.new("RGB", (32, 32)).save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -138,12 +138,22 @@ def test_t2i_api_returns_all_outputs_in_one_request():
     assert response.status_code == 200
     assert response.json()["data"] == [{"b64_json": encoded}] * 3
     assert backend.calls == 1
-    assert (
-        client.post(
-            "/v1/images/generations", json={"prompt": "a cat", "n": 11}
-        ).status_code
-        == 422
-    )
+    for invalid_parameters in (
+        {"n": 11},
+        {"n": True},
+        {"n": 3.0},
+        {"seed": True},
+        {"num_inference_steps": True},
+        {"guidance_scale": True},
+    ):
+        assert (
+            client.post(
+                "/v1/images/generations",
+                json={"prompt": "a cat", **invalid_parameters},
+            ).status_code
+            == 422
+        )
+    assert backend.calls == 1
 
 
 def test_t2i_stage_encodes_real_png_and_passes_source_arguments(
@@ -163,9 +173,8 @@ def test_t2i_stage_encodes_real_png_and_passes_source_arguments(
     result = generation_module.generate_image(payload, model, tokenizer=tokenizer)
 
     kwargs = model.t2i_generate.call_args.kwargs
-    assert kwargs["image_size"] == (64, 32)
-    assert kwargs["seed"] == 7
-    assert kwargs["think_mode"] is False
+    assert (kwargs["sampling"].width, kwargs["sampling"].height) == (64, 32)
+    assert kwargs["sampling"].seed == 7
     image = Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"])))
     assert image.format == "PNG"
     assert image.size == (64, 32)
@@ -225,58 +234,12 @@ def test_t2i_stage_batches_compatible_requests_with_per_request_seeds(
     args = model.t2i_generate.call_args.args
     kwargs = model.t2i_generate.call_args.kwargs
     assert args[1] == ["a blue cat", "a red dog on grass"]
-    assert kwargs["batch_size"] == 2
-    assert kwargs["seed"] == [7, 19]
-    assert kwargs["image_size"] == (64, 32)
-    assert kwargs["num_steps"] == 12
+    assert kwargs["seeds"] == [7, 19]
+    assert (kwargs["sampling"].width, kwargs["sampling"].height) == (64, 32)
+    assert kwargs["sampling"].num_inference_steps == 12
     assert [decode_result_pixel(result) for result in results] == [
         (0, 0, 0),
         (255, 255, 255),
-    ]
-
-
-def test_t2i_stage_splits_incompatible_requests_and_restores_order(
-    tokenizer: PreTrainedTokenizerBase,
-) -> None:
-    def t2i_generate(_tokenizer, prompt, *, image_size, batch_size, **_kwargs):
-        if isinstance(prompt, list):
-            assert prompt == ["first", "third"]
-            values = (-1.0, 0.0)
-        else:
-            assert prompt == "second"
-            values = (1.0,)
-        width, height = image_size
-        assert len(values) == batch_size
-        return torch.stack([torch.full((3, height, width), value) for value in values])
-
-    model = Mock()
-    model.t2i_generate.side_effect = t2i_generate
-    payloads = [
-        StagePayload(
-            request_id=f"test-{index}",
-            request=OmniRequest(
-                inputs=prompt,
-                params={"width": width, "height": 32, "seed": index},
-            ),
-            data=None,
-        )
-        for index, (prompt, width) in enumerate(
-            [("first", 64), ("second", 32), ("third", 64)]
-        )
-    ]
-
-    results = generation_module.generate_images(payloads, model, tokenizer=tokenizer)
-
-    assert model.t2i_generate.call_count == 2
-    assert [result.request_id for result in results] == [
-        "test-0",
-        "test-1",
-        "test-2",
-    ]
-    assert [decode_result_pixel(result) for result in results] == [
-        (0, 0, 0),
-        (255, 255, 255),
-        (127, 127, 127),
     ]
 
 
@@ -320,7 +283,7 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
     model = Mock()
 
     def edit_image(
@@ -328,18 +291,7 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
         prompt: str,
         references: list[Image.Image],
         *,
-        batch_size: int,
-        seed: int,
-        image_size: tuple[int, int],
-        cfg_scale: float,
-        img_cfg_scale: float,
-        cfg_norm: str,
-        timestep_shift: float,
-        enable_timestep_shift: bool,
-        cfg_interval: tuple[float, float],
-        num_steps: int,
-        t_eps: float,
-        think_mode: bool,
+        sampling: SenseNovaU1ImageEditSampling,
     ) -> torch.Tensor:
         return torch.zeros((1, 3, 32, 64))
 
@@ -372,14 +324,12 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
     kwargs = model.it2i_generate.call_args.kwargs
     assert args[1] == "make the background blue"
     assert len(args[2]) == 1
-    assert args[2][0].size == (16, 8)
-    assert kwargs["image_size"] == (64, 32)
-    assert kwargs["num_steps"] == 12
-    assert kwargs["cfg_scale"] == 2.5
-    assert kwargs["img_cfg_scale"] == 1.5
-    assert kwargs["seed"] == 7
-    assert kwargs["timestep_shift"] == 3.0
-    assert kwargs["think_mode"] is False
+    assert args[2][0].size == (64, 32)
+    assert (kwargs["sampling"].width, kwargs["sampling"].height) == (64, 32)
+    assert kwargs["sampling"].num_inference_steps == 12
+    assert kwargs["sampling"].guidance_scale == 2.5
+    assert kwargs["sampling"].img_cfg_scale == 1.5
+    assert kwargs["sampling"].seed == 7
     image = Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"])))
     assert image.format == "PNG"
     assert image.size == (64, 32)
@@ -412,11 +362,11 @@ def test_i2i_stage_preserves_reference_aspect_ratio_without_explicit_size(
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
     model = Mock()
 
     def generate(*_args, **kwargs):
-        width, height = kwargs["image_size"]
+        width, height = (kwargs["sampling"].width, kwargs["sampling"].height)
         return torch.zeros((1, 3, height, width))
 
     model.it2i_generate.side_effect = generate
@@ -440,7 +390,10 @@ def test_i2i_stage_preserves_reference_aspect_ratio_without_explicit_size(
 
     result = generation_module.generate_image(payload, model, tokenizer=tokenizer)
 
-    assert model.it2i_generate.call_args.kwargs["image_size"] == (384, 192)
+    assert (
+        model.it2i_generate.call_args.kwargs["sampling"].width,
+        model.it2i_generate.call_args.kwargs["sampling"].height,
+    ) == (384, 192)
     image = Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"])))
     assert image.size == (384, 192)
 
@@ -463,7 +416,7 @@ class ImageEditClient:
         reference = Image.open(
             io.BytesIO(base64.b64decode(request.prompt["image_b64"][0]))
         )
-        assert reference.size == (16, 8)
+        assert reference.size == (64, 32)
         assert request.extra_params == {
             "width": 64,
             "height": 32,
@@ -507,16 +460,17 @@ class DefaultImageEditClient:
 
 class MultipleOutputImageEditClient:
     def __init__(self):
-        self.seeds = []
+        self.seeds_and_counts = []
 
     async def generate(self, request, request_id):
-        assert request.extra_params["n"] == 1
-        self.seeds.append(request.extra_params["seed"])
-        buffer = io.BytesIO()
-        Image.new("RGB", (32, 32), (self.seeds[-1], 0, 0)).save(buffer, format="PNG")
-        yield umm_image_chunk(
-            request_id, [base64.b64encode(buffer.getvalue()).decode("ascii")]
-        )
+        image_count = request.extra_params["n"]
+        self.seeds_and_counts.append((request.extra_params["seed"], image_count))
+        encoded_images = []
+        for index in range(image_count):
+            buffer = io.BytesIO()
+            Image.new("RGB", (32, 32), (index, 0, 0)).save(buffer, format="PNG")
+            encoded_images.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
+        yield umm_image_chunk(request_id, encoded_images)
 
 
 def test_image_api_exposes_image_only_for_sensenova():
@@ -565,7 +519,7 @@ def test_image_edit_api_accepts_one_reference_image():
     )
     client = TestClient(app)
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
 
     response = client.post(
         "/v1/images/edits",
@@ -620,7 +574,7 @@ def test_image_edit_api_maps_stage_errors(stage_error: str, expected_status: int
         )
     )
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
     response = client.post(
         "/v1/images/edits",
         files={"image": ("reference.png", reference.getvalue(), "image/png")},
@@ -650,7 +604,7 @@ def test_image_edit_api_parses_cache_flag(raw: str, expected: bool) -> None:
     )
     client = TestClient(app)
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
 
     response = client.post(
         "/v1/images/edits",
@@ -669,7 +623,7 @@ def test_image_edit_api_uses_sglang_defaults_when_omitted():
     )
     client = TestClient(app)
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
 
     response = client.post(
         "/v1/images/edits",
@@ -862,13 +816,21 @@ def test_i2i_stage_overrides_match_cost_and_tp_validation(
     validate_generation_request(payload, model)
     assert model.sensenova_cache_dit.validate_request.call_args.kwargs["steps"] == 4
     result = generation_module.generate_image(payload, model, tokenizer)
-    assert model.it2i_generate.call_args.kwargs["num_steps"] == 4
-    assert model.it2i_generate.call_args.kwargs["image_size"] == (
+    assert model.it2i_generate.call_args.kwargs["sampling"].num_inference_steps == 4
+    assert (
+        model.it2i_generate.call_args.kwargs["sampling"].width,
+        model.it2i_generate.call_args.kwargs["sampling"].height,
+    ) == (
         output_width_pixels,
         output_height_pixels,
     )
-    assert model.it2i_generate.call_args.kwargs["cfg_scale"] == guidance_scale
-    assert model.it2i_generate.call_args.kwargs["img_cfg_scale"] == img_cfg_scale
+    assert (
+        model.it2i_generate.call_args.kwargs["sampling"].guidance_scale
+        == guidance_scale
+    )
+    assert (
+        model.it2i_generate.call_args.kwargs["sampling"].img_cfg_scale == img_cfg_scale
+    )
     with Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"]))) as image:
         decoded_image_size = image.size
     assert decoded_image_size == (
@@ -879,7 +841,7 @@ def test_i2i_stage_overrides_match_cost_and_tp_validation(
 
 @pytest.mark.parametrize("reference_count", [1, 3])
 @pytest.mark.parametrize("do_resize", [False, True])
-@pytest.mark.parametrize("reference_size_pixels", [(64, 32), (77, 39)])
+@pytest.mark.parametrize("reference_size_pixels", [(64, 32), (96, 64)])
 def test_i2i_validation_decodes_references_without_resizing(
     reference_count: int,
     do_resize: bool,
@@ -927,14 +889,12 @@ def test_i2i_validation_decodes_references_without_resizing(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_reference_index", [0, 1])
 @pytest.mark.parametrize("image_format", ["JPEG", "PNG"])
-@pytest.mark.parametrize(
-    "scheduler_class", [TensorParallelScheduler, SenseNovaTensorParallelScheduler]
-)
+@pytest.mark.parametrize("cooperative_cancellation", [False, True])
 async def test_truncated_image_is_rejected_before_tp_fanout(
     tokenizer: PreTrainedTokenizerBase,
     invalid_reference_index: int,
     image_format: Literal["JPEG", "PNG"],
-    scheduler_class: type[TensorParallelScheduler],
+    cooperative_cancellation: bool,
 ) -> None:
     """A truncated reference killed TP execution instead of failing its request."""
     image_buffer = io.BytesIO()
@@ -972,9 +932,24 @@ async def test_truncated_image_is_rejected_before_tp_fanout(
     model = Mock()
     model.sensenova_cache_dit.enabled_by_default = False
     model.it2i_generate.return_value = torch.zeros(1, 3, 32, 64)
-    scheduler = scheduler_class(
-        lambda payload: generation_module.generate_image(payload, model, tokenizer),
-        validate_request=lambda payload: validate_generation_request(payload, model),
+
+    def compute(payload: StagePayload) -> StagePayload:
+        return generation_module.generate_image(payload, model, tokenizer)
+
+    def validate(payload: StagePayload) -> None:
+        validate_generation_request(payload, model)
+
+    scheduler = (
+        SenseNovaTensorParallelScheduler(
+            compute,
+            report_cancellation=True,
+            shutdown_join_timeout_s=5.0,
+            validate_request=validate,
+        )
+        if cooperative_cancellation
+        else TensorParallelScheduler(
+            compute, shutdown_join_timeout_s=5.0, validate_request=validate
+        )
     )
     fanout = Mock()
     leader = Stage(
@@ -1179,7 +1154,7 @@ def test_image_edit_api_accepts_multiple_reference_images():
     )
     client = TestClient(app)
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
     image_file = ("reference.png", reference.getvalue(), "image/png")
 
     response = client.post(
@@ -1191,7 +1166,8 @@ def test_image_edit_api_accepts_multiple_reference_images():
     assert response.status_code == 200
 
 
-def test_image_edit_api_expands_n_with_sequential_seeds():
+def test_image_edit_api_sends_every_output_in_one_request():
+    """Each edit output re-sent all references as its own pipeline request."""
     image_client = MultipleOutputImageEditClient()
     app = create_app(
         image_client,
@@ -1200,7 +1176,7 @@ def test_image_edit_api_expands_n_with_sequential_seeds():
     )
     client = TestClient(app)
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
 
     response = client.post(
         "/v1/images/edits",
@@ -1210,7 +1186,7 @@ def test_image_edit_api_expands_n_with_sequential_seeds():
 
     assert response.status_code == 200
     assert len(response.json()["data"]) == 3
-    assert image_client.seeds == [7, 8, 9]
+    assert image_client.seeds_and_counts == [(7, 3)]
 
 
 def test_image_edit_api_rejects_unsupported_or_invalid_inputs():
@@ -1221,7 +1197,7 @@ def test_image_edit_api_rejects_unsupported_or_invalid_inputs():
     )
     client = TestClient(app)
     reference = io.BytesIO()
-    Image.new("RGB", (16, 8), (255, 0, 0)).save(reference, format="PNG")
+    Image.new("RGB", (64, 32), (255, 0, 0)).save(reference, format="PNG")
     image_file = ("reference.png", reference.getvalue(), "image/png")
 
     bad_image = client.post(
@@ -1230,6 +1206,13 @@ def test_image_edit_api_rejects_unsupported_or_invalid_inputs():
         data={"prompt": "edit this"},
     )
     assert bad_image.status_code == 400
+    corrupt_image = client.post(
+        "/v1/images/edits",
+        files={"image": ("corrupt.png", png_with_bad_idat_crc(), "image/png")},
+        data={"prompt": "edit this"},
+    )
+    assert corrupt_image.status_code == 400
+    assert corrupt_image.json()["detail"] == "reference image is not a valid image"
     invalid_size = client.post(
         "/v1/images/edits",
         files={"image": image_file},

@@ -7,10 +7,10 @@ from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
     create_block_causal_mask,
 )
 from sglang_omni.models.sensenova_u1.neo_unify.conversation import get_conv_template
-from sglang_omni.models.sensenova_u1.neo_unify.generation_math import (
+from sglang_omni.models.sensenova_u1.neo_unify.generation_state import GenerationState
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_vit import (
     build_abs_positions_from_grid_hw,
 )
-from sglang_omni.models.sensenova_u1.neo_unify.generation_state import GenerationState
 
 # Modified for SGLang; see this directory's README.md for upstream source.
 
@@ -51,79 +51,6 @@ def unpatchify(
     x = torch.einsum("nhwpqc->nchpwq", x)
     images = x.reshape(shape=(x.shape[0], 3, h * patch_size, w * patch_size))
     return images
-
-
-def euler_step(
-    self: GenerationState,
-    v_pred: torch.Tensor,
-    z: torch.Tensor,
-    t: torch.Tensor,
-    t_next: torch.Tensor,
-) -> torch.Tensor:
-    z_next = z + (t_next - t) * v_pred
-    return z_next
-
-
-def build_cfg_schedule(
-    timesteps: torch.Tensor, cfg_interval: tuple[float, float], needs_cfg: bool
-) -> list[bool]:
-    if not needs_cfg:
-        return [False] * (timesteps.numel() - 1)
-    else:
-        pass
-    return (
-        (timesteps[:-1] >= cfg_interval[0]) & (timesteps[:-1] <= cfg_interval[1])
-    ).tolist()
-
-
-def build_i2i_cfg_schedule(
-    timesteps: torch.Tensor, cfg_interval: tuple[float, float]
-) -> list[bool]:
-    if cfg_interval[0] == 0:
-        return [True] * (timesteps.numel() - 1)
-    else:
-        pass
-    return (
-        (timesteps[:-1] > cfg_interval[0]) & (timesteps[:-1] < cfg_interval[1])
-    ).tolist()
-
-
-def calculate_dynamic_mu(self: GenerationState, image_seq_len: int) -> float:
-    denom = self.max_image_seq_len - self.base_image_seq_len
-    if denom == 0:
-        return float(self.base_shift)
-    else:
-        pass
-    m = (self.max_shift - self.base_shift) / denom
-    b = self.base_shift - m * self.base_image_seq_len
-    return float(image_seq_len) * m + b
-
-
-def apply_time_schedule(
-    self: GenerationState, t: torch.Tensor, image_seq_len: int, timestep_shift: float
-) -> torch.Tensor:
-    self.time_schedule = "standard"
-    sigma = 1 - t
-    if timestep_shift != 1:
-        self.time_schedule = "standard"
-    else:
-        pass
-    if self.time_schedule == "standard":
-        shift = timestep_shift
-        sigma = shift * sigma / (1 + (shift - 1) * sigma)
-    elif self.time_schedule == "dynamic":
-        mu = self.calculate_dynamic_mu(image_seq_len)
-        mu_t = t.new_tensor(mu)
-        if self.time_shift_type == "exponential":
-            shift = torch.exp(mu_t)
-            sigma = shift * sigma / (1 + (shift - 1) * sigma)
-        elif self.time_shift_type == "linear":
-            sigma = mu_t / (mu_t + (1 / sigma - 1))
-        else:
-            raise ValueError(f"Unsupported time_shift_type: {self.time_shift_type}")
-    else:
-        raise ValueError(f"Unsupported time_schedule: {self.time_schedule}")
-    return 1 - sigma
 
 
 def build_t2i_query(

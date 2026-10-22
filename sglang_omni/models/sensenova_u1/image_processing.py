@@ -11,20 +11,23 @@ import math
 import torch
 from PIL import Image
 
-from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1ImageEditSampling
+from sglang_omni.models.sensenova_u1.sampling import (
+    IMAGE_DIMENSION_MULTIPLE,
+    MIN_INPUT_MAX_PIXELS,
+    SenseNovaU1ImageEditSampling,
+)
 from sglang_omni.proto.request import StagePayload
 
 DEFAULT_INPUT_MAX_PIXELS = 2048 * 2048
-MIN_INPUT_MAX_PIXELS = 512 * 512
-IMAGE_RESIZE_FACTOR = 32
 
 
 def smart_resize(
     height: int,
     width: int,
-    factor: int = 32,
-    min_pixels: int = 65536,
-    max_pixels: int = 4194304,
+    *,
+    factor: int,
+    min_pixels: int,
+    max_pixels: int,
 ) -> tuple[int, int]:
     """Resize to the target pixel budget and round to the model patch grid."""
     if max(height, width) / min(height, width) > 200:
@@ -54,7 +57,12 @@ def reference_image_size(
     width: int, height: int, reference_count: int, options: SenseNovaU1ImageEditSampling
 ) -> tuple[int, int]:
     if not options.do_resize:
-        return width, height
+        if width % IMAGE_DIMENSION_MULTIPLE or height % IMAGE_DIMENSION_MULTIPLE:
+            raise ValueError(
+                f"Unresized reference dimensions must be divisible by {IMAGE_DIMENSION_MULTIPLE}"
+            )
+        else:
+            return width, height
     elif options.input_max_pixels is not None:
         input_max_pixels = options.input_max_pixels
     elif reference_count <= 2:
@@ -66,7 +74,7 @@ def reference_image_size(
     resized_height, resized_width = smart_resize(
         height=height,
         width=width,
-        factor=IMAGE_RESIZE_FACTOR,
+        factor=IMAGE_DIMENSION_MULTIPLE,
         min_pixels=input_max_pixels,
         max_pixels=input_max_pixels,
     )
@@ -105,23 +113,27 @@ def prepare_reference_images(
     value: str | list[str] | None, options: SenseNovaU1ImageEditSampling
 ) -> list[Image.Image]:
     images = decode_reference_images(value)
-    prepared = []
-    for image in images:
-        if image.mode == "RGBA":
-            background = Image.new("RGB", image.size, (255, 255, 255))
-            background.paste(image, mask=image.split()[3])
-            image = background
-        else:
-            image = image.convert("RGB")
-        width, height = reference_image_size(
-            image.width, image.height, len(images), options
-        )
-        if image.size != (width, height):
-            image = image.resize((width, height), Image.Resampling.LANCZOS)
-        else:
-            pass
-        prepared.append(image)
-    return prepared
+    prepared: list[Image.Image] = []
+    try:
+        for image in images:
+            if image.mode == "RGBA":
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                background.paste(image, mask=image.split()[3])
+                image = background
+            else:
+                image = image.convert("RGB")
+            width, height = reference_image_size(
+                image.width, image.height, len(images), options
+            )
+            if image.size != (width, height):
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+            else:
+                pass
+            prepared.append(image)
+        return prepared
+    finally:
+        for image in images:
+            image.close()
 
 
 def resolve_edit_output_size(
@@ -135,7 +147,7 @@ def resolve_edit_output_size(
     height, width = smart_resize(
         height=reference_size[1],
         width=reference_size[0],
-        factor=IMAGE_RESIZE_FACTOR,
+        factor=IMAGE_DIMENSION_MULTIPLE,
         min_pixels=target_pixels,
         max_pixels=target_pixels,
     )
@@ -148,10 +160,11 @@ def resolve_reference_output_size(
     """Validate reference pixels and resolve dimensions without resizing images."""
     references = decode_reference_images(encoded_references)
     try:
-        reference_size_pixels = reference_image_size(
-            references[0].width, references[0].height, len(references), options
-        )
-        return resolve_edit_output_size(reference_size_pixels, options)
+        reference_sizes = [
+            reference_image_size(image.width, image.height, len(references), options)
+            for image in references
+        ]
+        return resolve_edit_output_size(reference_sizes[0], options)
     finally:
         for image in references:
             image.close()

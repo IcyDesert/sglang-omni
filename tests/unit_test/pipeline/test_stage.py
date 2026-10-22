@@ -8,7 +8,7 @@ import logging
 import pickle
 import threading
 import time
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -40,6 +40,7 @@ from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.session import SessionHooks, SessionScheduler
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.scheduling.tensor_parallel_scheduler import TensorParallelScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from tests.unit_test.fixtures.pipeline_fakes import (
     EventLog,
@@ -59,12 +60,6 @@ from tests.unit_test.pipeline.helpers import make_stage
 
 
 def test_tp_validation_rejects_before_fanout_and_preserves_next_request():
-    from unittest.mock import AsyncMock, Mock
-
-    from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
-        TensorParallelScheduler,
-    )
-
     calls = [[], []]
     collective = threading.Barrier(2, timeout=3)
 
@@ -82,6 +77,7 @@ def test_tp_validation_rejects_before_fanout_and_preserves_next_request():
     schedulers = [
         TensorParallelScheduler(
             lambda payload, rank=rank: compute(rank, payload),
+            shutdown_join_timeout_s=5.0,
             validate_request=Mock(side_effect=validate),
         )
         for rank in range(2)
@@ -117,6 +113,31 @@ def test_tp_validation_rejects_before_fanout_and_preserves_next_request():
     assert all(
         scheduler.outbox.get_nowait().type == "result" for scheduler in schedulers
     )
+
+
+def test_tp_validation_runs_off_the_event_loop():
+    """Leader validation decoded references on the event loop, stalling aborts."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def validate(payload):
+        entered.set()
+        assert release.wait(2)
+
+    scheduler = TensorParallelScheduler(
+        lambda payload: payload, shutdown_join_timeout_s=5.0, validate_request=validate
+    )
+    leader = make_stage(role="leader", scheduler=scheduler, tp_fanout=Mock())
+
+    async def dispatch():
+        execution = asyncio.create_task(leader.execute(make_stage_payload()))
+        assert await asyncio.to_thread(entered.wait, 2)
+        # The loop can only reach this line while validation is still blocked.
+        release.set()
+        await execution
+
+    asyncio.run(dispatch())
+    assert scheduler.inbox.get_nowait().request_id == "req-1"
 
 
 @pytest.fixture(autouse=True)
@@ -607,11 +628,6 @@ def test_stage_stop_warns_but_succeeds_on_a_stuck_scheduler_thread(
 
 @pytest.mark.parametrize("role", ["leader", "follower"])
 def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
-    from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
-        TensorParallelScheduler,
-    )
-    from sglang_omni.scheduling.message import IncomingMessage
-
     async def _run() -> None:
         cleanup_entered = threading.Event()
         release_cleanup = threading.Event()
@@ -623,7 +639,9 @@ def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
             cleanup_entered.set()
             assert release_cleanup.wait(5)
 
-        scheduler = TensorParallelScheduler(compute, shutdown_callback=cleanup)
+        scheduler = TensorParallelScheduler(
+            compute, shutdown_join_timeout_s=5.0, shutdown_callback=cleanup
+        )
         scheduler.inbox.put(IncomingMessage("req", "new_request", "forward"))
         stage_obj = make_stage(
             role=role, scheduler=scheduler, control_plane=CloseAwareControlPlane()
@@ -637,7 +655,7 @@ def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
             with pytest.raises(RuntimeError, match="Scheduler thread"):
                 await asyncio.wait_for(run_task, timeout=2)
             assert stage_obj.scheduler_crash_error is not None
-            assert scheduler.wait_for_shutdown is False
+            assert scheduler.shutdown_join_timeout_s is None
             # The stage can exit and trigger group shutdown while this rank's cleanup is still blocked on its compute thread.
             assert stage_obj.scheduler_thread.is_alive()
         finally:
@@ -652,11 +670,6 @@ def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
 
 
 def test_stage_stop_waits_past_timeout_for_collective_cleanup(monkeypatch) -> None:
-    from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
-        TensorParallelScheduler,
-    )
-    from sglang_omni.scheduling.message import IncomingMessage
-
     async def _run() -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -669,7 +682,9 @@ def test_stage_stop_waits_past_timeout_for_collective_cleanup(monkeypatch) -> No
             return value
 
         scheduler = TensorParallelScheduler(
-            compute, shutdown_callback=lambda: events.append("cleanup")
+            compute,
+            shutdown_join_timeout_s=5.0,
+            shutdown_callback=lambda: events.append("cleanup"),
         )
         scheduler.inbox.put(IncomingMessage("req", "new_request", "forward"))
         stage_obj = make_stage(scheduler=scheduler)
@@ -691,6 +706,37 @@ def test_stage_stop_waits_past_timeout_for_collective_cleanup(monkeypatch) -> No
         assert stage_obj.scheduler_thread is None
 
     asyncio.run(_run())
+
+
+def test_stage_stop_bounds_wedged_collective_cleanup(caplog) -> None:
+    """A TP rank blocked in a collective whose peer died made stage stop wait forever."""
+
+    async def run() -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def compute(value):
+            entered.set()
+            assert release.wait(5)
+            return value
+
+        scheduler = TensorParallelScheduler(compute, shutdown_join_timeout_s=0.05)
+        scheduler.inbox.put(IncomingMessage("req", "new_request", "forward"))
+        stage_obj = make_stage(scheduler=scheduler)
+        await stage_obj.start()
+        try:
+            assert await asyncio.to_thread(entered.wait, 1)
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stage_obj.stop(), timeout=2)
+            assert "scheduler thread did not stop within 0.05s" in caplog.text
+            assert stage_obj.scheduler_thread is not None
+            assert stage_obj.scheduler_thread.is_alive()
+        finally:
+            release.set()
+            if stage_obj.scheduler_thread is not None:
+                await asyncio.to_thread(stage_obj.scheduler_thread.join, 2)
+
+    asyncio.run(run())
 
 
 def test_relay_payload_and_cross_gpu_stream_contracts() -> None:

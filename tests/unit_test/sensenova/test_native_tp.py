@@ -13,10 +13,7 @@ from torch import nn
 from sglang_omni.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOLLMConfig,
 )
-from sglang_omni.models.sensenova_u1.neo_unify.modeling_qwen3 import (
-    Qwen3ForCausalLM,
-    set_attn_backend,
-)
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_qwen3 import Qwen3ForCausalLM
 from sglang_omni.models.sensenova_u1.tensor_parallel import apply_tensor_parallel
 
 
@@ -31,7 +28,6 @@ def native_parity(rank, rendezvous, dtype):
     )
     try:
         torch.manual_seed(29)
-        set_attn_backend("sdpa")
         config = NEOLLMConfig(
             vocab_size=32,
             hidden_size=32,

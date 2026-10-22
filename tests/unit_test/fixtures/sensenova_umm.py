@@ -11,6 +11,19 @@ from sglang_omni.models.sensenova_u1.umm import SenseNovaUMMAdapter
 from sglang_omni.pipeline.umm import UMMController, UMMLimits
 
 
+def png_with_bad_idat_crc() -> bytes:
+    """A PNG that opens normally but fails verification on its image-data checksum."""
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (64, 32), color="red").save(image_buffer, format="PNG")
+    png_bytes = bytearray(image_buffer.getvalue())
+    chunk_type_offset = png_bytes.index(b"IDAT")
+    chunk_data_length = int.from_bytes(
+        png_bytes[chunk_type_offset - 4 : chunk_type_offset], "big"
+    )
+    png_bytes[chunk_type_offset + 4 + chunk_data_length] ^= 0xFF
+    return bytes(png_bytes)
+
+
 @pytest.fixture
 def encoded_images() -> list[str]:
     images = []

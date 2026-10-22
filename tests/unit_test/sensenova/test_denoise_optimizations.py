@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-from types import SimpleNamespace
-
 import pytest
 import torch
 
 from sglang_omni.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOLLMConfig,
 )
-from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
-from sglang_omni.models.sensenova_u1.neo_unify.modeling_qwen3 import (
-    Qwen3Attention,
-    Qwen3Model,
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_qwen3 import Qwen3Model
+from sglang_omni.models.sensenova_u1.neo_unify.qwen_attention import Qwen3Attention
+from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
     Qwen3RotaryEmbedding,
 )
 
@@ -150,39 +147,3 @@ def test_image_only_matches_all_true_indicators():
         actual = model(image_only=True, **common).last_hidden_state
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("needs_cfg", [False, True])
-@pytest.mark.parametrize("shift", [1.0, 3.0])
-@pytest.mark.parametrize("interval", [(0.0, 1.0), (0.25, 0.75), (0.5, 0.5), (0.7, 0.8)])
-def test_t2i_cfg_schedule_preserves_scalar_decisions(needs_cfg, shift, interval):
-    timesteps = torch.linspace(0, 1, 9)
-    timesteps = NEOChatModel.apply_time_schedule(SimpleNamespace(), timesteps, 4, shift)
-    probes = []
-    for endpoint in dict.fromkeys(interval):
-        edge = timesteps.new_tensor(endpoint)
-        probes.extend(
-            (
-                torch.nextafter(edge, edge.new_tensor(0.0)),
-                edge,
-                torch.nextafter(edge, edge.new_tensor(1.0)),
-            )
-        )
-    timesteps = torch.cat((timesteps[:-1], torch.stack(probes), timesteps[-1:]))
-    expected = [
-        bool(t >= interval[0] and t <= interval[1] and needs_cfg)
-        for t in timesteps[:-1]
-    ]
-
-    assert NEOChatModel.build_cfg_schedule(timesteps, interval, needs_cfg) == expected
-
-
-@pytest.mark.parametrize("interval", [(0.0, 1.0), (0.25, 0.75), (0.7, 0.8)])
-def test_i2i_cfg_schedule_preserves_strict_interval_semantics(interval):
-    timesteps = torch.linspace(0, 1, 9)
-    expected = [
-        bool((t > interval[0] and t < interval[1]) or interval[0] == 0)
-        for t in timesteps[:-1]
-    ]
-
-    assert NEOChatModel.build_i2i_cfg_schedule(timesteps, interval) == expected
