@@ -42,7 +42,8 @@ class PrefixTimings(TypedDict, total=False):
 
 class ThinkingBackend(Protocol):
     @property
-    def strict(self) -> bool: ...
+    def strict(self) -> bool:
+        """Return whether backend failures must propagate to the caller."""
 
     def generate_batch(
         self,
@@ -51,7 +52,8 @@ class ThinkingBackend(Protocol):
         max_think_tokens: int,
         eos_token_id: int,
         think_end_token_id: int,
-    ) -> list[list[int]]: ...
+    ) -> list[list[int]]:
+        """Return generated thinking tokens for each input prefix."""
 
     def generate_batch_for_kv_transfer(
         self,
@@ -60,20 +62,25 @@ class ThinkingBackend(Protocol):
         max_think_tokens: int,
         eos_token_id: int,
         think_end_token_id: int,
-    ) -> tuple[list[list[int]], ThinkingSession | list[ThinkingSession]]: ...
+    ) -> tuple[list[list[int]], ThinkingSession | list[ThinkingSession]]:
+        """Return thinking tokens and retained sessions for prefix transfer."""
 
-    def dump_prefix_kv(self, input_ids: list[int], dump_id: str) -> None: ...
+    def dump_prefix_kv(self, input_ids: list[int], dump_id: str) -> None:
+        """Export the prefix cache identified by the dump ID."""
 
     def transfer_prefix_kv(
         self,
         input_ids: list[int],
         dump_id: str,
         session_context: ThinkingSession | None = None,
-    ) -> PrefixMetadata: ...
+    ) -> PrefixMetadata:
+        """Export a prefix cache and return its transfer metadata."""
 
     def close_transfer_context(
         self,
         session_context: ThinkingSession | list[ThinkingSession] | None,
-    ) -> None: ...
+    ) -> None:
+        """Release retained sessions after prefix transfer."""
 
-    def fail(self, exc: BaseException) -> bool: ...
+    def fail(self, exc: BaseException) -> bool:
+        """Handle a backend failure according to the configured error policy."""

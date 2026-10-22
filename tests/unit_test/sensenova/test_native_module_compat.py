@@ -18,7 +18,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class NativeModuleLoader(Protocol):
-    def __call__(self, module: str) -> ModuleType: ...
+    def __call__(self, module: str) -> ModuleType:
+        """Load a native module without accelerator package initialization."""
 
 
 @pytest.fixture

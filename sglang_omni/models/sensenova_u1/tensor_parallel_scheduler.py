@@ -13,19 +13,23 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 
 class RequestCompute(Protocol):
-    def __call__(self, payload: StagePayload, /) -> StagePayload: ...
+    def __call__(self, payload: StagePayload, /) -> StagePayload:
+        """Execute a request and return its stage payload."""
 
 
 class RequestValidator(Protocol):
-    def __call__(self, payload: StagePayload, /) -> None: ...
+    def __call__(self, payload: StagePayload, /) -> None:
+        """Validate a request before dispatching tensor-parallel work."""
 
 
 class ShutdownCallback(Protocol):
-    def __call__(self) -> None: ...
+    def __call__(self) -> None:
+        """Release resources after pending work has drained."""
 
 
 class FailureCallback(Protocol):
-    def __call__(self, exc: BaseException, /) -> None: ...
+    def __call__(self, exc: BaseException, /) -> None:
+        """Report a compute failure to the scheduler owner."""
 
 
 class TensorParallelScheduler(SimpleScheduler):

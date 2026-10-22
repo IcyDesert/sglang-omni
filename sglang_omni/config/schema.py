@@ -659,7 +659,8 @@ class CustomVoiceConfig:
 
 
 class SerializationFallback(Protocol):
-    def __call__(self, value: object, /) -> object: ...
+    def __call__(self, value: object, /) -> object:
+        """Convert an unsupported value into a serializable value."""
 
 
 class ModelDumpOptions(TypedDict, total=False):

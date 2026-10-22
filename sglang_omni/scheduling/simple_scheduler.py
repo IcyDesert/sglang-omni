@@ -30,11 +30,13 @@ logger = logging.getLogger(__name__)
 class BatchKey(Protocol):
     def __call__(
         self, payload: StagePayload
-    ) -> tuple[str | int | float | bool | None, ...]: ...
+    ) -> tuple[str | int | float | bool | None, ...]:
+        """Return the compatibility key used to group requests into batches."""
 
 
 class RequestArrivalHook(Protocol):
-    def __call__(self, payload: StagePayload) -> None: ...
+    def __call__(self, payload: StagePayload) -> None:
+        """Record a request when it reaches the scheduler."""
 
 
 class SimpleScheduler(Generic[ComputeInput, ComputeResult]):

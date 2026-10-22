@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class LayerPreHook(Protocol):
-    def __call__(self, module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None: ...
+    def __call__(self, module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        """Prepare layer weights before the module executes."""
 
 
 class LayerPostHook(Protocol):
@@ -28,7 +29,8 @@ class LayerPostHook(Protocol):
         module: nn.Module,
         inputs: tuple[torch.Tensor, ...],
         output: torch.Tensor | None,
-    ) -> None: ...
+    ) -> None:
+        """Release streamed layer weights after the module executes."""
 
 
 @dataclass(frozen=True)

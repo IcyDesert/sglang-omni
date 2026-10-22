@@ -188,7 +188,8 @@ def compute_default_rope_parameters(
 class RopeInitializer(Protocol):
     def __call__(
         self, cfg: Qwen3Config, dev: torch.device | None = None
-    ) -> tuple[torch.Tensor, float]: ...
+    ) -> tuple[torch.Tensor, float]:
+        """Return rotary frequencies and their attention scaling factor."""
 
 
 class Qwen3RotaryEmbedding(nn.Module):

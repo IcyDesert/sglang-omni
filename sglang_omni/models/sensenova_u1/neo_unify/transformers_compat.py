@@ -33,7 +33,8 @@ class ModelForward(Protocol):
         cache_position: torch.Tensor | None = None,
         image_only: bool = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast: ...
+    ) -> BaseModelOutputWithPast:
+        """Return hidden states and the optional updated prefix cache."""
 
 
 class LegacyCausalMaskFactory(Protocol):
@@ -45,7 +46,8 @@ class LegacyCausalMaskFactory(Protocol):
         cache_position: torch.Tensor,
         past_key_values: Cache | None,
         position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor | None: ...
+    ) -> torch.Tensor | None:
+        """Build a causal mask using explicit cache positions."""
 
 
 class CausalMaskFactory(Protocol):
@@ -56,7 +58,8 @@ class CausalMaskFactory(Protocol):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None,
         position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor | None: ...
+    ) -> torch.Tensor | None:
+        """Build a causal mask from the inputs and prefix cache."""
 
 
 try:
