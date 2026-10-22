@@ -26,11 +26,6 @@ from sglang_omni.config import FactoryArgs, ProcessConfig
 from sglang_omni.config.manager import resolve_config_cls_for_model_path
 from sglang_omni.config.topology import compile_logical_processes
 from sglang_omni.models.sensenova_u1.config import SenseNovaU1PipelineConfig
-from sglang_omni.models.sensenova_u1.generation import (
-    generate_image,
-    generate_images,
-    text_to_image_options,
-)
 from sglang_omni.models.sensenova_u1.image_processing import (
     decode_reference_images,
     prepare_reference_images,
@@ -165,7 +160,7 @@ def test_t2i_stage_encodes_real_png_and_passes_source_arguments(
         data=None,
     )
 
-    result = generate_image(payload, model, tokenizer=tokenizer)
+    result = generation_module.generate_image(payload, model, tokenizer=tokenizer)
 
     kwargs = model.t2i_generate.call_args.kwargs
     assert kwargs["image_size"] == (64, 32)
@@ -185,7 +180,7 @@ def test_t2i_stage_rejects_invalid_output(tokenizer: PreTrainedTokenizerBase) ->
         data=None,
     )
     try:
-        generate_image(payload, model, tokenizer=tokenizer)
+        generation_module.generate_image(payload, model, tokenizer=tokenizer)
     except ValueError as exc:
         assert "invalid image tensor" in str(exc)
     else:
@@ -225,7 +220,7 @@ def test_t2i_stage_batches_compatible_requests_with_per_request_seeds(
         )
     ]
 
-    results = generate_images(payloads, model, tokenizer=tokenizer)
+    results = generation_module.generate_images(payloads, model, tokenizer=tokenizer)
 
     args = model.t2i_generate.call_args.args
     kwargs = model.t2i_generate.call_args.kwargs
@@ -270,7 +265,7 @@ def test_t2i_stage_splits_incompatible_requests_and_restores_order(
         )
     ]
 
-    results = generate_images(payloads, model, tokenizer=tokenizer)
+    results = generation_module.generate_images(payloads, model, tokenizer=tokenizer)
 
     assert model.t2i_generate.call_count == 2
     assert [result.request_id for result in results] == [
@@ -371,7 +366,7 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
         data=None,
     )
 
-    result = generate_image(payload, model, tokenizer=tokenizer)
+    result = generation_module.generate_image(payload, model, tokenizer=tokenizer)
 
     args = model.it2i_generate.call_args.args
     kwargs = model.it2i_generate.call_args.kwargs
@@ -406,7 +401,7 @@ def test_i2i_stage_rejects_invalid_reference_image(
     )
 
     try:
-        generate_image(payload, Mock(), tokenizer=tokenizer)
+        generation_module.generate_image(payload, Mock(), tokenizer=tokenizer)
     except ValueError as exc:
         assert "invalid reference image" in str(exc)
     else:
@@ -443,7 +438,7 @@ def test_i2i_stage_preserves_reference_aspect_ratio_without_explicit_size(
         data=None,
     )
 
-    result = generate_image(payload, model, tokenizer=tokenizer)
+    result = generation_module.generate_image(payload, model, tokenizer=tokenizer)
 
     assert model.it2i_generate.call_args.kwargs["image_size"] == (384, 192)
     image = Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"])))
@@ -784,7 +779,7 @@ def test_image_edit_oom_uses_model_device_backend(
         "device exhausted" if device_type == "cpu" else f"{device_type.upper()} memory"
     )
     with pytest.raises(error_type, match=error_message) as raised:
-        generate_image(payload, model, tokenizer)
+        generation_module.generate_image(payload, model, tokenizer)
     if device_type == "cpu":
         get_device_module.assert_not_called()
         backend.empty_cache.assert_not_called()
@@ -810,7 +805,7 @@ def test_multi_output_failure_cleans_cache_controller(
         "multi", OmniRequest("a cat", {"n": 2, "width": 32, "height": 32}), None
     )
     with pytest.raises(RuntimeError, match="generation failed"):
-        generate_images([payload], model, tokenizer)
+        generation_module.generate_images([payload], model, tokenizer)
     cleanup.assert_called_once_with(model)
 
 
@@ -866,7 +861,7 @@ def test_i2i_stage_overrides_match_cost_and_tp_validation(
     open_image.assert_not_called()
     validate_generation_request(payload, model)
     assert model.sensenova_cache_dit.validate_request.call_args.kwargs["steps"] == 4
-    result = generate_image(payload, model, tokenizer)
+    result = generation_module.generate_image(payload, model, tokenizer)
     assert model.it2i_generate.call_args.kwargs["num_steps"] == 4
     assert model.it2i_generate.call_args.kwargs["image_size"] == (
         output_width_pixels,
@@ -978,7 +973,7 @@ async def test_truncated_image_is_rejected_before_tp_fanout(
     model.sensenova_cache_dit.enabled_by_default = False
     model.it2i_generate.return_value = torch.zeros(1, 3, 32, 64)
     scheduler = scheduler_class(
-        lambda payload: generate_image(payload, model, tokenizer),
+        lambda payload: generation_module.generate_image(payload, model, tokenizer),
         validate_request=lambda payload: validate_generation_request(payload, model),
     )
     fanout = Mock()
@@ -1040,7 +1035,7 @@ def test_invalid_edit_seed_is_rejected_before_tp_execution(
     with pytest.raises(ValueError, match="seed"):
         validate_generation_request(payload, model)
     with pytest.raises(ValueError, match="seed"):
-        generate_image(payload, model, tokenizer)
+        generation_module.generate_image(payload, model, tokenizer)
     model.it2i_generate.assert_not_called()
 
 
@@ -1342,7 +1337,7 @@ def test_generate_stage_params_layer_onto_t2i_options():
         ),
         None,
     )
-    options = text_to_image_options(payload)
+    options = generation_module.text_to_image_options(payload)
     assert (options.width, options.height) == (512, 384)
     assert options.num_inference_steps == 2
     assert options.guidance_scale == 3.0
