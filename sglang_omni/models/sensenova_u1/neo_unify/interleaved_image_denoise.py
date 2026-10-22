@@ -121,6 +121,7 @@ def interleaved_image_denoise(
                 leave=False,
             )
         except ImportError:
+            # note (Wes): tqdm is optional; keep plain iteration when it is unavailable.
             pass
     else:
         pass
