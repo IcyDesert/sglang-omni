@@ -874,7 +874,9 @@ def test_i2i_stage_overrides_match_cost_and_tp_validation(
     )
     assert model.it2i_generate.call_args.kwargs["cfg_scale"] == guidance_scale
     assert model.it2i_generate.call_args.kwargs["img_cfg_scale"] == img_cfg_scale
-    assert Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"]))).size == (
+    with Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"]))) as image:
+        decoded_image_size = image.size
+    assert decoded_image_size == (
         output_width_pixels,
         output_height_pixels,
     )

@@ -46,7 +46,8 @@ class AttentionState(AttentionModule, Protocol):
         indexes: torch.LongTensor,
         hidden_states: torch.Tensor,
         position_embeddings: PositionEmbeddings | None = None,
-    ) -> PositionEmbeddings: ...
+    ) -> PositionEmbeddings:
+        """Return temporal and spatial rotary embeddings for the input positions."""
 
 
 def forward_gen(

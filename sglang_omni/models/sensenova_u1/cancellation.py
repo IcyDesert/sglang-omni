@@ -20,7 +20,8 @@ class SenseNovaCancelledError(RuntimeError):
 
 
 class CancellationProbe(Protocol):
-    def __call__(self, request_id: str) -> bool: ...
+    def __call__(self, request_id: str) -> bool:
+        """Return whether the request has been cancelled."""
 
 
 class GenerationScope:

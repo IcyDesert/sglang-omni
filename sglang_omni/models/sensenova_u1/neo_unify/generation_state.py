@@ -74,18 +74,21 @@ class GenerationState(Protocol):
     last_srt_kv_transfer_timings_list: list[PrefixTimings]
     last_srt_kv_transferred_prefixes: list[str]
 
-    def notify_layer_offload_phase(self, phase: str) -> None: ...
+    def notify_layer_offload_phase(self, phase: str) -> None:
+        """Notify the layer offloader of the next execution phase."""
 
     def extract_feature(
         self,
         pixel_values: torch.Tensor | None,
         gen_model: bool = False,
         grid_hw: torch.Tensor | None = None,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Encode image pixels into features for the language model."""
 
     def patchify(
         self, images: torch.Tensor, patch_size: int, channel_first: bool = False
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Convert images into flattened patches."""
 
     def unpatchify(
         self,
@@ -93,7 +96,8 @@ class GenerationState(Protocol):
         patch_size: int,
         h: int | None = None,
         w: int | None = None,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Reconstruct images from flattened patches."""
 
     def euler_step(
         self,
@@ -101,36 +105,43 @@ class GenerationState(Protocol):
         z: torch.Tensor,
         t: torch.Tensor,
         t_next: torch.Tensor,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Advance image latents to the next timestep using predicted velocity."""
 
     @staticmethod
     def build_cfg_schedule(
         timesteps: torch.Tensor, cfg_interval: tuple[float, float], needs_cfg: bool
-    ) -> list[bool]: ...
+    ) -> list[bool]:
+        """Return which text-to-image steps use classifier-free guidance."""
 
     @staticmethod
     def build_i2i_cfg_schedule(
         timesteps: torch.Tensor, cfg_interval: tuple[float, float]
-    ) -> list[bool]: ...
+    ) -> list[bool]:
+        """Return which image-edit steps use classifier-free guidance."""
 
-    def calculate_dynamic_mu(self, image_seq_len: int) -> float: ...
+    def calculate_dynamic_mu(self, image_seq_len: int) -> float:
+        """Return the timestep shift derived from the image token count."""
 
     def apply_time_schedule(
         self, t: torch.Tensor, image_seq_len: int, timestep_shift: float
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Transform timesteps using the configured noise schedule."""
 
     def build_t2i_query(
         self,
         prompt_text: str,
         system_message: str | None = None,
         append_text: str | None = None,
-    ) -> str: ...
+    ) -> str:
+        """Format a prompt for text-to-image generation."""
 
     def build_t2i_text_inputs(
         self, tokenizer: PreTrainedTokenizerBase, query: str | list[str]
     ) -> tuple[
         torch.Tensor, torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor
-    ]: ...
+    ]:
+        """Build token IDs, positions, attention masks, and valid prefix lengths."""
 
     def build_t2i_image_indexes(
         self,
@@ -138,14 +149,16 @@ class GenerationState(Protocol):
         token_w: int,
         text_len: int | torch.Tensor,
         device: torch.device | None,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Build temporal and spatial positions for image tokens."""
 
     def t2i_prefix_forward(
         self,
         input_ids: torch.Tensor,
         indexes: torch.Tensor,
         attention_mask: dict[str, torch.Tensor],
-    ) -> tuple[DynamicCache, torch.Tensor]: ...
+    ) -> tuple[DynamicCache, torch.Tensor]:
+        """Return the text prefix cache and hidden states."""
 
     def it2i_prefix_forward(
         self,
@@ -153,15 +166,18 @@ class GenerationState(Protocol):
         indexes: torch.Tensor,
         attention_mask: dict[str, torch.Tensor],
         gen_indicators: torch.Tensor | None = None,
-    ) -> tuple[DynamicCache, torch.Tensor]: ...
+    ) -> tuple[DynamicCache, torch.Tensor]:
+        """Return the image-edit prefix cache and hidden states."""
 
     def think_prefix_forward(
         self, **kwargs: Unpack[ThinkPrefixInputs]
-    ) -> CausalLMOutputWithPast: ...
+    ) -> CausalLMOutputWithPast:
+        """Return the thinking prefix cache and next-token logits."""
 
     def append_text_tokens_to_cache(
         self, cache: DynamicCache, t_idx: int, input_ids: torch.Tensor
-    ) -> int: ...
+    ) -> int:
+        """Extend the prefix cache and return the final temporal position."""
 
     def request_srt_think_tokens(
         self,
@@ -172,14 +188,16 @@ class GenerationState(Protocol):
         max_think_tokens: int,
     ) -> tuple[
         list[list[int]], list[str], ThinkingSession | list[ThinkingSession] | None
-    ]: ...
+    ]:
+        """Return generated thinking tokens, decoded text, and transfer sessions."""
 
     def import_srt_prefix_tokens(
         self,
         thinking_backend: ThinkingBackend,
         token_ids: list[int],
         session_context: ThinkingSession | None = None,
-    ) -> tuple[DynamicCache, PrefixTimings]: ...
+    ) -> tuple[DynamicCache, PrefixTimings]:
+        """Import a transferred prefix cache and return its timings."""
 
     def try_import_srt_text_prefix(
         self,
@@ -187,7 +205,8 @@ class GenerationState(Protocol):
         input_ids: torch.Tensor,
         prefix_length: int | torch.Tensor,
         name: str,
-    ) -> tuple[DynamicCache | None, PrefixTimings]: ...
+    ) -> tuple[DynamicCache | None, PrefixTimings]:
+        """Return an available transferred prefix cache and its timings."""
 
     def try_import_srt_text_prefix_batch(
         self,
@@ -195,7 +214,8 @@ class GenerationState(Protocol):
         input_ids: torch.Tensor,
         prefix_lengths: torch.Tensor,
         name: str,
-    ) -> tuple[DynamicCache | None, list[PrefixTimings]]: ...
+    ) -> tuple[DynamicCache | None, list[PrefixTimings]]:
+        """Return a merged batch of transferred prefix caches and their timings."""
 
     def replay_srt_think_prefix(
         self,
@@ -209,7 +229,8 @@ class GenerationState(Protocol):
         require_transfer: bool = False,
     ) -> tuple[
         DynamicCache, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor
-    ]: ...
+    ]:
+        """Return cached thinking prefixes and prepared image generation inputs."""
 
     def generate_think(
         self,
@@ -219,7 +240,8 @@ class GenerationState(Protocol):
         t_idx: int,
         IMG_START_TOKEN: str,
         max_think_tokens: int = 1024,
-    ) -> tuple[DynamicCache, int, str]: ...
+    ) -> tuple[DynamicCache, int, str]:
+        """Extend the prefix cache with generated thinking text."""
 
     def t2i_predict_v(
         self,
@@ -232,7 +254,8 @@ class GenerationState(Protocol):
         image_token_num: int,
         timestep_embeddings: torch.Tensor | None = None,
         image_size: tuple[int, int] | None = None,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Predict the image latent velocity for a denoising step."""
 
     def build_it2i_inputs(
         self,
@@ -240,7 +263,8 @@ class GenerationState(Protocol):
         query: str,
         pixel_values: torch.Tensor | None = None,
         grid_hw: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]: ...
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Build image-edit embeddings, positions, and attention masks."""
 
     def generate(
         self,
@@ -252,12 +276,16 @@ class GenerationState(Protocol):
         generation_config: GenerationConfig | None = None,
         output_hidden_states: bool | None = None,
         **generate_kwargs: GenerationValue,
-    ) -> torch.LongTensor: ...
+    ) -> torch.LongTensor:
+        """Generate token IDs conditioned on text and optional images."""
 
-    def get_output_embeddings(self) -> nn.Module: ...
+    def get_output_embeddings(self) -> nn.Module:
+        """Return the language model output embedding module."""
 
-    def get_input_embeddings(self) -> nn.Module: ...
+    def get_input_embeddings(self) -> nn.Module:
+        """Return the language model input embedding module."""
 
     def get_thw_indexes(
         self, input_ids: torch.Tensor, grid_hw: torch.Tensor | None = None
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Return temporal and spatial positions for text and image tokens."""

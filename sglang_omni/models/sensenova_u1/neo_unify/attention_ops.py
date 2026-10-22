@@ -42,7 +42,8 @@ class AttentionForward(Protocol):
         dropout: float = 0.0,
         sliding_window: int | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return attention outputs and optional attention weights."""
 
 
 def eager_attention_forward(

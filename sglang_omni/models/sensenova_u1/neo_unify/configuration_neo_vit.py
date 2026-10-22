@@ -17,13 +17,15 @@ logger = logging.getLogger(__name__)
 @overload
 def as_singleton_tuple(
     value: int | Sequence[int],
-) -> tuple[int, ...]: ...
+) -> tuple[int, ...]:
+    pass
 
 
 @overload
 def as_singleton_tuple(
     value: float | Sequence[float],
-) -> tuple[float, ...]: ...
+) -> tuple[float, ...]:
+    pass
 
 
 def as_singleton_tuple(
