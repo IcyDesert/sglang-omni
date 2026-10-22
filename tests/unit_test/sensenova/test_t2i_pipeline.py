@@ -117,9 +117,7 @@ def test_t2i_api_returns_all_outputs_in_one_request():
     )
     response = client.post("/v1/images/generations", json={"prompt": "a cat", "n": 3})
     assert response.status_code == 200
-    assert (
-        response.json()["data"] == [{"b64_json": encoded, "output_format": "png"}] * 3
-    )
+    assert response.json()["data"] == [{"b64_json": encoded}] * 3
     assert backend.calls == 1
     assert (
         client.post(
@@ -311,7 +309,6 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
         prompt: str,
         references: list[Image.Image],
         *,
-        usage: dict[str, int],
         batch_size: int,
         seed: int,
         image_size: tuple[int, int],
@@ -325,7 +322,6 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
         t_eps: float,
         think_mode: bool,
     ) -> torch.Tensor:
-        usage["image_tokens"] = 276
         return torch.zeros((1, 3, 32, 64))
 
     model.it2i_generate.side_effect = edit_image

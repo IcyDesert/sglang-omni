@@ -279,6 +279,31 @@ def test_shared_rmsnorm_uses_framework_dispatch():
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_shared_rmsnorm_cuda_cpu_input_uses_native(
+    dtype: torch.dtype, with_residual: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CPU normalization on CUDA hosts must not launch asynchronous CUDA writes."""
+    norm = make_qwen3_rms_norm(32, eps=1e-6).to(dtype)
+    hidden_states = torch.randn(2, 3, 32, dtype=dtype)
+    residual = torch.randn_like(hidden_states) if with_residual else None
+    expected = norm.forward_native(hidden_states, residual)
+
+    def reject_cuda_inputs(
+        self: RMSNorm,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        post_residual_addition: torch.Tensor | None = None,
+        quant_linear: torch.nn.Module | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        raise AssertionError("CUDA RMSNorm must not receive CPU inputs")
+
+    monkeypatch.setattr(RMSNorm, "forward_cuda", reject_cuda_inputs)
+    actual = norm.forward_cuda(hidden_states, residual)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_shared_rmsnorm_aiter_cpu_input_uses_native(monkeypatch):
     norm = make_qwen3_rms_norm(64, eps=1e-6)
     hidden_states = torch.randn(2, 3, 64)
