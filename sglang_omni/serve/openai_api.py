@@ -430,6 +430,7 @@ def register_images(
         ImageGenerationsRequest,
         ImageResponse,
         ImageResponseData,
+        ImageUsage,
     )
 
     def build_image_request(
@@ -540,6 +541,10 @@ def register_images(
                 **options,
             }
         )
+        if source is not None and params.mode == "thinking":
+            raise ValueError("Thinking mode only supports text-to-image generation")
+        else:
+            pass
         return GenerateRequest(
             model=request.model,
             messages=[Message(role="user", content=request.prompt)],
@@ -586,7 +591,17 @@ def register_images(
             image = ImageResponseData(b64_json=result.image)
         else:
             image = ImageResponseData(url=f"data:image/png;base64,{result.image}")
-        return ImageResponse(id=request_id, data=[image])
+        if result.usage is None:
+            usage = None
+        else:
+            # Thinking mode counts both passes as completion tokens.
+            usage = ImageUsage(
+                prompt_tokens=result.usage.prompt_tokens,
+                completion_tokens=result.usage.completion_tokens,
+                total_tokens=result.usage.total_tokens,
+                reasoning_tokens=None,
+            )
+        return ImageResponse(id=request_id, data=[image], usage=usage)
 
     async def generations(
         request: ImageGenerationsRequest, http_request: Request
