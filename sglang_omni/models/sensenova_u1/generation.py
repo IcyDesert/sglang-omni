@@ -78,7 +78,7 @@ def generate_images(
             pass
         options = text_to_image_options(payload)
         if options.n > 1:
-            results[index] = generate_text_to_image(payload, model, tokenizer)
+            results[index] = generate_image(payload, model, tokenizer)
             continue
         else:
             pass
@@ -273,7 +273,7 @@ def generate_image_edit(
         pass
     options = SenseNovaU1ImageEditSampling.from_params(payload.request.params)
     references = prepare_reference_images(inputs.get("image_b64"), options)
-    width, height = resolve_edit_output_size(references, options)
+    width, height = resolve_edit_output_size(references[0].size, options)
     validate_output_dimensions(payload.request, width, height)
     prepare_cache_dit(
         model,
@@ -304,10 +304,26 @@ def generate_image_edit(
                 think_mode=False,
             )
     except torch.OutOfMemoryError as error:
-        torch.cuda.empty_cache()
+        device = model.device
+        if device.type not in ("cuda", "npu"):
+            raise
+        else:
+            torch.get_device_module(device).empty_cache()
+        memory_advice = "reduce references or output size"
+        if options.do_resize:
+            memory_advice += ", or lower input_max_pixels"
+        else:
+            pass
+        if device.type == "cuda":
+            memory_advice += (
+                ", or lower generate.factory.dit_layerwise_resident_layers "
+                "with layerwise offload enabled"
+            )
+        else:
+            pass
         raise ValueError(
-            f"{REFERENCE_MEMORY_ERROR_PREFIX}{len(references)} reference images exceeds GPU memory; "
-            "reduce references or lower generate.factory.dit_layerwise_resident_layers"
+            f"{REFERENCE_MEMORY_ERROR_PREFIX}{len(references)} reference images exceeds "
+            f"{device.type.upper()} memory; {memory_advice}"
         ) from error
     else:
         pass

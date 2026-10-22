@@ -19,6 +19,7 @@ from sglang_omni.models.sensenova_u1.admission import REFERENCE_MEMORY_ERROR_PRE
 from sglang_omni.models.sensenova_u1.sampling import (
     SenseNovaU1ImageEditSampling,
     SenseNovaU1Sampling,
+    validate_seed_range,
 )
 from sglang_omni.serve.openai_api import (
     image_result_with_disconnect_watch,
@@ -76,7 +77,7 @@ def umm_images(chunk: GenerateChunk) -> list[str]:
 
 
 def image_error_status_code(exc: BaseException) -> int:
-    """Report references that exceed GPU memory as a client error."""
+    """Report references that exceed accelerator memory as a client error."""
     if REFERENCE_MEMORY_ERROR_PREFIX in str(exc):
         return 400
     else:
@@ -163,6 +164,8 @@ def register_image_edits(app: FastAPI) -> None:
         num_inference_steps: int | None = Form(default=None),
         guidance_scale: float | None = Form(default=None),
         img_cfg_scale: float | None = Form(default=None),
+        input_max_pixels: int | None = Form(default=None),
+        do_resize: str | None = Form(default=None),
         enable_cache_dit: str | None = Form(default=None),
         cache_dit_params: str | None = Form(default=None),
     ) -> ImageGenerationResponse:
@@ -199,16 +202,22 @@ def register_image_edits(app: FastAPI) -> None:
             else:
                 pass
             params = {"n": 1, "size_explicit": size is not None}
-            if enable_cache_dit:
-                normalized_cache_dit = enable_cache_dit.strip().lower()
-                if normalized_cache_dit in ("true", "1", "yes", "on"):
-                    params["enable_cache_dit"] = True
-                elif normalized_cache_dit in ("false", "0", "no", "off"):
-                    params["enable_cache_dit"] = False
+            submitted_form = await request.form()
+            for name, boolean_text in (
+                ("enable_cache_dit", enable_cache_dit),
+                ("do_resize", do_resize),
+            ):
+                if boolean_text is None and name not in submitted_form:
+                    continue
                 else:
-                    raise ValueError("enable_cache_dit must be a boolean")
-            else:
-                pass
+                    pass
+                normalized_boolean_text = (boolean_text or "").strip().lower()
+                if normalized_boolean_text in ("true", "1", "yes", "on"):
+                    params[name] = True
+                elif normalized_boolean_text in ("false", "0", "no", "off"):
+                    params[name] = False
+                else:
+                    raise ValueError(f"{name} must be a boolean")
             if cache_dit_params is not None:
                 parsed_cache_params = json.loads(cache_dit_params)
                 if not isinstance(parsed_cache_params, dict):
@@ -228,12 +237,14 @@ def register_image_edits(app: FastAPI) -> None:
                 ("guidance_scale", guidance_scale),
                 ("img_cfg_scale", img_cfg_scale),
                 ("seed", seed),
+                ("input_max_pixels", input_max_pixels),
             ):
                 if value is not None:
                     params[name] = value
                 else:
                     pass
             edit_sampling = SenseNovaU1ImageEditSampling.from_params(params)
+            validate_seed_range(edit_sampling.seed, n)
             params.update(
                 width=edit_sampling.width,
                 height=edit_sampling.height,

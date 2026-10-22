@@ -57,6 +57,42 @@ class TestSenseNovaSampling(unittest.TestCase):
     def test_multiple_t2i_outputs(self):
         self.assertEqual(SenseNovaU1Sampling.from_params({"n": 4}).n, 4)
 
+    def test_seed_range_reserves_every_output(self) -> None:
+        """A seed accepted by sampling overflowed the RNG after TP dispatch."""
+        for parameters in (
+            {"seed": 2**64 - 1},
+            {"seed": 2**64 - 10, "n": 10},
+        ):
+            with self.subTest(parameters=parameters):
+                self.assertEqual(
+                    SenseNovaU1Sampling.from_params(parameters).seed, parameters["seed"]
+                )
+        for parameters in (
+            {"seed": 2**64},
+            {"seed": 2**64 - 1, "n": 2},
+            {"seed": 2**64 - 9, "n": 10},
+            {"seed": 2**64 - 1, "stage_params": {"generate": {"n": 2}}},
+            {"stage_params": {"generate": {"seed": 2**64}}},
+        ):
+            with (
+                self.subTest(parameters=parameters),
+                self.assertRaisesRegex(ValueError, "seed"),
+            ):
+                SenseNovaU1Sampling.from_params(parameters)
+        for parameters in (
+            {"seed": 2**64},
+            {"stage_params": {"generate": {"seed": 2**64}}},
+        ):
+            with (
+                self.subTest(parameters=parameters),
+                self.assertRaisesRegex(ValueError, "seed"),
+            ):
+                SenseNovaU1ImageEditSampling.from_params(parameters)
+        self.assertEqual(
+            SenseNovaU1ImageEditSampling.from_params({"seed": 2**64 - 1}).seed,
+            2**64 - 1,
+        )
+
     def test_image_edit_rejects_invalid_options(self):
         for params in (
             {"img_cfg_scale": float("inf")},
@@ -69,6 +105,45 @@ class TestSenseNovaSampling(unittest.TestCase):
         ):
             with self.subTest(params=params), self.assertRaises(ValueError):
                 SenseNovaU1ImageEditSampling.from_params(params)
+
+    def test_stage_overrides_apply_to_both_sampling_paths(self) -> None:
+        """Stage options were honored by execution but ignored by other consumers."""
+        parameters = {
+            "num_inference_steps": 50,
+            "stage_params": {
+                "generate": {"num_inference_steps": 4, "width": 512},
+                "output": {"width": 1024},
+            },
+        }
+        for sampling_type in (SenseNovaU1Sampling, SenseNovaU1ImageEditSampling):
+            with self.subTest(sampling_type=sampling_type):
+                options = sampling_type.from_params(parameters)
+                self.assertEqual(options.num_inference_steps, 4)
+                self.assertEqual(options.width, 512)
+        self.assertEqual(parameters["num_inference_steps"], 50)
+
+    def test_invalid_stage_overrides_are_rejected(self) -> None:
+        """Malformed generate overrides must not silently execute default options."""
+        for parameters in (
+            {"stage_params": "invalid"},
+            {"stage_params": {"generate": "invalid"}},
+            {"stage_params": {"generate": []}},
+            {"stage_params": {"generate": False}},
+            {"stage_params": {"generate": {"num_inference_steps": -1}}},
+        ):
+            for sampling_type in (SenseNovaU1Sampling, SenseNovaU1ImageEditSampling):
+                with self.subTest(parameters=parameters, sampling_type=sampling_type):
+                    with self.assertRaises(ValueError):
+                        sampling_type.from_params(parameters)
+
+    def test_null_generate_overrides_preserve_top_level_options(self) -> None:
+        """A null stage entry must behave like an omitted entry, not fail validation."""
+        for sampling_type in (SenseNovaU1Sampling, SenseNovaU1ImageEditSampling):
+            with self.subTest(sampling_type=sampling_type):
+                options = sampling_type.from_params(
+                    {"width": 512, "stage_params": {"generate": None}}
+                )
+                self.assertEqual(options.width, 512)
 
 
 if __name__ == "__main__":

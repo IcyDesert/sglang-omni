@@ -83,21 +83,21 @@ def decode_reference_images(value: str | list[str] | None) -> list[Image.Image]:
     else:
         pass
     images: list[Image.Image] = []
-    for encoded_image in values:
-        try:
+    try:
+        for encoded_image in values:
             image_bytes = base64.b64decode(encoded_image, validate=True)
             image = Image.open(io.BytesIO(image_bytes))
+            images.append(image)
             image.load()
-        except (
-            binascii.Error,
-            OSError,
-            ValueError,
-            Image.DecompressionBombError,
-        ) as exc:
-            raise ValueError(
-                "SenseNova-U1 received an invalid reference image"
-            ) from exc
-        images.append(image)
+    except (
+        binascii.Error,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+    ) as exc:
+        for image in images:
+            image.close()
+        raise ValueError("SenseNova-U1 received an invalid reference image") from exc
     return images
 
 
@@ -125,7 +125,7 @@ def prepare_reference_images(
 
 
 def resolve_edit_output_size(
-    references: list[Image.Image], options: SenseNovaU1ImageEditSampling
+    reference_size: tuple[int, int], options: SenseNovaU1ImageEditSampling
 ) -> tuple[int, int]:
     if options.size_explicit:
         return options.width, options.height
@@ -133,13 +133,28 @@ def resolve_edit_output_size(
         pass
     target_pixels = options.width * options.height
     height, width = smart_resize(
-        height=references[0].height,
-        width=references[0].width,
+        height=reference_size[1],
+        width=reference_size[0],
         factor=IMAGE_RESIZE_FACTOR,
         min_pixels=target_pixels,
         max_pixels=target_pixels,
     )
     return width, height
+
+
+def resolve_reference_output_size(
+    encoded_references: str | list[str] | None, options: SenseNovaU1ImageEditSampling
+) -> tuple[int, int]:
+    """Validate reference pixels and resolve dimensions without resizing images."""
+    references = decode_reference_images(encoded_references)
+    try:
+        reference_size_pixels = reference_image_size(
+            references[0].width, references[0].height, len(references), options
+        )
+        return resolve_edit_output_size(reference_size_pixels, options)
+    finally:
+        for image in references:
+            image.close()
 
 
 def encode_image(

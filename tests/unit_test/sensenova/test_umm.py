@@ -32,6 +32,7 @@ from sglang_omni.pipeline.umm import (
     create_umm_controller,
 )
 from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.serve.openai_errors import generation_error_status_code
 
 pytest_plugins = ["tests.unit_test.fixtures.sensenova_umm"]
 
@@ -106,6 +107,142 @@ def test_invalid_request_never_dispatches(
         )
     assert not controller.contexts
     assert not controller.adapter.executions
+
+
+@pytest.mark.parametrize("is_image_edit", [False, True])
+def test_seed_overflow_never_dispatches(
+    controller: UMMController, encoded_image: str, is_image_edit: bool
+) -> None:
+    """An out-of-range seed reached TP compute and stopped the generation stage."""
+    inputs = (
+        {"task": "image_edit", "prompt": "edit", "image_b64": encoded_image}
+        if is_image_edit
+        else "prompt"
+    )
+    with pytest.raises(UMMRequestError, match="seed"):
+        controller.transition(
+            StagePayload("request", OmniRequest(inputs, {"seed": 2**64}), None)
+        )
+    assert not controller.contexts
+    assert not controller.adapter.executions
+    assert controller.outbox.empty()
+
+
+@pytest.mark.parametrize(
+    "reference_count, placeholder_count",
+    [(1, 0), (1, 1), (1, 2), (2, 1), (2, 2), (2, 3)],
+)
+def test_image_placeholder_count_is_checked_at_admission(
+    controller: UMMController,
+    encoded_image: str,
+    reference_count: int,
+    placeholder_count: int,
+) -> None:
+    """More image placeholders than references triggered a model assertion after dispatch."""
+    request = OmniRequest(
+        {
+            "task": "image_edit",
+            "prompt": "<image>" * placeholder_count + " edit",
+            "image_b64": (
+                encoded_image
+                if reference_count == 1
+                else [encoded_image] * reference_count
+            ),
+        }
+    )
+    if placeholder_count > reference_count:
+        with pytest.raises(UMMRequestError, match="placeholders"):
+            controller.transition(StagePayload("request", request, None))
+        assert controller.outbox.empty()
+    else:
+        phase = controller.transition(StagePayload("request", request, None))
+        assert phase is not None
+        phase.data = {"modality": "image", "image_b64": encoded_image}
+        assert controller.transition(phase) is not None
+    assert not controller.contexts
+    assert not controller.adapter.executions
+
+
+@pytest.mark.parametrize("reference_count", [1, 2])
+@pytest.mark.parametrize("prompt", ["edit <IMG_CONTEXT>", "<image> edit <IMG_CONTEXT>"])
+def test_image_context_token_is_rejected_before_dispatch_and_recovers(
+    controller: UMMController,
+    encoded_image: str,
+    reference_count: int,
+    prompt: str,
+) -> None:
+    """A literal image context token reached TP compute and broke grid assignment."""
+    references = [encoded_image] * reference_count
+    request = OmniRequest(
+        {"task": "image_edit", "prompt": prompt, "image_b64": references},
+        {"width": 256, "height": 256},
+    )
+    with pytest.raises(UMMRequestError, match="<IMG_CONTEXT>") as raised:
+        controller.transition(StagePayload("request", request, None))
+    assert generation_error_status_code(raised.value) == 400
+    assert not controller.contexts
+    assert not controller.adapter.executions
+    assert controller.outbox.empty()
+
+    valid_request = replace(
+        request,
+        inputs={
+            "task": "image_edit",
+            "prompt": prompt.replace("<IMG_CONTEXT>", "the color"),
+            "image_b64": references,
+        },
+    )
+    phase = controller.transition(StagePayload("request", valid_request, None))
+    assert phase is not None
+    phase.data = {"modality": "image", "image_b64": encoded_image}
+    assert controller.transition(phase) is not None
+    assert not controller.contexts
+    assert not controller.adapter.executions
+
+
+@pytest.mark.parametrize(
+    "prompt, is_image_edit",
+    [
+        ("edit <img>", True),
+        ("edit </img>", True),
+        ("edit <image>", True),
+        ("edit the color", True),
+        ("draw <IMG_CONTEXT>", False),
+    ],
+)
+def test_image_context_rejection_preserves_other_prompt_inputs(
+    controller: UMMController,
+    encoded_image: str,
+    prompt: str,
+    is_image_edit: bool,
+) -> None:
+    """The I2I context-token guard must not ban other markers or T2I text."""
+    inputs = (
+        {"task": "image_edit", "prompt": prompt, "image_b64": encoded_image}
+        if is_image_edit
+        else prompt
+    )
+    phase = controller.transition(
+        StagePayload(
+            "request", OmniRequest(inputs, {"width": 256, "height": 256}), None
+        )
+    )
+    assert phase is not None
+    phase.data = {"modality": "image", "image_b64": encoded_image}
+    assert controller.transition(phase) is not None
+    assert not controller.contexts
+    assert not controller.adapter.executions
+
+
+def test_umm_config_retains_tp_constraints() -> None:
+    configuration = SenseNovaU1PipelineConfig(model_path="unused")
+    assert configuration.resolved_entry_stage == "orchestrator"
+    assert configuration.stage_named("generate").next == "orchestrator"
+    assert configuration.stage_named("output").terminal
+    configuration.stage_named("generate").tp_size = 3
+    configuration.stage_named("generate").gpu = [0, 1, 2]
+    with pytest.raises(ValueError, match="tp_size"):
+        SenseNovaU1PipelineConfig.model_validate(configuration.model_dump())
 
 
 @pytest.mark.parametrize(
@@ -356,4 +493,63 @@ def test_decoder_pixel_limit_is_a_request_error(
     with pytest.raises(UMMRequestError, match="pixel limit"):
         controller.transition(StagePayload("request", request, None))
     assert not controller.contexts
+    assert controller.outbox.empty()
+
+
+@pytest.mark.parametrize(
+    "overrides, error_message",
+    [
+        ({"num_inference_steps": 101}, "max_steps"),
+        ({"width": 8192, "height": 8192}, "max_output_pixels"),
+    ],
+)
+def test_stage_overrides_cannot_bypass_admission(
+    controller: UMMController,
+    overrides: dict[str, JsonValue],
+    error_message: str,
+) -> None:
+    """Stage overrides bypassed the limits applied to top-level options."""
+    request = OmniRequest("prompt", {"stage_params": {"generate": overrides}})
+    with pytest.raises(UMMRequestError, match=error_message):
+        controller.transition(StagePayload("request", request, None))
+    assert not controller.adapter.executions
+    assert controller.outbox.empty()
+
+
+def test_stage_multi_output_count_matches_admitted_outputs(
+    controller: UMMController, encoded_images: list[str]
+) -> None:
+    """An overridden output count was rejected after successful generation."""
+    request = OmniRequest("prompt", {"stage_params": {"generate": {"n": 2}}})
+    phase = controller.transition(StagePayload("request", request, None))
+    assert phase is not None
+    phase.data = {"modality": "image", "images_b64": encoded_images[:2]}
+    result = controller.transition(phase)
+    assert result is not None
+    assert len(result.data["segments"]) == 2
+    assert not controller.adapter.executions
+
+
+@pytest.mark.parametrize("limit", ["pixels", "retained_bytes"])
+def test_edit_resolved_dimensions_are_bounded_before_dispatch(
+    controller: UMMController,
+    encoded_image: str,
+    limit: Literal["pixels", "retained_bytes"],
+) -> None:
+    """Aspect-ratio rounding exceeded the reserved pixel or byte budget."""
+    if limit == "pixels":
+        controller.adapter.limits = controller.adapter.limits.model_copy(
+            update={"max_output_pixels": 96 * 64}
+        )
+        error_message = "max_output_pixels"
+    else:
+        controller.limits = replace(controller.limits, max_retained_bytes=126000)
+        error_message = "max_retained_bytes"
+    request = OmniRequest(
+        {"task": "image_edit", "prompt": "edit", "image_b64": encoded_image},
+        {"width": 96, "height": 64, "do_resize": False},
+    )
+    with pytest.raises(UMMRequestError, match=error_message):
+        controller.transition(StagePayload("request", request, None))
+    assert not controller.adapter.executions
     assert controller.outbox.empty()

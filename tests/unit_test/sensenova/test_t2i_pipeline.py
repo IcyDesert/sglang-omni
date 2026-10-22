@@ -4,7 +4,9 @@ import base64
 import io
 import json
 from collections.abc import AsyncIterator
-from unittest.mock import Mock, create_autospec
+from types import SimpleNamespace
+from typing import Literal
+from unittest.mock import AsyncMock, Mock, create_autospec, patch
 
 import pytest
 import torch
@@ -12,6 +14,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from transformers import PreTrainedTokenizerBase
 
+import sglang_omni.models.sensenova_u1.generation as generation_module
 from sglang_omni.client.image_media import InlineImage
 from sglang_omni.client.types import (
     GenerateChunk,
@@ -28,15 +31,36 @@ from sglang_omni.models.sensenova_u1.generation import (
     generate_images,
     text_to_image_options,
 )
+from sglang_omni.models.sensenova_u1.image_processing import (
+    decode_reference_images,
+    prepare_reference_images,
+    resolve_edit_output_size,
+    resolve_reference_output_size,
+)
 from sglang_omni.models.sensenova_u1.images_api import register_images_api
+from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1ImageEditSampling
 from sglang_omni.models.sensenova_u1.stages import (
     image_generation_batch_key,
     image_generation_request_cost,
+    validate_generation_request,
+)
+from sglang_omni.models.sensenova_u1.tensor_parallel import (
+    SenseNovaTensorParallelScheduler,
+)
+from sglang_omni.models.sensenova_u1.tensor_parallel_scheduler import (
+    TensorParallelScheduler,
 )
 from sglang_omni.pipeline.replicas import expand_replica_stages
+from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.serve.openai_api import create_app, image_result_with_disconnect_watch
 from sglang_omni.utils.imports import import_string
+from tests.unit_test.fixtures.pipeline_fakes import (
+    FakeRelay,
+    RecordingStageControlPlane,
+)
 
 
 def umm_image_chunk(request_id: str, encoded_images: list[str]) -> UMMGenerateChunk:
@@ -577,6 +601,11 @@ def test_image_edit_api_accepts_one_reference_image():
             "reduce references or lower generate.factory.dit_layerwise_resident_layers",
             400,
         ),
+        (
+            "SenseNova-U1 I2I with 3 reference images exceeds NPU memory; "
+            "reduce references or lower input_max_pixels",
+            400,
+        ),
         ("SenseNova-U1 generation crashed", 500),
     ],
 )
@@ -654,6 +683,495 @@ def test_image_edit_api_uses_sglang_defaults_when_omitted():
     )
 
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize("boolean_name", ["do_resize", "enable_cache_dit"])
+@pytest.mark.parametrize(
+    "pixel_budget, boolean_text, expected_boolean, expected_status",
+    [
+        (262144, "false", False, 200),
+        (262144, "true", True, 200),
+        (None, "false", False, 200),
+        (262143, "true", True, 400),
+        (262144, "invalid", False, 400),
+        (262144, "", False, 400),
+        (262144, " ", False, 400),
+    ],
+)
+def test_image_edit_api_forwards_boolean_controls(
+    boolean_name: Literal["do_resize", "enable_cache_dit"],
+    pixel_budget: int | None,
+    boolean_text: str,
+    expected_boolean: bool,
+    expected_status: int,
+) -> None:
+    """Explicit empty boolean fields must not silently use model defaults."""
+
+    class ResizeClient:
+        calls: int = 0
+
+        async def generate(
+            self, request: GenerateRequest, request_id: str
+        ) -> AsyncIterator[GenerateChunk]:
+            self.calls += 1
+            assert request.extra_params[boolean_name] is expected_boolean
+            assert request.extra_params.get("input_max_pixels") == pixel_budget
+            yield umm_image_chunk(request_id, [encoded])
+
+    reference = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(reference, format="PNG")
+    encoded = base64.b64encode(reference.getvalue()).decode("ascii")
+    backend = ResizeClient()
+    client = TestClient(
+        create_app(
+            backend, model_name="sensenova", image_api_registrar=register_images_api
+        )
+    )
+    parameters = {"prompt": "edit this", boolean_name: boolean_text}
+    if pixel_budget is not None:
+        parameters["input_max_pixels"] = str(pixel_budget)
+    else:
+        pass
+    response = client.post(
+        "/v1/images/edits",
+        files={"image": ("reference.png", reference.getvalue(), "image/png")},
+        data=parameters,
+    )
+    assert response.status_code == expected_status
+    assert backend.calls == (1 if expected_status == 200 else 0)
+
+
+@pytest.mark.parametrize("do_resize", [False, True])
+@pytest.mark.parametrize("device_type", ["cuda", "npu", "cpu"])
+def test_image_edit_oom_uses_model_device_backend(
+    device_type: Literal["cuda", "npu", "cpu"],
+    do_resize: bool,
+    tokenizer: PreTrainedTokenizerBase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NPU I2I failures used the CUDA allocator and GPU-only advice."""
+    backend = SimpleNamespace(empty_cache=Mock())
+    get_device_module = Mock(return_value=backend)
+    monkeypatch.setattr(torch, "get_device_module", get_device_module)
+    monkeypatch.setattr(
+        torch.cuda, "empty_cache", Mock(side_effect=AssertionError("wrong backend"))
+    )
+    reference = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(reference, format="PNG")
+    model = Mock()
+    model.device = SimpleNamespace(type=device_type)
+    model.it2i_generate.side_effect = torch.OutOfMemoryError("device exhausted")
+    payload = StagePayload(
+        "oom",
+        OmniRequest(
+            {
+                "task": "image_edit",
+                "prompt": "edit this",
+                "image_b64": base64.b64encode(reference.getvalue()).decode("ascii"),
+            },
+            {
+                "width": 32,
+                "height": 32,
+                "size_explicit": True,
+                "do_resize": do_resize,
+                "input_max_pixels": 512 * 512,
+            },
+        ),
+        None,
+    )
+    error_type = torch.OutOfMemoryError if device_type == "cpu" else ValueError
+    error_message = (
+        "device exhausted" if device_type == "cpu" else f"{device_type.upper()} memory"
+    )
+    with pytest.raises(error_type, match=error_message) as raised:
+        generate_image(payload, model, tokenizer)
+    if device_type == "cpu":
+        get_device_module.assert_not_called()
+        backend.empty_cache.assert_not_called()
+    else:
+        get_device_module.assert_called_once_with(model.device)
+        backend.empty_cache.assert_called_once_with()
+        assert "output size" in str(raised.value)
+        assert ("input_max_pixels" in str(raised.value)) is do_resize
+        assert ("dit_layerwise_resident_layers" in str(raised.value)) is (
+            device_type == "cuda"
+        )
+
+
+def test_multi_output_failure_cleans_cache_controller(
+    tokenizer: PreTrainedTokenizerBase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The n>1 branch bypassed cache cleanup after a failed generation."""
+    cleanup = Mock(wraps=generation_module.unmount_cache_dit_after_failure)
+    monkeypatch.setattr(generation_module, "unmount_cache_dit_after_failure", cleanup)
+    model = Mock()
+    model.t2i_generate.side_effect = RuntimeError("generation failed")
+    payload = StagePayload(
+        "multi", OmniRequest("a cat", {"n": 2, "width": 32, "height": 32}), None
+    )
+    with pytest.raises(RuntimeError, match="generation failed"):
+        generate_images([payload], model, tokenizer)
+    cleanup.assert_called_once_with(model)
+
+
+@pytest.mark.parametrize("size_explicit", [False, True])
+@pytest.mark.parametrize(
+    "guidance_scale, img_cfg_scale, branch_count",
+    [(1.0, 1.0, 1), (4.0, 4.0, 2), (0.5, 1.0, 2)],
+)
+def test_i2i_stage_overrides_match_cost_and_tp_validation(
+    tokenizer: PreTrainedTokenizerBase,
+    guidance_scale: float,
+    img_cfg_scale: float,
+    branch_count: int,
+    size_explicit: bool,
+) -> None:
+    """I2I cost and TP validation used options different from model execution."""
+    reference = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(reference, format="PNG")
+    payload = StagePayload(
+        "edit",
+        OmniRequest(
+            {
+                "task": "image_edit",
+                "prompt": "edit this",
+                "image_b64": base64.b64encode(reference.getvalue()).decode("ascii"),
+            },
+            {
+                "width": 64,
+                "height": 32,
+                "size_explicit": size_explicit,
+                "do_resize": False,
+                "stage_params": {
+                    "generate": {
+                        "width": 96,
+                        "height": 64,
+                        "num_inference_steps": 4,
+                        "guidance_scale": guidance_scale,
+                        "img_cfg_scale": img_cfg_scale,
+                    }
+                },
+            },
+        ),
+        None,
+    )
+    model = Mock()
+    model.sensenova_cache_dit.enabled_by_default = True
+    output_width_pixels, output_height_pixels = (96, 64) if size_explicit else (96, 96)
+    model.it2i_generate.return_value = torch.zeros(
+        (1, 3, output_height_pixels, output_width_pixels)
+    )
+    with patch.object(Image, "open", wraps=Image.open) as open_image:
+        assert image_generation_request_cost(payload) == 96 * 64 * 4 * branch_count
+    open_image.assert_not_called()
+    validate_generation_request(payload, model)
+    assert model.sensenova_cache_dit.validate_request.call_args.kwargs["steps"] == 4
+    result = generate_image(payload, model, tokenizer)
+    assert model.it2i_generate.call_args.kwargs["num_steps"] == 4
+    assert model.it2i_generate.call_args.kwargs["image_size"] == (
+        output_width_pixels,
+        output_height_pixels,
+    )
+    assert model.it2i_generate.call_args.kwargs["cfg_scale"] == guidance_scale
+    assert model.it2i_generate.call_args.kwargs["img_cfg_scale"] == img_cfg_scale
+    assert Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"]))).size == (
+        output_width_pixels,
+        output_height_pixels,
+    )
+
+
+@pytest.mark.parametrize("reference_count", [1, 3])
+@pytest.mark.parametrize("do_resize", [False, True])
+@pytest.mark.parametrize("reference_size_pixels", [(64, 32), (77, 39)])
+def test_i2i_validation_decodes_references_without_resizing(
+    reference_count: int,
+    do_resize: bool,
+    reference_size_pixels: tuple[int, int],
+) -> None:
+    """Validation must decode pixels but leave resizing to model preprocessing."""
+    image_buffer = io.BytesIO()
+    Image.new("RGB", reference_size_pixels).save(image_buffer, format="PNG")
+    references = [
+        base64.b64encode(image_buffer.getvalue()).decode("ascii")
+    ] * reference_count
+    parameters = {"width": 96, "height": 64, "do_resize": do_resize}
+    options = SenseNovaU1ImageEditSampling.from_params(parameters)
+    prepared_references = prepare_reference_images(references, options)
+    output_width_pixels, output_height_pixels = resolve_edit_output_size(
+        prepared_references[0].size, options
+    )
+    payload = StagePayload(
+        "edit",
+        OmniRequest(
+            {"task": "image_edit", "prompt": "edit", "image_b64": references},
+            parameters,
+        ),
+        None,
+    )
+    model = Mock()
+    model.sensenova_cache_dit.enabled_by_default = False
+    with (
+        patch.object(
+            Image.Image, "load", autospec=True, side_effect=Image.Image.load
+        ) as load,
+        patch.object(
+            Image.Image, "resize", autospec=True, side_effect=Image.Image.resize
+        ) as resize,
+    ):
+        assert resolve_reference_output_size(references, options) == (
+            output_width_pixels,
+            output_height_pixels,
+        )
+        validate_generation_request(payload, model)
+    load.assert_called()
+    resize.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_reference_index", [0, 1])
+@pytest.mark.parametrize("image_format", ["JPEG", "PNG"])
+@pytest.mark.parametrize(
+    "scheduler_class", [TensorParallelScheduler, SenseNovaTensorParallelScheduler]
+)
+async def test_truncated_image_is_rejected_before_tp_fanout(
+    tokenizer: PreTrainedTokenizerBase,
+    invalid_reference_index: int,
+    image_format: Literal["JPEG", "PNG"],
+    scheduler_class: type[TensorParallelScheduler],
+) -> None:
+    """A truncated reference killed TP execution instead of failing its request."""
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (64, 32), (80, 100, 130)).save(image_buffer, format=image_format)
+    image_bytes = image_buffer.getvalue()
+    truncated_image_bytes = (
+        image_bytes[:-2] if image_format == "JPEG" else image_bytes[:45]
+    )
+    with Image.open(io.BytesIO(truncated_image_bytes)) as image:
+        if image_format == "JPEG":
+            image.verify()
+        else:
+            pass
+    reference = base64.b64encode(image_bytes).decode("ascii")
+    references = [reference, reference]
+    references[invalid_reference_index] = base64.b64encode(
+        truncated_image_bytes
+    ).decode("ascii")
+    invalid = StagePayload(
+        "invalid",
+        OmniRequest(
+            {"task": "image_edit", "prompt": "edit", "image_b64": references},
+            {"width": 64, "height": 32, "size_explicit": True, "do_resize": False},
+        ),
+        None,
+    )
+    valid = StagePayload(
+        "valid",
+        OmniRequest(
+            {"task": "image_edit", "prompt": "edit", "image_b64": reference},
+            invalid.request.params,
+        ),
+        None,
+    )
+    model = Mock()
+    model.sensenova_cache_dit.enabled_by_default = False
+    model.it2i_generate.return_value = torch.zeros(1, 3, 32, 64)
+    scheduler = scheduler_class(
+        lambda payload: generate_image(payload, model, tokenizer),
+        validate_request=lambda payload: validate_generation_request(payload, model),
+    )
+    fanout = Mock()
+    leader = Stage(
+        name="generate",
+        role="leader",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={},
+        control_plane=RecordingStageControlPlane(),
+        relay=FakeRelay(),
+        scheduler=scheduler,
+        tp_fanout=fanout,
+    )
+    leader.send_failure = AsyncMock()
+
+    await leader.execute(invalid)
+    leader.send_failure.assert_awaited_once_with(
+        "invalid", "SenseNova-U1 received an invalid reference image"
+    )
+    fanout.fanout_work.assert_not_called()
+    assert scheduler.inbox.empty()
+    model.it2i_generate.assert_not_called()
+
+    await leader.execute(valid)
+    fanout.fanout_work.assert_called_once_with(valid)
+    scheduler.run_single(scheduler.inbox.get_nowait(), asyncio.get_running_loop())
+    result = scheduler.outbox.get_nowait()
+    assert result.type == "result"
+    assert result.request_id == "valid"
+    assert scheduler.compute_error is None
+    model.it2i_generate.assert_called_once()
+    with Image.open(
+        io.BytesIO(base64.b64decode(result.data.data["image_b64"]))
+    ) as image:
+        assert image.size == (64, 32)
+
+
+def test_invalid_edit_seed_is_rejected_before_tp_execution(
+    tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    """An invalid seed must fail validation before TP ranks execute model work."""
+    reference = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(reference, format="PNG")
+    payload = StagePayload(
+        "invalid",
+        OmniRequest(
+            {
+                "task": "image_edit",
+                "prompt": "edit",
+                "image_b64": base64.b64encode(reference.getvalue()).decode("ascii"),
+            },
+            {"seed": 2**64, "do_resize": False},
+        ),
+        None,
+    )
+    model = Mock()
+    model.sensenova_cache_dit.enabled_by_default = False
+    with pytest.raises(ValueError, match="seed"):
+        validate_generation_request(payload, model)
+    with pytest.raises(ValueError, match="seed"):
+        generate_image(payload, model, tokenizer)
+    model.it2i_generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "seed, image_count, expected_status",
+    [(2**64 - 1, 1, 200), (2**64 - 2, 2, 200), (2**64 - 1, 2, 400), (2**64, 1, 400)],
+)
+def test_image_edit_api_validates_all_output_seeds(
+    seed: int, image_count: int, expected_status: int
+) -> None:
+    """The edits loop accepted a base seed whose later outputs overflowed the RNG."""
+    reference = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(reference, format="PNG")
+    encoded = base64.b64encode(reference.getvalue()).decode("ascii")
+
+    class SeedClient:
+        def __init__(self) -> None:
+            self.seeds: list[int] = []
+
+        async def generate(
+            self, request: GenerateRequest, request_id: str
+        ) -> AsyncIterator[GenerateChunk]:
+            self.seeds.append(request.extra_params["seed"])
+            yield umm_image_chunk(request_id, [encoded])
+
+    backend = SeedClient()
+    client = TestClient(
+        create_app(
+            backend, model_name="sensenova", image_api_registrar=register_images_api
+        )
+    )
+    response = client.post(
+        "/v1/images/edits",
+        files={"image": ("reference.png", reference.getvalue(), "image/png")},
+        data={"prompt": "edit", "seed": str(seed), "n": str(image_count)},
+    )
+    assert response.status_code == expected_status
+    assert backend.seeds == (
+        [seed + index for index in range(image_count)] if expected_status == 200 else []
+    )
+
+
+@pytest.mark.parametrize("failure", [None, "later_reference", "aspect_ratio"])
+def test_reference_images_are_closed_after_validation(
+    failure: Literal["later_reference", "aspect_ratio"] | None,
+) -> None:
+    """Validation must close every decoded reference on success or failure."""
+    image_buffer = io.BytesIO()
+    reference_size_pixels = (32, 7000) if failure == "aspect_ratio" else (64, 32)
+    Image.new("RGB", reference_size_pixels).save(image_buffer, format="PNG")
+    encoded_reference = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+    references = [
+        encoded_reference,
+        "invalid" if failure == "later_reference" else encoded_reference,
+    ]
+    options = SenseNovaU1ImageEditSampling.from_params(
+        {"width": 96, "height": 64, "input_max_pixels": 262144}
+    )
+    with patch.object(
+        Image.Image, "close", autospec=True, side_effect=Image.Image.close
+    ) as close_image:
+        if failure is None:
+            assert resolve_reference_output_size(references, options) == (96, 32)
+        else:
+            error_message = (
+                "invalid reference image"
+                if failure == "later_reference"
+                else "aspect ratio"
+            )
+            with pytest.raises(ValueError, match=error_message):
+                resolve_reference_output_size(references, options)
+    assert close_image.call_count == (1 if failure == "later_reference" else 2)
+    assert all(call.args[0].fp is None for call in close_image.call_args_list)
+
+
+def test_reference_pixel_decode_failure_closes_open_images() -> None:
+    """A truncated reference must close both earlier images and its own header."""
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (64, 32)).save(image_buffer, format="PNG")
+    encoded_reference = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+    truncated_reference = base64.b64encode(image_buffer.getvalue()[:45]).decode("ascii")
+    with patch.object(
+        Image.Image, "close", autospec=True, side_effect=Image.Image.close
+    ) as close_image:
+        with pytest.raises(ValueError, match="invalid reference image"):
+            decode_reference_images([encoded_reference, truncated_reference])
+    assert close_image.call_count == 2
+    assert all(call.args[0].fp is None for call in close_image.call_args_list)
+
+
+@pytest.mark.parametrize("references", [None, [], "", "invalid", ["invalid"]])
+def test_reference_parsing_rejects_invalid_inputs(
+    references: str | list[str] | None,
+) -> None:
+    """Validation and generation must both reject malformed references."""
+    options = SenseNovaU1ImageEditSampling.from_params({})
+    with pytest.raises(ValueError):
+        decode_reference_images(references)
+    with pytest.raises(ValueError):
+        resolve_reference_output_size(references, options)
+
+
+def test_image_edits_stay_single_item_without_decoding_cost() -> None:
+    """I2I costs must not decode references that cannot affect batch admission."""
+    scheduler = SimpleScheduler(
+        Mock(),
+        batch_compute_fn=Mock(),
+        max_batch_size=2,
+        max_batch_cost=1,
+        batch_key_fn=image_generation_batch_key,
+        request_cost_fn=image_generation_request_cost,
+    )
+    messages = [
+        IncomingMessage(
+            request_id=request_id,
+            type="new_request",
+            data=StagePayload(
+                request_id,
+                OmniRequest(
+                    {"task": "image_edit", "prompt": "edit", "image_b64": "unused"},
+                    {"width": 96, "height": 64},
+                ),
+                None,
+            ),
+        )
+        for request_id in ("first", "second")
+    ]
+    scheduler.inbox.put(messages[1])
+    with patch.object(Image, "open", wraps=Image.open) as open_image:
+        assert scheduler.collect_batch(messages[0]) == [messages[0]]
+        assert scheduler.next_message() is messages[1]
+        assert scheduler.collect_batch(messages[1]) == [messages[1]]
+    open_image.assert_not_called()
 
 
 def test_image_edit_api_accepts_multiple_reference_images():

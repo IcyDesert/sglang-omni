@@ -128,8 +128,9 @@ The response follows the Images API shape:
 ```
 
 `size` dimensions must be positive multiples of 32. Text-to-image requests
-support `n` from 1 to 10 and return base64 PNG images. Image edits support one
-output image. Both routes require `think_mode=false`.
+support `n` from 1 to 10 and return base64 PNG images. Image edits also accept
+`n` from 1 to 10, executing each output separately with `seed + output_index`.
+Both routes require `think_mode=false`.
 
 ## Cache-DiT Acceleration
 
@@ -179,8 +180,24 @@ curl http://127.0.0.1:8000/v1/images/edits \
 ```
 
 When `size` is omitted, the output keeps the first reference image's aspect
-ratio within the default pixel budget. I2I requests stay single-item even when
+ratio using the default pixel budget. I2I requests stay single-item even when
 T2I dynamic batching is enabled.
+
+The edits endpoint accepts `input_max_pixels` to control reference-image
+resizing and `do_resize` as a `true` or `false` form field. For example,
+`-F 'input_max_pixels=262144' -F 'do_resize=true'` lowers the reference pixel
+budget to 512x512 pixels while retaining the aspect ratio. The minimum accepted
+budget is 262144. `do_resize=false` preserves the reference dimensions but does
+not disable admission limits or output-size selection. These options do not
+replace `size`, which controls the generated image dimensions when provided.
+
+I2I accelerator memory errors identify the CUDA or NPU backend and suggest
+reducing references or output size. Lowering `input_max_pixels` only helps
+when `do_resize=true`; CUDA requests can also lower
+`generate.factory.dit_layerwise_resident_layers` with layerwise offload enabled.
+A CPU memory error remains a server failure rather than being reported as a
+reference-image accelerator error. Empty or invalid boolean form values are
+rejected rather than treated as omitted fields.
 
 On Ascend, the condition, image-condition, and unconditional I2I branches each
 prepare their own prefix length. This enables the BNSD FIA cache when the
@@ -255,7 +272,15 @@ are fixed model constants (`DEFAULT_UMM_ADMISSION_LIMITS`), because the UMM
 controller factory does not accept per-model adapter options. Reference-image
 bounds cover both original and resized pixels, using the same size calculation
 as preprocessing. They respect default resize settings and `do_resize=False`.
+I2I output pixel limits and retained-byte reservations use the resolved output
+dimensions, including aspect-ratio rounding, before dispatching model work.
 These bounds do not represent total accelerator memory.
+
+For `/generate`, overrides in `stage_params.generate` are applied consistently
+to admission, request cost, batching, TP validation, and model execution.
+Overrides cannot bypass the model's step, image-count, or pixel limits.
+A null `stage_params.generate` entry behaves like an omitted entry; strings
+and lists are rejected.
 
 Cancellation is cooperative at model checkpoints. TP ranks decide together
 before leaving a sequence of collectives. One cancelled member of a fused batch
@@ -291,30 +316,3 @@ are checked before generation. The controller still requires
 `timeout_s` under `orchestrator.factory`. The retained-byte limit reserves a
 conservative inline PNG budget before generation, so a request can be rejected
 before its actual encoded image size is known.
-
-### Validation Status
-
-CPU tests exercise the real adapter and controller, output ordering,
-input/output budgets, deadlines, cleanup after late results, media integrity,
-and configuration construction. The CPU/Gloo regression covers T2I,
-multi-output, UMM routing/output, TP configuration and cancellation, Cache-DiT,
-and sampling.
-A full SGLang run on an RTX 4090 host (Python 3.12, torch 2.13.0, SGLang
-0.5.21) produced 225 passed, 1 failed, and 43 subtests passed. The one failure
-is the bfloat16 case of `test_native_tp`; it also reproduces at the pre-change
-commit `cd4b310fa`, so it is not introduced by the UMM migration. HTTP tests cover both Images endpoints and
-preservation of 400/503 rejection statuses. Their local CPU run loads the real
-SGLang utility module without the GPU-dependent package initializer; this does
-not validate a complete installed service.
-
-The Gloo suite covers TP collectives and asymmetric cancellation followed by a
-successful request on the same process group. It does not validate NCCL/HCCL
-cancellation during model inference.
-
-GPU/NPU launch, baseline image comparison, batching throughput, TP/DP inference,
-Cache-DiT, offload, and business acceptance remain unexecuted for this UMM path.
-The existing pipeline's hardware results do not establish these properties for
-the new default configuration. Compare against commit `706053fa0` before
-production use, using the conditions and coverage listed above. A runnable
-checklist is in the
-[Phase 3 validation checklist](../design/sensenova_phase3_checklist.md).
