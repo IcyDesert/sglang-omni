@@ -228,11 +228,10 @@ def create_generation_executor(
             f"SenseNova-U1 NPU operators: FIA={npu_fia_available()}, "
             f"SwiGLU={npu_swiglu_available()}"
         )
-        npu = torch.get_device_module(resolved_device.type)
         logger.info(
             "SenseNova-U1 NPU memory after load: "
-            f"allocated={npu.memory_allocated(resolved_device)}, "
-            f"reserved={npu.memory_reserved(resolved_device)}"
+            f"allocated={torch.npu.memory_allocated(resolved_device)}, "
+            f"reserved={torch.npu.memory_reserved(resolved_device)}"
         )
     else:
         pass
