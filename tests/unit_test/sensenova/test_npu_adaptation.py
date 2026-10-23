@@ -584,6 +584,17 @@ def test_generation_executor_uses_resolved_npu_device(monkeypatch):
     )
     monkeypatch.setattr(torch.ops, "npu", SimpleNamespace(), raising=False)
 
+    def memory_query(device):
+        calls.setdefault("memory_devices", []).append(device)
+        return 0
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(memory_allocated=memory_query, memory_reserved=memory_query),
+        raising=False,
+    )
+
     scheduler = stages.create_generation_executor(
         "/model/sensenova",
         cooperative_cancellation=False,
@@ -614,4 +625,5 @@ def test_generation_executor_uses_resolved_npu_device(monkeypatch):
         "model_kwargs": {"torch_dtype": torch.bfloat16},
         "eval": True,
         "device": resolved_device,
+        "memory_devices": [resolved_device, resolved_device],
     }

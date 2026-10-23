@@ -35,10 +35,12 @@ SENSENOVA_NPU_FUSED_ROPE_ENV = "SGLANG_SENSENOVA_NPU_FUSED_ROPE"
 SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL = {"1", "true", "on", "rotary_mul", "mul"}
 
 
-# note (Codex): Preserve the existing fused-kernel dispatch limits.
+# note (Wes): Inputs past these sizes take the eager RoPE path instead of npu_rotary_mul.
 NPU_ROTARY_MUL_BATCH_LIMIT = 1000
 NPU_ROTARY_MUL_HEAD_COUNT_LIMIT = 1000
 NPU_ROTARY_MUL_HEAD_DIMENSION_LIMIT = 896
+
+
 CUDA_FUSED_ROPE_MIN_SEQUENCE_LENGTH = 128
 
 

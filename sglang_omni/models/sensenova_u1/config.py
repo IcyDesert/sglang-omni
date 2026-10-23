@@ -18,18 +18,13 @@ from sglang_omni.pipeline.umm import (
     UMMPipelineConfig,
 )
 
-DEFAULT_GENERATION_DTYPE = "bfloat16"
-DEFAULT_LAYERWISE_OFFLOAD = False
-
 
 class SenseNovaGenerationFactoryArgs(FactoryArgs):
     cooperative_cancellation: bool = False
-    dtype: Annotated[str | None, FactoryDefault(value=DEFAULT_GENERATION_DTYPE)] = None
+    dtype: Annotated[str | None, FactoryDefault(value="bfloat16")] = None
     enable_cache_dit: bool | None = None
     cache_dit_params: dict[str, int | float] | None = None
-    dit_layerwise_offload: Annotated[
-        bool | None, FactoryDefault(value=DEFAULT_LAYERWISE_OFFLOAD)
-    ] = None
+    dit_layerwise_offload: Annotated[bool | None, FactoryDefault(value=False)] = None
     dit_offload_prefetch_size: Annotated[int | None, FactoryDefault(value=1)] = Field(
         default=None, ge=0, strict=True
     )
@@ -83,8 +78,6 @@ class SenseNovaU1PipelineConfig(UMMPipelineConfig):
             process="sensenova_generate",
             factory_path="sglang_omni.models.sensenova_u1.stages.create_generation_executor",
             factory=SenseNovaGenerationFactoryArgs(
-                dtype=DEFAULT_GENERATION_DTYPE,
-                dit_layerwise_offload=DEFAULT_LAYERWISE_OFFLOAD,
                 enable_cache_dit=False,
                 cooperative_cancellation=True,
             ),

@@ -101,8 +101,9 @@ class SenseNovaU1Sampling(BaseModel):
 
 
 class SenseNovaU1ImageEditSampling(SenseNovaU1Sampling):
-    """Image editing adds image guidance and reference resizing controls."""
+    """Image editing runs one output per request; the Images API sends one request per output."""
 
+    n: Annotated[int, Field(ge=1, le=1, strict=True)] = 1
     img_cfg_scale: GuidanceScale = 1.0
     input_max_pixels: (
         Annotated[int, Field(ge=MIN_INPUT_MAX_PIXELS, strict=True)] | None

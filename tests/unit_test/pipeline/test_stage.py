@@ -141,6 +141,33 @@ def test_tp_validation_runs_off_the_event_loop():
     assert scheduler.inbox.get_nowait().request_id == "req-1"
 
 
+def test_abort_during_tp_validation_skips_dispatch():
+    """An abort that landed during off-loop validation still sent the work to every rank."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def validate(payload):
+        entered.set()
+        assert release.wait(2)
+
+    scheduler = TensorParallelScheduler(
+        lambda payload: payload, shutdown_join_timeout_s=5.0, validate_request=validate
+    )
+    fanout = Mock()
+    leader = make_stage(role="leader", scheduler=scheduler, tp_fanout=fanout)
+
+    async def dispatch():
+        execution = asyncio.create_task(leader.execute(make_stage_payload()))
+        assert await asyncio.to_thread(entered.wait, 2)
+        leader.on_abort("req-1")
+        release.set()
+        await execution
+
+    asyncio.run(dispatch())
+    fanout.fanout_work.assert_not_called()
+    assert scheduler.inbox.empty()
+
+
 @pytest.fixture(autouse=True)
 def cuda_ipc_capable_platform(monkeypatch):
     """These stage tests assert the cuda_ipc transport contract on any host, so pin

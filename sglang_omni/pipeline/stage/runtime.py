@@ -1201,6 +1201,11 @@ class Stage:
             except ValueError as exc:
                 await self.send_failure(request_id, str(exc))
                 return
+            # note (Wes): An abort can land while validation runs, before any rank has the work.
+            if request_id in self.aborted:
+                return
+            else:
+                pass
         else:
             pass
         session_operation = find_session_operation(payload.request.metadata)

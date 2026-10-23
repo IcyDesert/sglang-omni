@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+from types import SimpleNamespace
+
 import pytest
 import torch
+from torch import nn
 
+from sglang_omni.models.sensenova_u1.neo_unify import image_denoise
 from sglang_omni.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOLLMConfig,
 )
@@ -10,6 +14,7 @@ from sglang_omni.models.sensenova_u1.neo_unify.qwen_attention import Qwen3Attent
 from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
     Qwen3RotaryEmbedding,
 )
+from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1Sampling
 
 
 def tiny_dense_config(num_hidden_layers=2):
@@ -147,3 +152,55 @@ def test_image_only_matches_all_true_indicators():
         actual = model(image_only=True, **common).last_hidden_state
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_denoising_embeds_each_timestep_once_per_step(monkeypatch):
+    """CUDA denoising ran the timestep embedder on every image token at every step."""
+    embedded_timestep_counts: list[int] = []
+
+    class RecordingTimestepEmbedder(nn.Module):
+        def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+            embedded_timestep_counts.append(timesteps.numel())
+            return timesteps[:, None].expand(-1, 8).float()
+
+    model = SimpleNamespace(
+        downsample_ratio=0.5,
+        patch_size=2,
+        noise_scale=1.0,
+        noise_scale_mode="constant",
+        noise_scale_base_image_seq_len=1,
+        noise_scale_max_value=1.0,
+        add_noise_scale_embedding=False,
+        fm_modules={"timestep_embedder": RecordingTimestepEmbedder()},
+        extract_feature=lambda pixel_values, gen_model, grid_hw: torch.zeros(
+            pixel_values.shape[0], 2
+        ),
+    )
+    prefix = image_denoise.ImagePrefix(
+        cache=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    keys=torch.zeros(1, 1, 3, 4), values=torch.zeros(1, 1, 3, 4)
+                )
+            ]
+        ),
+        image_indexes=torch.zeros(3, 64, dtype=torch.long),
+        token_lengths=torch.tensor([3]),
+    )
+    monkeypatch.setattr(
+        image_denoise,
+        "t2i_predict_v",
+        lambda model, embeddings, indexes, mask, cache, timestep, latents, **kwargs: (
+            torch.zeros_like(latents)
+        ),
+    )
+    sampling = SenseNovaU1Sampling.from_params(
+        {"width": 32, "height": 32, "num_inference_steps": 3, "guidance_scale": 1.0}
+    )
+
+    images = image_denoise.denoise_images(
+        model, sampling=sampling, prefixes=[prefix], seeds=[7, 8]
+    )
+
+    assert images.shape == (2, 3, 32, 32)
+    assert embedded_timestep_counts == [3]

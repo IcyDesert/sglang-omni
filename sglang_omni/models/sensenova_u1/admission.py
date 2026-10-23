@@ -23,8 +23,6 @@ ADMISSION_METADATA_KEY = "sensenova_admission_limits"
 PNG_BYTES_PER_PIXEL_BOUND = 4
 PNG_CONTAINER_BYTES_BOUND = 65536
 IMAGE_SEGMENT_METADATA_BYTES_BOUND = 1024
-# Starts the I2I error for references that exceed accelerator memory, which the Images API reports as a client error.
-REFERENCE_MEMORY_ERROR_PREFIX = "SenseNova-U1 I2I with "
 
 
 class SenseNovaAdmissionLimits(BaseModel):
@@ -66,7 +64,7 @@ def validate_admission(
         and inputs["prompt"].strip()
     ):
         options = SenseNovaU1ImageEditSampling.from_params(parameters)
-        expected_images = options.n
+        expected_images = 1
         output_width, output_height = options.width, options.height
         references = inputs.get("image_b64")
         if isinstance(references, str):

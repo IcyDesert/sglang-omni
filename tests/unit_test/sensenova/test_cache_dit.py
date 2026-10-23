@@ -329,6 +329,16 @@ class TestCacheDitLifecycle(unittest.TestCase):
             decoder_attention_type(self.transformer, self.transformer.layers[0]),
             "full_attention",
         )
+        self.native[3].attention_type = "sliding_attention"
+        self.assertEqual(
+            decoder_attention_type(self.transformer, self.native[3]),
+            "sliding_attention",
+        )
+        self.controller.unmount()
+        self.assertEqual(
+            decoder_attention_type(self.transformer, self.native[3]),
+            "sliding_attention",
+        )
 
 
 @unittest.skipUnless(

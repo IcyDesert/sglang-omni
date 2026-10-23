@@ -129,8 +129,8 @@ The response follows the Images API shape:
 
 `size` dimensions must be positive multiples of 32. Text-to-image requests
 support `n` from 1 to 10 and return base64 PNG images. Image edits also accept
-`n` from 1 to 10 in one pipeline request: the references are decoded and
-resized once, then each output runs in turn with `seed + output_index`.
+`n` from 1 to 10; the API sends each output as its own pipeline request with
+`seed + output_index`, so every output gets the full `timeout_s`.
 Both routes require `think_mode=false`.
 
 ## Cache-DiT Acceleration
@@ -200,9 +200,9 @@ most 33554432 pixels (`max_reference_pixels`, 32 x 1024 x 1024), and the edits
 endpoint also caps each upload at 4096x4096 pixels. `do_resize=false` does not
 disable the other admission limits or output-size selection.
 
-I2I accelerator memory errors identify the CUDA or NPU backend and suggest
-reducing references or output size. Lowering `input_max_pixels` only helps
-when `do_resize=true`; CUDA requests can also lower
+I2I accelerator memory errors return 400 on every endpoint, identify the CUDA
+or NPU backend, and suggest reducing references or output size. Lowering
+`input_max_pixels` only helps when `do_resize=true`; CUDA requests can also lower
 `generate.factory.dit_layerwise_resident_layers` with layerwise offload enabled.
 A CPU memory error remains a server failure rather than being reported as a
 reference-image accelerator error. Empty or invalid boolean form values are

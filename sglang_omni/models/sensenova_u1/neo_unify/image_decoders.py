@@ -172,7 +172,7 @@ class ConvDecoder(nn.Module):
         return x
 
 
-# note (Codex): Preserve existing import and serialized class lookup names.
+# note (Wes): Old imports and pickles still refer to decoders by these legacy names.
 PatchDecoder_postps = PatchDecoderPostPixelShuffle
 PatchDecoder_preps = PatchDecoderPrePixelShuffle
 PatchDecoder_preps1 = PatchDecoderPrePixelShuffleSingleProjection

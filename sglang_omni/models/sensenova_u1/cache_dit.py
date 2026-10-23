@@ -152,6 +152,9 @@ class SenseNovaCacheDit:
             has_separate_cfg=has_separate_cfg,
         )
         object.__setattr__(transformer, "sensenova_cache_dit_native_layers", layers)
+        transformer.sensenova_cache_dit_native_layer_ids: frozenset[int] = frozenset(
+            id(layer) for layer in layers
+        )
         transformer.sensenova_cache_dit_attention_type: str = next(
             iter(attention_types)
         )
@@ -224,6 +227,7 @@ class SenseNovaCacheDit:
     @staticmethod
     def clear_native_layers(transformer: torch.nn.Module) -> None:
         transformer.__dict__.pop("sensenova_cache_dit_native_layers", None)
+        transformer.__dict__.pop("sensenova_cache_dit_native_layer_ids", None)
         transformer.__dict__.pop("sensenova_cache_dit_attention_type", None)
 
 
@@ -244,10 +248,8 @@ def decoder_layers(
 
 
 def decoder_attention_type(model: torch.nn.Module, layer: torch.nn.Module) -> str:
-    native_layers = model.__dict__.get("sensenova_cache_dit_native_layers")
-    if native_layers is None or any(
-        layer is native_layer for native_layer in native_layers
-    ):
+    native_layer_ids = model.__dict__.get("sensenova_cache_dit_native_layer_ids")
+    if native_layer_ids is None or id(layer) in native_layer_ids:
         return layer.attention_type
     else:
         return model.sensenova_cache_dit_attention_type

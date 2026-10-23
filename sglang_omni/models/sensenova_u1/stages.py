@@ -115,7 +115,9 @@ def image_generation_batch_key(
     return ("text_to_image", *options.batch_key())
 
 
-def validate_generation_request(payload: StagePayload, model: NEOChatModel) -> None:
+def validate_generation_request(
+    payload: StagePayload, model: NEOChatModel, cache_dit: SenseNovaCacheDit
+) -> None:
     """Reject invalid TP work before the leader dispatches it to other ranks."""
     inputs = payload.request.inputs
     is_edit = isinstance(inputs, dict) and inputs.get("task") == "image_edit"
@@ -134,14 +136,13 @@ def validate_generation_request(payload: StagePayload, model: NEOChatModel) -> N
     else:
         options = text_to_image_options(payload)
         branch_count = 2 if options.guidance_scale > 1 else 1
-    controller = model.sensenova_cache_dit
     enabled = (
-        controller.enabled_by_default
+        cache_dit.enabled_by_default
         if options.enable_cache_dit is None
         else options.enable_cache_dit
     )
     if enabled and branch_count <= 2:
-        controller.validate_request(
+        cache_dit.validate_request(
             model.language_model.model,
             params=options.cache_dit_params,
             steps=options.num_inference_steps,
@@ -213,7 +214,7 @@ def create_generation_executor(
     enable_cache_dit, cache_dit_params = resolve_cache_dit_defaults(
         enable_cache_dit, cache_dit_params
     )
-    model.sensenova_cache_dit: SenseNovaCacheDit = SenseNovaCacheDit(
+    cache_dit = SenseNovaCacheDit(
         enabled_by_default=enable_cache_dit,
         default_params=cache_dit_params,
     )
@@ -227,17 +228,12 @@ def create_generation_executor(
             f"SenseNova-U1 NPU operators: FIA={npu_fia_available()}, "
             f"SwiGLU={npu_swiglu_available()}"
         )
-        npu = getattr(torch, "npu", None)
-        if npu is not None and all(
-            hasattr(npu, name) for name in ("memory_allocated", "memory_reserved")
-        ):
-            logger.info(
-                "SenseNova-U1 NPU memory after load: "
-                f"allocated={npu.memory_allocated(resolved_device)}, "
-                f"reserved={npu.memory_reserved(resolved_device)}"
-            )
-        else:
-            pass
+        npu = torch.get_device_module(resolved_device.type)
+        logger.info(
+            "SenseNova-U1 NPU memory after load: "
+            f"allocated={npu.memory_allocated(resolved_device)}, "
+            f"reserved={npu.memory_reserved(resolved_device)}"
+        )
     else:
         pass
     batch_enabled = max_batch_size > 1
@@ -258,9 +254,7 @@ def create_generation_executor(
         )
         with cancellation, offload.request() if offload is not None else nullcontext():
             generation_checkpoint()
-            result = generate_image(payload, model, tokenizer)
-            generation_checkpoint()
-            return result
+            return generate_image(payload, model, tokenizer, cache_dit)
 
     def _generate_batch(payloads: list[StagePayload]) -> list[StagePayload]:
         cancellation = (
@@ -270,14 +264,12 @@ def create_generation_executor(
         )
         with cancellation, offload.request() if offload is not None else nullcontext():
             generation_checkpoint()
-            results = generate_images(payloads, model, tokenizer)
-            generation_checkpoint()
-            return results
+            return generate_images(payloads, model, tokenizer, cache_dit)
 
     def _shutdown() -> None:
         try:
             try:
-                model.sensenova_cache_dit.unmount()
+                cache_dit.unmount()
             finally:
                 if offload is not None:
                     offload.close()
@@ -290,7 +282,7 @@ def create_generation_executor(
                 pass
 
     def _validate(payload: StagePayload) -> None:
-        validate_generation_request(payload, model)
+        validate_generation_request(payload, model, cache_dit)
 
     if tp_size > 1 and cooperative_cancellation:
         scheduler = SenseNovaTensorParallelScheduler(

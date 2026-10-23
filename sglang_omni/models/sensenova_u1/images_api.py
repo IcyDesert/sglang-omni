@@ -11,14 +11,11 @@ import uuid
 from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool, TypeAdapter
 
 from sglang_omni.client.image_media import InlineImage
 from sglang_omni.client.types import GenerateChunk, GenerateRequest, UMMGenerateChunk
-from sglang_omni.models.sensenova_u1.admission import (
-    DEFAULT_UMM_ADMISSION_LIMITS,
-    REFERENCE_MEMORY_ERROR_PREFIX,
-)
+from sglang_omni.models.sensenova_u1.admission import DEFAULT_UMM_ADMISSION_LIMITS
 from sglang_omni.models.sensenova_u1.sampling import (
     GenerationSeed,
     GenerationSteps,
@@ -26,6 +23,7 @@ from sglang_omni.models.sensenova_u1.sampling import (
     ImageCount,
     SenseNovaU1ImageEditSampling,
     SenseNovaU1Sampling,
+    validate_seed_range,
 )
 from sglang_omni.serve.openai_api import (
     image_result_with_disconnect_watch,
@@ -82,14 +80,6 @@ def umm_images(chunk: GenerateChunk) -> list[str]:
         ]
 
 
-def image_error_status_code(exc: BaseException) -> int:
-    """Report references that exceed accelerator memory as a client error."""
-    if REFERENCE_MEMORY_ERROR_PREFIX in str(exc):
-        return 400
-    else:
-        return generation_error_status_code(exc)
-
-
 def register_image_generations(app: FastAPI) -> None:
     """Expose SenseNova text-to-image generation as a minimal Images API."""
 
@@ -140,7 +130,7 @@ def register_image_generations(app: FastAPI) -> None:
         except Exception as exc:
             logger.exception(f"Image generation failed for request {request_id}")
             raise HTTPException(
-                status_code=image_error_status_code(exc), detail=str(exc)
+                status_code=generation_error_status_code(exc), detail=str(exc)
             ) from exc
 
 
@@ -197,7 +187,8 @@ def register_image_edits(app: FastAPI) -> None:
         else:
             pass
         try:
-            params = {"n": n, "size_explicit": size is not None}
+            n = TypeAdapter(ImageCount).validate_python(n)
+            params = {"n": 1, "size_explicit": size is not None}
             submitted_form = await request.form()
             for name, boolean_text in (
                 ("enable_cache_dit", enable_cache_dit),
@@ -239,9 +230,9 @@ def register_image_edits(app: FastAPI) -> None:
                     params[name] = value
                 else:
                     pass
-            params = SenseNovaU1ImageEditSampling.from_params(params).model_dump(
-                exclude_none=True
-            )
+            edit_sampling = SenseNovaU1ImageEditSampling.from_params(params)
+            validate_seed_range(edit_sampling.seed, n)
+            params = edit_sampling.model_dump(exclude_none=True)
             if not prompt.strip():
                 raise ValueError("SenseNova-U1 requires a non-empty image edit prompt")
             else:
@@ -267,28 +258,35 @@ def register_image_edits(app: FastAPI) -> None:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        generate_request = GenerateRequest(
-            model=app.state.model_name,
-            prompt={
-                "task": "image_edit",
-                "prompt": prompt,
-                "image_b64": encoded_references,
-            },
-            extra_params=params,
-            output_modalities=["image"],
-            stream=False,
-        )
-        request_id = str(uuid.uuid4())
+        # note (Wes): Each output is its own request so it gets a full timeout_s and reserves one output at a time.
+        encoded_outputs = []
+        parent_request_id = str(uuid.uuid4())
         try:
-            chunk = await image_result_with_disconnect_watch(
-                request, app.state.client, generate_request, request_id
-            )
-            return build_image_response(umm_images(chunk))
+            for output_index in range(n):
+                output_params = dict(params)
+                output_params["seed"] = edit_sampling.seed + output_index
+                generate_request = GenerateRequest(
+                    model=app.state.model_name,
+                    prompt={
+                        "task": "image_edit",
+                        "prompt": prompt,
+                        "image_b64": encoded_references,
+                    },
+                    extra_params=output_params,
+                    output_modalities=["image"],
+                    stream=False,
+                )
+                request_id = f"{parent_request_id}:{output_index}"
+                chunk = await image_result_with_disconnect_watch(
+                    request, app.state.client, generate_request, request_id
+                )
+                encoded_outputs.extend(umm_images(chunk))
         except Exception as exc:
-            logger.exception(f"Image edit failed for request {request_id}")
+            logger.exception(f"Image edit failed for request {parent_request_id}")
             raise HTTPException(
-                status_code=image_error_status_code(exc), detail=str(exc)
+                status_code=generation_error_status_code(exc), detail=str(exc)
             ) from exc
+        return build_image_response(encoded_outputs)
 
 
 def register_images_api(app: FastAPI) -> None:

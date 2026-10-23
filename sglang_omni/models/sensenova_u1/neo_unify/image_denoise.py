@@ -129,16 +129,14 @@ def denoise_images(
         timesteps = 1 - GENERATION_TIMESTEP_SHIFT * noise_levels / (
             1 + (GENERATION_TIMESTEP_SHIFT - 1) * noise_levels
         )
-        if device.type == "npu":
-            denoise_embeddings = model.fm_modules["timestep_embedder"](timesteps[:-1])
-            if model.add_noise_scale_embedding:
-                denoise_embeddings = denoise_embeddings + model.fm_modules[
-                    "noise_scale_embedder"
-                ](timesteps.new_tensor([noise_scale / model.noise_scale_max_value]))
-            else:
-                pass
+        # note (Wes): Every image token shares the step's timestep, so one embedding per step is broadcast.
+        denoise_embeddings = model.fm_modules["timestep_embedder"](timesteps[:-1])
+        if model.add_noise_scale_embedding:
+            denoise_embeddings = denoise_embeddings + model.fm_modules[
+                "noise_scale_embedder"
+            ](timesteps.new_tensor([noise_scale / model.noise_scale_max_value]))
         else:
-            denoise_embeddings = None
+            pass
 
         for step_index in range(sampling.num_inference_steps):
             generation_checkpoint()
@@ -152,23 +150,9 @@ def denoise_images(
                 gen_model=True,
                 grid_hw=grid_shape,
             ).view(batch_size, image_token_count, -1)
-            if denoise_embeddings is not None:
-                timestep_embeddings = denoise_embeddings[step_index].view(1, 1, -1)
-            else:
-                expanded_timesteps = timestep.expand(batch_size * image_token_count)
-                timestep_embeddings = model.fm_modules["timestep_embedder"](
-                    expanded_timesteps
-                ).view(batch_size, image_token_count, -1)
-                if model.add_noise_scale_embedding:
-                    timestep_embeddings += model.fm_modules["noise_scale_embedder"](
-                        torch.full_like(
-                            expanded_timesteps,
-                            noise_scale / model.noise_scale_max_value,
-                        )
-                    ).view(batch_size, image_token_count, -1)
-                else:
-                    pass
-            image_embeddings = image_embeddings + timestep_embeddings
+            image_embeddings = image_embeddings + denoise_embeddings[step_index].view(
+                1, 1, -1
+            )
             predicted_velocities = [
                 t2i_predict_v(
                     model,
