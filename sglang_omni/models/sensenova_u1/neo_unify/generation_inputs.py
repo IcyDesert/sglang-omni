@@ -7,7 +7,7 @@ from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
     create_block_causal_mask,
 )
 from sglang_omni.models.sensenova_u1.neo_unify.conversation import get_conv_template
-from sglang_omni.models.sensenova_u1.neo_unify.generation_state import GenerationState
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
 from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_vit import (
     build_abs_positions_from_grid_hw,
 )
@@ -16,7 +16,6 @@ from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_vit import (
 
 
 def patchify(
-    self: GenerationState,
     images: torch.Tensor,
     patch_size: int,
     channel_first: bool = False,
@@ -35,7 +34,6 @@ def patchify(
 
 
 def unpatchify(
-    sle: GenerationState,
     x: torch.Tensor,
     patch_size: int,
     h: int | None = None,
@@ -54,14 +52,14 @@ def unpatchify(
 
 
 def build_t2i_query(
-    self: GenerationState,
+    model: NEOChatModel,
     prompt_text: str,
     system_message: str | None = None,
     append_text: str | None = None,
 ) -> str:
-    template = get_conv_template(self.template)
+    template = get_conv_template(model.template)
     template.system_message = (
-        self.system_message if system_message is None else system_message
+        model.system_message if system_message is None else system_message
     )
     template.append_message(template.roles[0], prompt_text)
     template.append_message(template.roles[1], None)
@@ -73,7 +71,7 @@ def build_t2i_query(
 
 
 def build_t2i_text_inputs(
-    self: GenerationState, tokenizer: PreTrainedTokenizerBase, query: str | list[str]
+    model: NEOChatModel, tokenizer: PreTrainedTokenizerBase, query: str | list[str]
 ) -> tuple[
     torch.Tensor, torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor
 ]:
@@ -84,7 +82,7 @@ def build_t2i_text_inputs(
         pass
     encoded = [tokenizer(item, return_tensors="pt")["input_ids"][0] for item in queries]
     lengths = [item.shape[0] for item in encoded]
-    prefix_lengths = torch.tensor(lengths, dtype=torch.long, device=self.device)
+    prefix_lengths = torch.tensor(lengths, dtype=torch.long, device=model.device)
     max_length = max(lengths)
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     if pad_token_id is None:
@@ -100,13 +98,13 @@ def build_t2i_text_inputs(
         (len(encoded), max_length),
         int(pad_token_id),
         dtype=encoded[0].dtype,
-        device=self.device,
+        device=model.device,
     )
     key_valid_mask = torch.zeros(
-        (len(encoded), max_length), dtype=torch.bool, device=self.device
+        (len(encoded), max_length), dtype=torch.bool, device=model.device
     )
     for batch_index, item in enumerate(encoded):
-        item = item.to(self.device)
+        item = item.to(model.device)
         item_length = item.shape[0]
         input_ids[batch_index, :item_length] = item
         key_valid_mask[batch_index, :item_length] = True
@@ -124,7 +122,6 @@ def build_t2i_text_inputs(
 
 
 def build_t2i_image_indexes(
-    self: GenerationState,
     token_h: int,
     token_w: int,
     text_len: int | torch.Tensor,
@@ -152,26 +149,26 @@ def build_t2i_image_indexes(
 
 
 def build_it2i_inputs(
-    self: GenerationState,
+    model: NEOChatModel,
     tokenizer: PreTrainedTokenizerBase,
     query: str,
     pixel_values: torch.Tensor | None = None,
     grid_hw: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     model_inputs = tokenizer(query, return_tensors="pt")
-    input_ids = model_inputs["input_ids"].to(self.device)
+    input_ids = model_inputs["input_ids"].to(model.device)
 
-    indexes = self.get_thw_indexes(input_ids[0], grid_hw)
+    indexes = get_thw_indexes(model, input_ids[0], grid_hw)
 
     attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
 
-    input_embeds = self.language_model.get_input_embeddings()(input_ids)
+    input_embeds = model.language_model.get_input_embeddings()(input_ids)
     B, N, C = input_embeds.shape
     if pixel_values is not None:
-        vit_embeds = self.extract_feature(pixel_values, grid_hw=grid_hw)
+        vit_embeds = model.extract_feature(pixel_values, grid_hw=grid_hw)
         input_embeds = input_embeds.reshape(B * N, C)
         input_ids = input_ids.reshape(B * N)
-        selected = input_ids == self.img_context_token_id
+        selected = input_ids == model.img_context_token_id
         assert selected.sum() != 0
         input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
         input_embeds = input_embeds.reshape(B, N, C)
@@ -182,25 +179,25 @@ def build_it2i_inputs(
 
 
 def get_thw_indexes(
-    self: GenerationState, input_ids: torch.Tensor, grid_hw: torch.Tensor | None = None
+    model: NEOChatModel, input_ids: torch.Tensor, grid_hw: torch.Tensor | None = None
 ) -> torch.Tensor:
     img_start_shift = torch.cat(
         [
             torch.zeros(1, dtype=torch.long).to(input_ids.device),
-            (input_ids == self.img_start_token_id).long(),
+            (input_ids == model.img_start_token_id).long(),
         ],
         dim=0,
     )[:-1]
-    not_img_token = (input_ids != self.img_context_token_id).long()
+    not_img_token = (input_ids != model.img_context_token_id).long()
     t_indexes = (img_start_shift + not_img_token).cumsum(0) - 1
     h_indexes = torch.zeros_like(t_indexes).to(t_indexes.device)
     w_indexes = torch.zeros_like(t_indexes).to(t_indexes.device)
 
     if grid_hw is not None:
-        selected = input_ids == self.img_context_token_id
+        selected = input_ids == model.img_context_token_id
         if selected.long().sum() > 0:
             abs_pos_w, abs_pos_h = build_abs_positions_from_grid_hw(
-                grid_hw // int(1 / self.downsample_ratio), device=t_indexes.device
+                grid_hw // int(1 / model.downsample_ratio), device=t_indexes.device
             )
             h_indexes[selected] = abs_pos_h.to(t_indexes.device, t_indexes.dtype)
             w_indexes[selected] = abs_pos_w.to(t_indexes.device, t_indexes.dtype)

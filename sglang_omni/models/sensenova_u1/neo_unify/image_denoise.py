@@ -15,8 +15,13 @@ from sglang_omni.models.sensenova_u1.neo_unify.flash_cache import (
     clear_flash_kv_cache,
     prepare_flash_kv_cache,
 )
+from sglang_omni.models.sensenova_u1.neo_unify.generation_forward import t2i_predict_v
+from sglang_omni.models.sensenova_u1.neo_unify.generation_inputs import (
+    patchify,
+    unpatchify,
+)
 from sglang_omni.models.sensenova_u1.neo_unify.generation_math import randn_with_seed
-from sglang_omni.models.sensenova_u1.neo_unify.generation_state import GenerationState
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
 from sglang_omni.models.sensenova_u1.sampling import (
     GENERATION_TIMESTEP_SHIFT,
     SenseNovaU1ImageEditSampling,
@@ -35,7 +40,7 @@ class ImagePrefix:
 
 
 def denoise_images(
-    model: GenerationState,
+    model: NEOChatModel,
     *,
     sampling: SenseNovaU1Sampling | SenseNovaU1ImageEditSampling,
     prefixes: list[ImagePrefix],
@@ -138,8 +143,8 @@ def denoise_images(
         for step_index in range(sampling.num_inference_steps):
             generation_checkpoint()
             timestep = timesteps[step_index]
-            image_latents = model.patchify(image_prediction, image_patch_size)
-            image_patches = model.patchify(
+            image_latents = patchify(image_prediction, image_patch_size)
+            image_patches = patchify(
                 image_prediction, model.patch_size, channel_first=True
             )
             image_embeddings = model.extract_feature(
@@ -165,7 +170,8 @@ def denoise_images(
                     pass
             image_embeddings = image_embeddings + timestep_embeddings
             predicted_velocities = [
-                model.t2i_predict_v(
+                t2i_predict_v(
+                    model,
                     image_embeddings,
                     prefix.image_indexes,
                     attention_mask,
@@ -196,7 +202,7 @@ def denoise_images(
                 image_latents
                 + (timesteps[step_index + 1] - timestep) * predicted_velocity
             )
-            image_prediction = model.unpatchify(
+            image_prediction = unpatchify(
                 image_latents, image_patch_size, sampling.height, sampling.width
             )
         return image_prediction

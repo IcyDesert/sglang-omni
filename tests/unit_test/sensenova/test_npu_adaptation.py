@@ -30,8 +30,11 @@ from sglang_omni.models.sensenova_u1.neo_unify.flash_cache import (
     copy_right_aligned_prefix_bnsd,
     prepare_flash_kv_cache,
 )
+from sglang_omni.models.sensenova_u1.neo_unify.generation_inputs import (
+    build_t2i_image_indexes,
+    build_t2i_text_inputs,
+)
 from sglang_omni.models.sensenova_u1.neo_unify.generation_math import randn_with_seed
-from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
 from sglang_omni.models.sensenova_u1.neo_unify.qwen_attention import Qwen3Attention
 from sglang_omni.models.sensenova_u1.neo_unify.qwen_feed_forward import (
     Qwen3MLP,
@@ -138,9 +141,7 @@ def test_builds_padded_batched_text_inputs():
     model = SimpleNamespace(device=torch.device("cpu"))
 
     input_ids, indexes, attention_mask, valid_mask, prefix_lengths = (
-        NEOChatModel.build_t2i_text_inputs(
-            model, FakeTokenizer(), ["short", "a much longer prompt"]
-        )
+        build_t2i_text_inputs(model, FakeTokenizer(), ["short", "a much longer prompt"])
     )
 
     assert input_ids.shape == (2, 5)
@@ -173,11 +174,9 @@ def test_position_indexes_support_batched_inputs():
 def test_singleton_text_matches_valid_batched_tokens():
     model = SimpleNamespace(device=torch.device("cpu"))
     tokenizer = FakeTokenizer()
-    batched = NEOChatModel.build_t2i_text_inputs(
-        model, tokenizer, ["short", "a much longer prompt"]
-    )
+    batched = build_t2i_text_inputs(model, tokenizer, ["short", "a much longer prompt"])
     for index, prompt in enumerate(["short", "a much longer prompt"]):
-        single = NEOChatModel.build_t2i_text_inputs(model, tokenizer, prompt)
+        single = build_t2i_text_inputs(model, tokenizer, prompt)
         length = single[0].shape[1]
         assert torch.equal(batched[0][index, :length], single[0][0])
         assert torch.equal(batched[1][index, :, :length], single[1])
@@ -199,8 +198,7 @@ def test_block_causal_mask_rejects_padded_keys():
 
 
 def test_builds_per_sample_image_indexes():
-    indexes = NEOChatModel.build_t2i_image_indexes(
-        SimpleNamespace(),
+    indexes = build_t2i_image_indexes(
         token_h=2,
         token_w=2,
         text_len=torch.tensor([2, 5]),
@@ -482,7 +480,6 @@ def test_prefix_and_denoise_attention_match_singletons(monkeypatch):
     generator = torch.Generator().manual_seed(31)
     text = torch.randn(2, 5, 64, generator=generator)
     image = torch.randn(2, 3, 64, generator=generator)
-    helper = SimpleNamespace(device=torch.device("cpu"))
     attention_batch_sizes: list[int] = []
     sdpa = attention_backend_module.sdpa_attn_func
 
@@ -511,8 +508,8 @@ def test_prefix_and_denoise_attention_match_singletons(monkeypatch):
             batch_size=batch_size,
             prefix_lengths=torch.tensor(lengths),
         )
-        image_indexes = NEOChatModel.build_t2i_image_indexes(
-            helper, 1, 3, torch.tensor(lengths), torch.device("cpu")
+        image_indexes = build_t2i_image_indexes(
+            1, 3, torch.tensor(lengths), torch.device("cpu")
         )
         outputs = []
         for _ in range(2):

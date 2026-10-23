@@ -19,7 +19,13 @@ from sglang_omni.models.sensenova_u1.image_processing import (
     prepare_reference_images,
     resolve_edit_output_size,
 )
+from sglang_omni.models.sensenova_u1.neo_unify.image_conditioned_generation import (
+    it2i_generate,
+)
 from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
+from sglang_omni.models.sensenova_u1.neo_unify.text_to_image_generation import (
+    t2i_generate,
+)
 from sglang_omni.models.sensenova_u1.sampling import (
     SenseNovaU1ImageEditSampling,
     SenseNovaU1Sampling,
@@ -81,7 +87,8 @@ def generate_text_to_image(
         cfg_scale=options.guidance_scale,
     )
     with torch.inference_mode():
-        images = model.t2i_generate(
+        images = t2i_generate(
+            model,
             tokenizer,
             prompt,
             sampling=options,
@@ -150,7 +157,8 @@ def generate_text_to_image_batch(
         f"steps={first.num_inference_steps}, cfg={first.guidance_scale}"
     )
     with torch.inference_mode():
-        images = model.t2i_generate(
+        images = t2i_generate(
+            model,
             tokenizer,
             prompts,
             sampling=first,
@@ -195,7 +203,8 @@ def generate_image_edit(
             )
             with torch.inference_mode():
                 output_images.append(
-                    model.it2i_generate(
+                    it2i_generate(
+                        model,
                         tokenizer,
                         prompt,
                         references,

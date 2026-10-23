@@ -33,6 +33,7 @@ from sglang_omni.models.sensenova_u1.image_processing import (
     resolve_reference_output_size,
 )
 from sglang_omni.models.sensenova_u1.images_api import register_images_api
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
 from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1ImageEditSampling
 from sglang_omni.models.sensenova_u1.stages import (
     image_generation_batch_key,
@@ -55,6 +56,8 @@ from tests.unit_test.fixtures.pipeline_fakes import (
     RecordingStageControlPlane,
 )
 from tests.unit_test.fixtures.sensenova_umm import png_with_bad_idat_crc
+
+pytest_plugins = ["tests.unit_test.fixtures.sensenova_generation"]
 
 
 def umm_image_chunk(request_id: str, encoded_images: list[str]) -> UMMGenerateChunk:
@@ -157,10 +160,11 @@ def test_t2i_api_returns_all_outputs_in_one_request() -> None:
 
 
 def test_t2i_stage_encodes_real_png_and_passes_source_arguments(
+    t2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     model = Mock()
-    model.t2i_generate.return_value = torch.zeros((1, 3, 32, 64))
+    t2i_generate_mock.return_value = torch.zeros((1, 3, 32, 64))
     payload = StagePayload(
         request_id="test",
         request=OmniRequest(
@@ -172,7 +176,7 @@ def test_t2i_stage_encodes_real_png_and_passes_source_arguments(
 
     result = generation_module.generate_image(payload, model, tokenizer=tokenizer)
 
-    kwargs = model.t2i_generate.call_args.kwargs
+    kwargs = t2i_generate_mock.call_args.kwargs
     assert (kwargs["sampling"].width, kwargs["sampling"].height) == (64, 32)
     assert kwargs["sampling"].seed == 7
     image = Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"])))
@@ -180,9 +184,11 @@ def test_t2i_stage_encodes_real_png_and_passes_source_arguments(
     assert image.size == (64, 32)
 
 
-def test_t2i_stage_rejects_invalid_output(tokenizer: PreTrainedTokenizerBase) -> None:
+def test_t2i_stage_rejects_invalid_output(
+    t2i_generate_mock: Mock, tokenizer: PreTrainedTokenizerBase
+) -> None:
     model = Mock()
-    model.t2i_generate.return_value = torch.zeros((1, 3, 16, 16))
+    t2i_generate_mock.return_value = torch.zeros((1, 3, 16, 16))
     payload = StagePayload(
         request_id="test",
         request=OmniRequest(inputs="a cat", params={"width": 32, "height": 32}),
@@ -202,11 +208,12 @@ def decode_result_pixel(payload):
 
 
 def test_t2i_stage_batches_compatible_requests_with_per_request_seeds(
+    t2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     tokenizer.side_effect = [{"input_ids": [1, 2, 3]}, {"input_ids": [1, 2, 3, 4, 5]}]
     model = Mock()
-    model.t2i_generate.return_value = torch.stack(
+    t2i_generate_mock.return_value = torch.stack(
         [torch.full((3, 32, 64), -1.0), torch.full((3, 32, 64), 1.0)]
     )
     payloads = [
@@ -231,9 +238,11 @@ def test_t2i_stage_batches_compatible_requests_with_per_request_seeds(
 
     results = generation_module.generate_images(payloads, model, tokenizer=tokenizer)
 
-    args = model.t2i_generate.call_args.args
-    kwargs = model.t2i_generate.call_args.kwargs
-    assert args[1] == ["a blue cat", "a red dog on grass"]
+    args = t2i_generate_mock.call_args.args
+    kwargs = t2i_generate_mock.call_args.kwargs
+    assert args[0] is model
+    assert args[1] is tokenizer
+    assert args[2] == ["a blue cat", "a red dog on grass"]
     assert kwargs["seeds"] == [7, 19]
     assert (kwargs["sampling"].width, kwargs["sampling"].height) == (64, 32)
     assert kwargs["sampling"].num_inference_steps == 12
@@ -280,6 +289,7 @@ def test_image_generation_batch_key_separates_parameters_and_image_edits():
 
 
 def test_i2i_stage_decodes_reference_and_passes_source_arguments(
+    it2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     reference = io.BytesIO()
@@ -287,6 +297,7 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
     model = Mock()
 
     def edit_image(
+        generation_model: NEOChatModel,
         model_tokenizer: PreTrainedTokenizerBase,
         prompt: str,
         references: list[Image.Image],
@@ -295,7 +306,7 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
     ) -> torch.Tensor:
         return torch.zeros((1, 3, 32, 64))
 
-    model.it2i_generate.side_effect = edit_image
+    it2i_generate_mock.side_effect = edit_image
     payload = StagePayload(
         request_id="test",
         request=OmniRequest(
@@ -320,11 +331,13 @@ def test_i2i_stage_decodes_reference_and_passes_source_arguments(
 
     result = generation_module.generate_image(payload, model, tokenizer=tokenizer)
 
-    args = model.it2i_generate.call_args.args
-    kwargs = model.it2i_generate.call_args.kwargs
-    assert args[1] == "make the background blue"
-    assert len(args[2]) == 1
-    assert args[2][0].size == (64, 32)
+    args = it2i_generate_mock.call_args.args
+    kwargs = it2i_generate_mock.call_args.kwargs
+    assert args[0] is model
+    assert args[1] is tokenizer
+    assert args[2] == "make the background blue"
+    assert len(args[3]) == 1
+    assert args[3][0].size == (64, 32)
     assert (kwargs["sampling"].width, kwargs["sampling"].height) == (64, 32)
     assert kwargs["sampling"].num_inference_steps == 12
     assert kwargs["sampling"].guidance_scale == 2.5
@@ -359,6 +372,7 @@ def test_i2i_stage_rejects_invalid_reference_image(
 
 
 def test_i2i_stage_preserves_reference_aspect_ratio_without_explicit_size(
+    it2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     reference = io.BytesIO()
@@ -369,7 +383,7 @@ def test_i2i_stage_preserves_reference_aspect_ratio_without_explicit_size(
         width, height = (kwargs["sampling"].width, kwargs["sampling"].height)
         return torch.zeros((1, 3, height, width))
 
-    model.it2i_generate.side_effect = generate
+    it2i_generate_mock.side_effect = generate
     payload = StagePayload(
         request_id="test",
         request=OmniRequest(
@@ -391,8 +405,8 @@ def test_i2i_stage_preserves_reference_aspect_ratio_without_explicit_size(
     result = generation_module.generate_image(payload, model, tokenizer=tokenizer)
 
     assert (
-        model.it2i_generate.call_args.kwargs["sampling"].width,
-        model.it2i_generate.call_args.kwargs["sampling"].height,
+        it2i_generate_mock.call_args.kwargs["sampling"].width,
+        it2i_generate_mock.call_args.kwargs["sampling"].height,
     ) == (384, 192)
     image = Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"])))
     assert image.size == (384, 192)
@@ -695,6 +709,7 @@ def test_image_edit_api_forwards_boolean_controls(
 @pytest.mark.parametrize("do_resize", [False, True])
 @pytest.mark.parametrize("device_type", ["cuda", "npu", "cpu"])
 def test_image_edit_oom_uses_model_device_backend(
+    it2i_generate_mock: Mock,
     device_type: Literal["cuda", "npu", "cpu"],
     do_resize: bool,
     tokenizer: PreTrainedTokenizerBase,
@@ -711,7 +726,7 @@ def test_image_edit_oom_uses_model_device_backend(
     Image.new("RGB", (32, 32)).save(reference, format="PNG")
     model = Mock()
     model.device = SimpleNamespace(type=device_type)
-    model.it2i_generate.side_effect = torch.OutOfMemoryError("device exhausted")
+    it2i_generate_mock.side_effect = torch.OutOfMemoryError("device exhausted")
     payload = StagePayload(
         "oom",
         OmniRequest(
@@ -750,13 +765,15 @@ def test_image_edit_oom_uses_model_device_backend(
 
 
 def test_multi_output_failure_cleans_cache_controller(
-    tokenizer: PreTrainedTokenizerBase, monkeypatch: pytest.MonkeyPatch
+    t2i_generate_mock: Mock,
+    tokenizer: PreTrainedTokenizerBase,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The n>1 branch bypassed cache cleanup after a failed generation."""
     cleanup = Mock(wraps=generation_module.unmount_cache_dit_after_failure)
     monkeypatch.setattr(generation_module, "unmount_cache_dit_after_failure", cleanup)
     model = Mock()
-    model.t2i_generate.side_effect = RuntimeError("generation failed")
+    t2i_generate_mock.side_effect = RuntimeError("generation failed")
     payload = StagePayload(
         "multi", OmniRequest("a cat", {"n": 2, "width": 32, "height": 32}), None
     )
@@ -771,6 +788,7 @@ def test_multi_output_failure_cleans_cache_controller(
     [(1.0, 1.0, 1), (4.0, 4.0, 2), (0.5, 1.0, 2)],
 )
 def test_i2i_stage_overrides_match_cost_and_tp_validation(
+    it2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
     guidance_scale: float,
     img_cfg_scale: float,
@@ -809,7 +827,7 @@ def test_i2i_stage_overrides_match_cost_and_tp_validation(
     model = Mock()
     model.sensenova_cache_dit.enabled_by_default = True
     output_width_pixels, output_height_pixels = (96, 64) if size_explicit else (96, 96)
-    model.it2i_generate.return_value = torch.zeros(
+    it2i_generate_mock.return_value = torch.zeros(
         (1, 3, output_height_pixels, output_width_pixels)
     )
     with patch.object(Image, "open", wraps=Image.open) as open_image:
@@ -818,20 +836,19 @@ def test_i2i_stage_overrides_match_cost_and_tp_validation(
     validate_generation_request(payload, model)
     assert model.sensenova_cache_dit.validate_request.call_args.kwargs["steps"] == 4
     result = generation_module.generate_image(payload, model, tokenizer)
-    assert model.it2i_generate.call_args.kwargs["sampling"].num_inference_steps == 4
+    assert it2i_generate_mock.call_args.kwargs["sampling"].num_inference_steps == 4
     assert (
-        model.it2i_generate.call_args.kwargs["sampling"].width,
-        model.it2i_generate.call_args.kwargs["sampling"].height,
+        it2i_generate_mock.call_args.kwargs["sampling"].width,
+        it2i_generate_mock.call_args.kwargs["sampling"].height,
     ) == (
         output_width_pixels,
         output_height_pixels,
     )
     assert (
-        model.it2i_generate.call_args.kwargs["sampling"].guidance_scale
-        == guidance_scale
+        it2i_generate_mock.call_args.kwargs["sampling"].guidance_scale == guidance_scale
     )
     assert (
-        model.it2i_generate.call_args.kwargs["sampling"].img_cfg_scale == img_cfg_scale
+        it2i_generate_mock.call_args.kwargs["sampling"].img_cfg_scale == img_cfg_scale
     )
     with Image.open(io.BytesIO(base64.b64decode(result.data["image_b64"]))) as image:
         decoded_image_size = image.size
@@ -893,6 +910,7 @@ def test_i2i_validation_decodes_references_without_resizing(
 @pytest.mark.parametrize("image_format", ["JPEG", "PNG"])
 @pytest.mark.parametrize("cooperative_cancellation", [False, True])
 async def test_truncated_image_is_rejected_before_tp_fanout(
+    it2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
     invalid_reference_index: int,
     image_format: Literal["JPEG", "PNG"],
@@ -933,7 +951,7 @@ async def test_truncated_image_is_rejected_before_tp_fanout(
     )
     model = Mock()
     model.sensenova_cache_dit.enabled_by_default = False
-    model.it2i_generate.return_value = torch.zeros(1, 3, 32, 64)
+    it2i_generate_mock.return_value = torch.zeros(1, 3, 32, 64)
 
     def compute(payload: StagePayload) -> StagePayload:
         return generation_module.generate_image(payload, model, tokenizer)
@@ -973,7 +991,7 @@ async def test_truncated_image_is_rejected_before_tp_fanout(
     )
     fanout.fanout_work.assert_not_called()
     assert scheduler.inbox.empty()
-    model.it2i_generate.assert_not_called()
+    it2i_generate_mock.assert_not_called()
 
     await leader.execute(valid)
     fanout.fanout_work.assert_called_once_with(valid)
@@ -982,7 +1000,7 @@ async def test_truncated_image_is_rejected_before_tp_fanout(
     assert result.type == "result"
     assert result.request_id == "valid"
     assert scheduler.compute_error is None
-    model.it2i_generate.assert_called_once()
+    it2i_generate_mock.assert_called_once()
     with Image.open(
         io.BytesIO(base64.b64decode(result.data.data["image_b64"]))
     ) as image:
@@ -990,6 +1008,7 @@ async def test_truncated_image_is_rejected_before_tp_fanout(
 
 
 def test_invalid_edit_seed_is_rejected_before_tp_execution(
+    it2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     """An invalid seed must fail validation before TP ranks execute model work."""
@@ -1013,7 +1032,7 @@ def test_invalid_edit_seed_is_rejected_before_tp_execution(
         validate_generation_request(payload, model)
     with pytest.raises(ValueError, match="seed"):
         generation_module.generate_image(payload, model, tokenizer)
-    model.it2i_generate.assert_not_called()
+    it2i_generate_mock.assert_not_called()
 
 
 @pytest.mark.parametrize(

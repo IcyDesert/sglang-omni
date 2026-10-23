@@ -3,17 +3,17 @@
 import torch
 from transformers.cache_utils import DynamicCache
 
-from sglang_omni.models.sensenova_u1.neo_unify.generation_state import GenerationState
+from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
 from sglang_omni.models.sensenova_u1.sampling import GENERATION_TIME_EPSILON
 
 
 def t2i_prefix_forward(
-    self: GenerationState,
+    model: NEOChatModel,
     input_ids: torch.Tensor,
     indexes: torch.Tensor,
     attention_mask: dict[str, torch.Tensor],
 ) -> tuple[DynamicCache, torch.Tensor]:
-    out = self.language_model.model(
+    out = model.language_model.model(
         input_ids=input_ids,
         indexes=indexes,
         attention_mask=attention_mask,
@@ -23,12 +23,12 @@ def t2i_prefix_forward(
 
 
 def it2i_prefix_forward(
-    self: GenerationState,
+    model: NEOChatModel,
     input_imbeds: torch.Tensor,
     indexes: torch.Tensor,
     attention_mask: dict[str, torch.Tensor],
 ) -> tuple[DynamicCache, torch.Tensor]:
-    out = self.language_model.model(
+    out = model.language_model.model(
         inputs_embeds=input_imbeds,
         indexes=indexes,
         attention_mask=attention_mask,
@@ -38,7 +38,7 @@ def it2i_prefix_forward(
 
 
 def t2i_predict_v(
-    self: GenerationState,
+    model: NEOChatModel,
     input_embeds: torch.Tensor,
     indexes_image: torch.Tensor,
     attn_mask: dict[str, torch.Tensor | None] | None,
@@ -50,7 +50,7 @@ def t2i_predict_v(
 ) -> torch.Tensor:
     B, L = z.shape[0], z.shape[1]
 
-    outputs = self.language_model.model(
+    outputs = model.language_model.model(
         inputs_embeds=input_embeds,
         image_only=True,
         indexes=indexes_image,
@@ -60,10 +60,10 @@ def t2i_predict_v(
         use_cache=True,
     )
 
-    if self.use_pixel_head:
-        merge_size = int(1 / self.downsample_ratio)
-        token_h = image_size[1] // (self.patch_size * merge_size)
-        token_w = image_size[0] // (self.patch_size * merge_size)
+    if model.use_pixel_head:
+        merge_size = int(1 / model.downsample_ratio)
+        token_h = image_size[1] // (model.patch_size * merge_size)
+        token_w = image_size[0] // (model.patch_size * merge_size)
 
         img_reshaped = outputs.last_hidden_state[:, -image_token_num:].view(
             B, token_h, token_w, -1
@@ -71,31 +71,31 @@ def t2i_predict_v(
         img_2d = torch.einsum("b h w c -> b c h w", img_reshaped)
         img_2d = img_2d.contiguous().view(B, -1, token_h, token_w)
 
-        smoothed_img_2d = self.fm_modules["fm_head"](img_2d)
+        smoothed_img_2d = model.fm_modules["fm_head"](img_2d)
 
         smoothed_reshaped = smoothed_img_2d.view(
             B,
             3,
             token_h,
-            self.patch_size * merge_size,
+            model.patch_size * merge_size,
             token_w,
-            self.patch_size * merge_size,
+            model.patch_size * merge_size,
         )
         smoothed_reshaped = torch.einsum(
             "b c h p w q -> b h w p q c", smoothed_reshaped
         )
         out_1d = smoothed_reshaped.contiguous().view(
-            B, L, self.patch_size * merge_size * self.patch_size * merge_size * 3
+            B, L, model.patch_size * merge_size * model.patch_size * merge_size * 3
         )
         x_pred = out_1d
     else:
-        if self.use_deep_fm_head:
-            x_pred = self.fm_modules["fm_head"](
+        if model.use_deep_fm_head:
+            x_pred = model.fm_modules["fm_head"](
                 outputs.last_hidden_state[:, -image_token_num:].view(B * L, -1),
                 t.repeat(B * L),
             ).view(B, L, -1)
         else:
-            x_pred = self.fm_modules["fm_head"](
+            x_pred = model.fm_modules["fm_head"](
                 outputs.last_hidden_state[:, -image_token_num:].view(B, L, -1)
             ).view(B, L, -1)
 

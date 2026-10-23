@@ -23,6 +23,9 @@ def tokenizer() -> PreTrainedTokenizerBase:
     )
 
 
+pytest_plugins = ["tests.unit_test.fixtures.sensenova_generation"]
+
+
 def payload(n: int = 1) -> StagePayload:
     return StagePayload(
         request_id=str(n),
@@ -36,18 +39,20 @@ def payload(n: int = 1) -> StagePayload:
 
 @pytest.mark.parametrize("n", [1, 2, 4, 10])
 def test_native_outputs_and_seed_order(
-    n: int, tokenizer: PreTrainedTokenizerBase
+    t2i_generate_mock: Mock, n: int, tokenizer: PreTrainedTokenizerBase
 ) -> None:
     model = Mock()
-    model.t2i_generate.return_value = torch.stack(
+    t2i_generate_mock.return_value = torch.stack(
         [torch.full((3, 32, 32), -1 + i / 8) for i in range(n)]
     )
     request = payload(n)
     generate_image(request, model, tokenizer)
-    model.t2i_generate.assert_called_once()
-    assert model.t2i_generate.call_args.args[1] == "a cat"
-    assert model.t2i_generate.call_args.kwargs["sampling"].n == n
-    assert model.t2i_generate.call_args.kwargs["sampling"].seed == 7
+    t2i_generate_mock.assert_called_once()
+    assert t2i_generate_mock.call_args.args[0] is model
+    assert t2i_generate_mock.call_args.args[1] is tokenizer
+    assert t2i_generate_mock.call_args.args[2] == "a cat"
+    assert t2i_generate_mock.call_args.kwargs["sampling"].n == n
+    assert t2i_generate_mock.call_args.kwargs["sampling"].seed == 7
     outputs = [request.data["image_b64"]] if n == 1 else request.data["images_b64"]
     assert len(outputs) == n
     for index, encoded in enumerate(outputs):
@@ -63,6 +68,7 @@ def test_native_outputs_and_seed_order(
 
 
 def test_image_edit_returns_every_output_from_one_request(
+    it2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     """Edits accepted only one output per request, so n outputs re-sent every reference."""
@@ -87,32 +93,35 @@ def test_image_edit_returns_every_output_from_one_request(
         data=None,
     )
     model = Mock()
-    model.it2i_generate.return_value = torch.zeros(1, 3, 32, 32)
+    it2i_generate_mock.return_value = torch.zeros(1, 3, 32, 32)
     generate_image(request, model, tokenizer)
     assert [
         (call.kwargs["sampling"].n, call.kwargs["sampling"].seed)
-        for call in model.it2i_generate.call_args_list
+        for call in it2i_generate_mock.call_args_list
     ] == [(1, 7), (1, 8)]
     assert len(request.data["images_b64"]) == 2
     assert image_generation_request_cost(request) == 2 * 32 * 32 * 50 * 2
 
 
 def test_compatible_batch_reaches_the_model_in_one_call(
+    t2i_generate_mock: Mock,
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     model = Mock()
-    model.t2i_generate.return_value = torch.zeros(2, 3, 32, 32)
+    t2i_generate_mock.return_value = torch.zeros(2, 3, 32, 32)
     requests = [payload(1), payload(1)]
     assert generate_images(requests, model, tokenizer) == requests
-    model.t2i_generate.assert_called_once()
-    assert model.t2i_generate.call_args.kwargs["seeds"] == [7, 7]
+    t2i_generate_mock.assert_called_once()
+    assert t2i_generate_mock.call_args.kwargs["seeds"] == [7, 7]
 
 
 @pytest.mark.parametrize("output", [None, torch.zeros(1, 3, 32, 32)])
 def test_invalid_multi_output_result_is_rejected(
-    output: torch.Tensor | None, tokenizer: PreTrainedTokenizerBase
+    t2i_generate_mock: Mock,
+    output: torch.Tensor | None,
+    tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     model = Mock()
-    model.t2i_generate.return_value = output
+    t2i_generate_mock.return_value = output
     with pytest.raises(ValueError, match="invalid multi-output"):
         generate_image(payload(2), model, tokenizer)

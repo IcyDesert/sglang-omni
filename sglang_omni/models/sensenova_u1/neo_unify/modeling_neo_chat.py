@@ -18,31 +18,11 @@ from sglang_omni.models.sensenova_u1.neo_unify.flow_matching import (
     FlowMatchingHead,
     TimestepEmbedder,
 )
-from sglang_omni.models.sensenova_u1.neo_unify.generation_forward import (
-    it2i_prefix_forward,
-    t2i_predict_v,
-    t2i_prefix_forward,
-)
-from sglang_omni.models.sensenova_u1.neo_unify.generation_inputs import (
-    build_it2i_inputs,
-    build_t2i_image_indexes,
-    build_t2i_query,
-    build_t2i_text_inputs,
-    get_thw_indexes,
-    patchify,
-    unpatchify,
-)
-from sglang_omni.models.sensenova_u1.neo_unify.image_conditioned_generation import (
-    it2i_generate,
-)
 from sglang_omni.models.sensenova_u1.neo_unify.image_decoders import ConvDecoder
 from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_vit import NEOVisionModel
 from sglang_omni.models.sensenova_u1.neo_unify.modeling_qwen3 import Qwen3ForCausalLM
 from sglang_omni.models.sensenova_u1.neo_unify.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM,
-)
-from sglang_omni.models.sensenova_u1.neo_unify.text_to_image_generation import (
-    t2i_generate,
 )
 
 # Modified for SGLang; see this directory's README.md for upstream source.
@@ -177,28 +157,6 @@ class NEOChatModel(PreTrainedModel):
                 grid_hw=grid_hw,
             ).last_hidden_state
 
-    patchify = patchify
-
-    unpatchify = unpatchify
-
-    build_t2i_query = build_t2i_query
-
-    build_t2i_text_inputs = build_t2i_text_inputs
-
-    build_t2i_image_indexes = build_t2i_image_indexes
-
-    t2i_prefix_forward = t2i_prefix_forward
-
-    it2i_prefix_forward = it2i_prefix_forward
-
-    t2i_predict_v = t2i_predict_v
-
-    build_it2i_inputs = build_it2i_inputs
-
-    it2i_generate = it2i_generate
-
-    t2i_generate = t2i_generate
-
     @property
     def lm_head(self) -> nn.Module:
         return self.language_model.get_output_embeddings()
@@ -214,8 +172,6 @@ class NEOChatModel(PreTrainedModel):
 
     def set_output_embeddings(self, value: nn.Module) -> None:
         return self.language_model.set_output_embeddings(value)
-
-    get_thw_indexes = get_thw_indexes
 
 
 __all__ = ["NEOChatModel"]
