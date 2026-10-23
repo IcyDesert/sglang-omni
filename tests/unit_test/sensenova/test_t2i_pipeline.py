@@ -426,6 +426,7 @@ class ImageEditClient:
             "seed": 7,
             "n": 1,
             "size_explicit": True,
+            "do_resize": True,
         }
         assert request.output_modalities == ["image"]
         buffer = io.BytesIO()
@@ -450,6 +451,7 @@ class DefaultImageEditClient:
             "seed": 42,
             "n": 1,
             "size_explicit": False,
+            "do_resize": True,
         }
         buffer = io.BytesIO()
         Image.new("RGB", (32, 32), (0, 0, 255)).save(buffer, format="PNG")
@@ -1021,22 +1023,10 @@ def test_invalid_edit_seed_is_rejected_before_tp_execution(
 def test_image_edit_api_validates_all_output_seeds(
     seed: int, image_count: int, expected_status: int
 ) -> None:
-    """The edits loop accepted a base seed whose later outputs overflowed the RNG."""
+    """The edits API accepted seed ranges whose final output overflowed the RNG."""
     reference = io.BytesIO()
     Image.new("RGB", (32, 32)).save(reference, format="PNG")
-    encoded = base64.b64encode(reference.getvalue()).decode("ascii")
-
-    class SeedClient:
-        def __init__(self) -> None:
-            self.seeds: list[int] = []
-
-        async def generate(
-            self, request: GenerateRequest, request_id: str
-        ) -> AsyncIterator[GenerateChunk]:
-            self.seeds.append(request.extra_params["seed"])
-            yield umm_image_chunk(request_id, [encoded])
-
-    backend = SeedClient()
+    backend = MultipleOutputImageEditClient()
     client = TestClient(
         create_app(
             backend, model_name="sensenova", image_api_registrar=register_images_api
@@ -1048,9 +1038,13 @@ def test_image_edit_api_validates_all_output_seeds(
         data={"prompt": "edit", "seed": str(seed), "n": str(image_count)},
     )
     assert response.status_code == expected_status
-    assert backend.seeds == (
-        [seed + index for index in range(image_count)] if expected_status == 200 else []
+    assert backend.seeds_and_counts == (
+        [(seed, image_count)] if expected_status == 200 else []
     )
+    if expected_status == 200:
+        assert len(response.json()["data"]) == image_count
+    else:
+        pass
 
 
 @pytest.mark.parametrize("failure", [None, "later_reference", "aspect_ratio"])

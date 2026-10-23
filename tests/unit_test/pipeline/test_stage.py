@@ -8,6 +8,7 @@ import logging
 import pickle
 import threading
 import time
+from typing import Literal
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -627,22 +628,26 @@ def test_stage_stop_warns_but_succeeds_on_a_stuck_scheduler_thread(
 
 
 @pytest.mark.parametrize("role", ["leader", "follower"])
-def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
-    async def _run() -> None:
+def test_tp_failure_reports_before_blocked_cleanup(
+    monkeypatch: pytest.MonkeyPatch, role: Literal["leader", "follower"]
+) -> None:
+    async def run() -> None:
         cleanup_entered = threading.Event()
         release_cleanup = threading.Event()
 
-        def compute(value):
+        def compute(request_payload: StagePayload) -> StagePayload:
             raise RuntimeError("rank-local allocation failed")
 
-        def cleanup():
+        def cleanup() -> None:
             cleanup_entered.set()
             assert release_cleanup.wait(5)
 
         scheduler = TensorParallelScheduler(
             compute, shutdown_join_timeout_s=5.0, shutdown_callback=cleanup
         )
-        scheduler.inbox.put(IncomingMessage("req", "new_request", "forward"))
+        scheduler.inbox.put(
+            IncomingMessage("req", "new_request", make_stage_payload(request_id="req"))
+        )
         stage_obj = make_stage(
             role=role, scheduler=scheduler, control_plane=CloseAwareControlPlane()
         )
@@ -652,11 +657,23 @@ def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
         run_task = asyncio.create_task(stage_obj.run())
         try:
             assert await asyncio.to_thread(cleanup_entered.wait, 2)
-            with pytest.raises(RuntimeError, match="Scheduler thread"):
+            with pytest.raises(RuntimeError) as failure:
                 await asyncio.wait_for(run_task, timeout=2)
             assert stage_obj.scheduler_crash_error is not None
+            assert scheduler.compute_error is not None
+            assert str(scheduler.compute_error) == "rank-local allocation failed"
+            assert stage_obj.scheduler_crash_error.__cause__ is scheduler.compute_error
+            if stage_obj.background_task_error is None:
+                assert str(failure.value) == "Scheduler thread for stage stage crashed"
+                assert failure.value.__cause__ is stage_obj.scheduler_crash_error
+            else:
+                assert role == "follower"
+                assert failure.value is stage_obj.background_task_error
+                assert str(failure.value) == (
+                    "TP follower stage stage received scheduler error: "
+                    "rank-local allocation failed"
+                )
             assert scheduler.shutdown_join_timeout_s is None
-            # The stage can exit and trigger group shutdown while this rank's cleanup is still blocked on its compute thread.
             assert stage_obj.scheduler_thread.is_alive()
         finally:
             release_cleanup.set()
@@ -666,7 +683,7 @@ def test_tp_failure_reports_before_blocked_cleanup(monkeypatch, role) -> None:
                 run_task.cancel()
                 await asyncio.gather(run_task, return_exceptions=True)
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
 def test_stage_stop_waits_past_timeout_for_collective_cleanup(monkeypatch) -> None:
